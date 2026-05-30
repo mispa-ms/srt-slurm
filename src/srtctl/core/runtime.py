@@ -147,9 +147,12 @@ class RuntimeContext:
         # Compute run_name
         run_name = f"{config.name}_{job_id}"
 
-        # Resolve node IPs
-        head_node_ip = get_hostname_ip(nodes.head)
-        infra_node_ip = get_hostname_ip(nodes.infra)
+        # Resolve node IPs — pass network_interface so srun-based resolution
+        # picks the correct NIC (e.g. mgmt vs IB) instead of relying on default
+        # DNS lookup which may resolve to an unreachable interface.
+        network_interface = get_srtslurm_setting("network_interface")
+        head_node_ip = get_hostname_ip(nodes.head, network_interface)
+        infra_node_ip = get_hostname_ip(nodes.infra, network_interface)
 
         # Compute log directory using FormattablePath or default logic
         # Check for SRTCTL_OUTPUT_DIR from sbatch script first (ensures consistency)

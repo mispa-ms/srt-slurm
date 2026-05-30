@@ -30,10 +30,11 @@ ETCD_LISTEN_ADDR = "http://0.0.0.0"
 logger = logging.getLogger(__name__)
 
 
-def get_local_ip() -> str:
+def get_local_ip(network_interface: str | None = None) -> str:
     """Get local IP address using multiple fallback methods.
 
     Methods tried (in order):
+    0. If `network_interface` is given: `ip -o -4 addr show dev <iface>` (deterministic NIC pick)
     1. hostname -I (gets first non-loopback IP)
     2. ip route get 8.8.8.8 (finds default source IP)
     3. socket.gethostbyname (fallback)
@@ -66,6 +67,27 @@ def get_local_ip() -> str:
                 continue
             return ip
         return None
+
+    # Method 0: explicit network interface — query that NIC's IPv4 address
+    # directly. This is the only deterministic way to pick the right interface
+    # on multi-NIC nodes where `hostname -I` ordering depends on kernel state.
+    if network_interface:
+        try:
+            result = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show", "dev", network_interface],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split()
+                    if "inet" in parts:
+                        ip = parts[parts.index("inet") + 1].split("/")[0]
+                        if not _is_bad_ip(ip):
+                            return ip
+        except Exception:
+            pass
 
     # Method 1: hostname -I
     try:
@@ -271,6 +293,16 @@ def main():
         default=None,
         help="NATS max message payload in MB (default: NATS default 1MB)",
     )
+    parser.add_argument(
+        "--network-interface",
+        type=str,
+        default=None,
+        help=(
+            "Network interface to use for etcd advertise URL "
+            "(e.g. 'os_p2n1' on B300 mgmt). Required when "
+            "hostname -I orders an unreachable interface first."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -281,8 +313,8 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Get our IP address using multiple fallback methods
-    host_ip = get_local_ip()
-    logger.info("Host IP: %s", host_ip)
+    host_ip = get_local_ip(args.network_interface)
+    logger.info("Host IP: %s (network_interface=%s)", host_ip, args.network_interface or "<auto>")
 
     # Start services
     nats_proc = None
