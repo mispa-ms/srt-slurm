@@ -17,24 +17,17 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
-# Nsight Systems CLI. Install nsight-systems-cli (nsys 2024.2.3 in NVIDIA's
-# ubuntu2404/sbsa cuda repo). Older but reliable to install: the
-# `nsight-systems-<version>` family triggers an apt Signed-By conflict when
-# combined with the cuda-keyring deb on top of vllm/vllm-openai images that
-# already have a cuda repo registered.
+# Nsight Systems CLI. The vllm/vllm-openai image already has the NVIDIA
+# cuda repo registered, so a direct `apt install` works. Installing
+# cuda-keyring on top triggers an apt Signed-By conflict against the
+# container's pre-registered entry (seen on #53132895, #53135432) — skip it.
 #
 # Note: 2024.2.3 doesn't support `--gpu-metrics-devices=cuda-visible` (added
-# in nsys 2024.5+). YAMLs that need that flag should drop it from
-# `profiling.extra_nsys_args` — kernel + CUDA API + NVTX traces still work.
+# in nsys 2024.5+). YAMLs that need GPU metrics should use the legacy form
+# `--gpu-metrics-devices=0` (or `=all`) — each DP rank is wrapped by its own
+# nsys with CUDA_VISIBLE_DEVICES pinned to one GPU.
 if ! command -v nsys >/dev/null 2>&1; then
-    apt-get install -y --no-install-recommends wget ca-certificates
-    ARCH=$(dpkg --print-architecture)
-    if [ "$ARCH" = "arm64" ]; then KEYRING_ARCH=sbsa; else KEYRING_ARCH=x86_64; fi
-    wget -qO /tmp/cuda-keyring.deb \
-        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${KEYRING_ARCH}/cuda-keyring_1.1-1_all.deb"
-    dpkg -i /tmp/cuda-keyring.deb
     apt-get -y update
     apt-get install -y --no-install-recommends nsight-systems-cli
-    rm -f /tmp/cuda-keyring.deb
 fi
 nsys --version
