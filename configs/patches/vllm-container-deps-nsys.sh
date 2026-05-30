@@ -17,17 +17,17 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
-# Nsight Systems CLI. The vllm/vllm-openai image already has the NVIDIA
-# cuda repo registered, so a direct `apt install` works. Installing
-# cuda-keyring on top triggers an apt Signed-By conflict against the
-# container's pre-registered entry (seen on #53132895, #53135432) — skip it.
+# Nsight Systems. The vllm/vllm-openai image already has the NVIDIA cuda
+# repo registered, so a direct `apt install` works. (Installing cuda-keyring
+# on top triggers an apt Signed-By conflict — seen on #53132895, #53135432.)
 #
-# Note: 2024.2.3 doesn't support `--gpu-metrics-devices=cuda-visible` (added
-# in nsys 2024.5+). YAMLs that need GPU metrics should use the legacy form
-# `--gpu-metrics-devices=0` (or `=all`) — each DP rank is wrapped by its own
-# nsys with CUDA_VISIBLE_DEVICES pinned to one GPU.
+# The `nsight-systems-cli` package is pinned to 2024.2.3 on ubuntu2404/sbsa,
+# which lacks `--gpu-metrics-devices` entirely (rejected as unrecognised on
+# #53136239). Switch to `nsight-systems-2025.6.3` (the full nsight-systems
+# package family carries newer versions — confirmed via the repo Packages
+# index for ubuntu2404/sbsa).
 if ! command -v nsys >/dev/null 2>&1; then
     apt-get -y update
-    apt-get install -y --no-install-recommends nsight-systems-cli
+    apt-get install -y --no-install-recommends nsight-systems-2025.6.3
 fi
 nsys --version
