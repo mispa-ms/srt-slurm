@@ -17,17 +17,19 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
+# Nsight Systems CLI. Always install via the NVIDIA cuda repo — the Ubuntu
+# 24.04 default repo only carries nsys 2024.2.3, which lacks
+# `--gpu-metrics-devices=cuda-visible` (added in nsys 2024.5+). srtctl injects
+# that flag into worker launches, so an older nsys exits unrecognised-option.
 if ! command -v nsys >/dev/null 2>&1; then
-    if ! apt-get install -y --no-install-recommends nsight-systems-cli 2>/dev/null; then
-        apt-get install -y --no-install-recommends wget ca-certificates
-        ARCH=$(dpkg --print-architecture)
-        if [ "$ARCH" = "arm64" ]; then KEYRING_ARCH=sbsa; else KEYRING_ARCH=x86_64; fi
-        wget -qO /tmp/cuda-keyring.deb \
-            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${KEYRING_ARCH}/cuda-keyring_1.1-1_all.deb"
-        dpkg -i /tmp/cuda-keyring.deb
-        apt-get -y update
-        apt-get install -y --no-install-recommends nsight-systems-cli
-        rm -f /tmp/cuda-keyring.deb
-    fi
+    apt-get install -y --no-install-recommends wget ca-certificates
+    ARCH=$(dpkg --print-architecture)
+    if [ "$ARCH" = "arm64" ]; then KEYRING_ARCH=sbsa; else KEYRING_ARCH=x86_64; fi
+    wget -qO /tmp/cuda-keyring.deb \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${KEYRING_ARCH}/cuda-keyring_1.1-1_all.deb"
+    dpkg -i /tmp/cuda-keyring.deb
+    apt-get -y update
+    apt-get install -y --no-install-recommends nsight-systems-cli
+    rm -f /tmp/cuda-keyring.deb
 fi
 nsys --version
