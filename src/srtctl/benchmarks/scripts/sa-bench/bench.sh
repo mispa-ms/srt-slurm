@@ -174,9 +174,6 @@ else
 fi
 mkdir -p "$result_dir"
 
-# Start profiling before benchmark
-start_all_profiling
-
 for concurrency in "${CONCURRENCY_LIST[@]}"; do
 
     if [ "$NUM_WARMUP_MULT" -gt 0 ]; then
@@ -209,6 +206,16 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
 
     echo "Running benchmark with concurrency: $concurrency"
     echo "$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Fire /engine/start_profile *between* warmup and main so nsys captures
+    # only the measurement window, not the cache-warming pass. With
+    # delay_iterations + max_iterations in the YAML's profiler-config,
+    # the worker's CudaProfilerWrapper.start() trips immediately, then
+    # counts engine steps. Calling start_all_profiling here ensures step 0
+    # of the counter aligns with the start of the main run, so the
+    # configured [start_step, stop_step] window lands cleanly inside the
+    # main benchmark's saturated phase rather than during warmup.
+    start_all_profiling
 
     set -x
     python3 -u "${WORK_DIR}/benchmark_serving.py" \
