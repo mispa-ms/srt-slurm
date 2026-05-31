@@ -84,10 +84,17 @@ profiling__start_profile_on_worker() {
             ;;
     esac
 
-    if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
+    # Hardened curl: --max-time bounds the call so a hung worker can't stall
+    # the benchmark; --retry catches transient races between worker readiness
+    # and the start_profile POST. Failures are reported per-worker but do not
+    # abort the benchmark — missing one rank's profile is recoverable, an
+    # aborted benchmark is not.
+    if curl -sS -f --max-time 30 --retry 3 --retry-delay 2 \
+        -X POST "http://${hostport}${start_path}" \
+        -H "Content-Type: application/json" -d "${payload}" >/dev/null 2>&1; then
         return 0
     fi
-    echo "Warning: failed to start profiling on ${hostport}"
+    echo "Warning: failed to start profiling on ${hostport} (curl exit $?); nsys capture may be empty for this worker" >&2
     return 0
 }
 
@@ -117,7 +124,11 @@ profiling__stop_profile_on_worker() {
             ;;
     esac
 
-    curl -sS -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null || true
+    # Same hardening as start_profile: bounded time, retries, non-fatal on failure.
+    curl -sS --max-time 30 --retry 3 --retry-delay 2 \
+        -X POST "http://${hostport}${stop_path}" \
+        -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1 \
+        || echo "Warning: failed to stop profiling on ${hostport} (curl exit $?); nsys profile session may still be active until worker exit" >&2
     return 0
 }
 

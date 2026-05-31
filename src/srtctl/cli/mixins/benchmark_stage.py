@@ -251,7 +251,14 @@ class BenchmarkStageMixin:
         if p.is_torch:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiles_dir_in_container
 
-        # Collect worker leader IPs and system server ports by mode
+        # Collect worker IPs + ports by mode. For dynamo frontends each DP
+        # rank has its own DYN_SYSTEM_PORT and its own /engine/start_profile
+        # listener (vLLM's AsyncMPClient.call_utility_async only fans the
+        # profile RPC out to the local engine_core, so a single-endpoint
+        # POST activates profile on 1-of-N ranks — see
+        # core_client.py:1070). For framework-native HTTP routers (sglang,
+        # vllm-router) the router itself fans out, so one leader endpoint
+        # is enough.
         prefill_ips = []
         decode_ips = []
         agg_ips = []
@@ -261,20 +268,25 @@ class BenchmarkStageMixin:
 
         use_sys_port = self.config.frontend.type == "dynamo"
         for process in self.backend_processes:
-            if not process.is_leader:
+            # Dynamo: emit ALL DP ranks (each has its own sys_port).
+            # Other frontends: emit only the leader (one HTTP port per worker).
+            if not use_sys_port and not process.is_leader:
                 continue
-            leader_ip = get_hostname_ip(process.node, self.runtime.network_interface)
+            worker_ip = get_hostname_ip(process.node, self.runtime.network_interface)
             port = process.sys_port if use_sys_port else process.http_port
-            leader_endpoint = f"{leader_ip}:{port}"
+            worker_endpoint = f"{worker_ip}:{port}"
             if process.endpoint_mode == "prefill":
-                prefill_ips.append(leader_ip)
-                prefill_endpoints.append(leader_endpoint)
+                if process.is_leader:
+                    prefill_ips.append(worker_ip)
+                prefill_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "decode":
-                decode_ips.append(leader_ip)
-                decode_endpoints.append(leader_endpoint)
+                if process.is_leader:
+                    decode_ips.append(worker_ip)
+                decode_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "agg":
-                agg_ips.append(leader_ip)
-                agg_endpoints.append(leader_endpoint)
+                if process.is_leader:
+                    agg_ips.append(worker_ip)
+                agg_endpoints.append(worker_endpoint)
 
         if prefill_ips:
             env["PROFILE_PREFILL_IPS"] = ",".join(prefill_ips)
