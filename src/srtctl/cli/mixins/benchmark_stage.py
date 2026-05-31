@@ -251,14 +251,30 @@ class BenchmarkStageMixin:
         if p.is_torch:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiles_dir_in_container
 
-        # Collect worker IPs + ports by mode. For dynamo frontends each DP
-        # rank has its own DYN_SYSTEM_PORT and its own /engine/start_profile
-        # listener (vLLM's AsyncMPClient.call_utility_async only fans the
-        # profile RPC out to the local engine_core, so a single-endpoint
-        # POST activates profile on 1-of-N ranks — see
-        # core_client.py:1070). For framework-native HTTP routers (sglang,
-        # vllm-router) the router itself fans out, so one leader endpoint
-        # is enough.
+        # Collect worker IPs + ports by mode. Two patterns coexist depending
+        # on the frontend + role:
+        #
+        # 1. Dynamo + decode: emit ALL DP ranks. vLLM's AsyncMPClient.
+        #    call_utility_async only fans the profile RPC to the local
+        #    engine_core (core_client.py:1070), so a single-endpoint POST
+        #    activates profile on 1-of-N decode ranks → asymmetric CUPTI
+        #    overhead → NCCL all-reduce timeout under load. Per-rank POST
+        #    fixes this.
+        #
+        # 2. Dynamo + prefill / agg: emit ONLY the leader endpoint. Per-rank
+        #    fan-out on prefill makes ALL DP ranks CUPTI-active during
+        #    profile_run, multiplying memory pressure ~Nx. With DSV4-Pro
+        #    prefill at gpu-mem 0.95 + batched_tokens 4096, the extra
+        #    runtime CUPTI buffer left no headroom for Triton kernel
+        #    workspace, OOMing one rank on the very first forward
+        #    (observed v6 #53236287: DP1 Triton OOM at first request, then
+        #    EngineDeadError everywhere). Leader-only matches v4's working
+        #    pattern: prefill profile fires on DP0 only, the asymmetry is
+        #    tolerable because prefill workloads are short-lived.
+        #
+        # 3. Framework-native routers (sglang router, vllm router): emit
+        #    only leader. The router fans out internally, so a single
+        #    endpoint is correct and per-rank POST would double-trigger.
         prefill_ips = []
         decode_ips = []
         agg_ips = []
@@ -268,24 +284,24 @@ class BenchmarkStageMixin:
 
         use_sys_port = self.config.frontend.type == "dynamo"
         for process in self.backend_processes:
-            # Dynamo: emit ALL DP ranks (each has its own sys_port).
-            # Other frontends: emit only the leader (one HTTP port per worker).
-            if not use_sys_port and not process.is_leader:
+            # Determine whether to emit this process's endpoint:
+            # - Dynamo + decode: emit every DP rank.
+            # - Otherwise (dynamo prefill/agg, non-dynamo): leader only.
+            decode_fanout = use_sys_port and process.endpoint_mode == "decode"
+            if not decode_fanout and not process.is_leader:
                 continue
             worker_ip = get_hostname_ip(process.node, self.runtime.network_interface)
             port = process.sys_port if use_sys_port else process.http_port
             worker_endpoint = f"{worker_ip}:{port}"
             if process.endpoint_mode == "prefill":
-                if process.is_leader:
-                    prefill_ips.append(worker_ip)
+                prefill_ips.append(worker_ip)
                 prefill_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "decode":
                 if process.is_leader:
                     decode_ips.append(worker_ip)
                 decode_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "agg":
-                if process.is_leader:
-                    agg_ips.append(worker_ip)
+                agg_ips.append(worker_ip)
                 agg_endpoints.append(worker_endpoint)
 
         if prefill_ips:
