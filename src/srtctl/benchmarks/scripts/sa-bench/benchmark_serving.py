@@ -723,38 +723,52 @@ async def benchmark(
     slow_down_servers: list[str] | None = None,
     slow_down_sleep_time: float = 1.0,
     slow_down_wait_time: float = 60.0,
+    skip_initial_test: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = input_requests[0]
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError("Multi-modal content is only supported on 'openai-chat' backend.")
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        best_of=best_of,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-    )
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
-        )
+    if skip_initial_test:
+        # Caller asserts the system is already verified (e.g. an upstream
+        # warmup pass already ran). Skipping avoids routing a single-prompt
+        # probe to one rank ahead of the main batch — when nsys profiling is
+        # armed with delay_iterations + max_iterations, that probe makes the
+        # single recipient rank tick its step counter to delay_iterations on
+        # its own and fire cudaProfilerStart/Stop alone, while peers stay at
+        # step 0. That asymmetric CUPTI cycle is what triggers the post-stop
+        # EngineDeadError cascade on vLLM DP+EP nsys runs (see § Gotcha 17
+        # in VLLM_NSYS_CAPTURE_NOTES.md).
+        print("Skipping initial single prompt test run; main benchmark begins immediately.")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Starting initial single prompt test run...")
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            best_of=best_of,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+        )
+
+        test_output = await request_func(request_func_input=test_input)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}"
+            )
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -1222,6 +1236,7 @@ def main(args: argparse.Namespace):
             slow_down_servers=args.slow_down_servers,
             slow_down_sleep_time=args.slow_down_sleep_time,
             slow_down_wait_time=args.slow_down_wait_time,
+            skip_initial_test=args.skip_initial_test,
         )
     )
 
@@ -1419,6 +1434,16 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with " "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--skip-initial-test",
+        action="store_true",
+        help=(
+            "Skip the single-prompt probe that normally runs before the main "
+            "benchmark. Use after a warmup pass has already verified server "
+            "health to avoid triggering single-rank profiler asymmetry on DP+EP "
+            "nsys runs (see VLLM_NSYS_CAPTURE_NOTES.md Gotcha 17)."
+        ),
     )
     parser.add_argument(
         "--save-result",

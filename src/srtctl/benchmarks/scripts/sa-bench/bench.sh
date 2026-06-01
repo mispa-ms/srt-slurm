@@ -208,13 +208,18 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
     echo "$(date '+%Y-%m-%d %H:%M:%S')"
 
     # Fire /engine/start_profile *between* warmup and main so nsys captures
-    # only the measurement window, not the cache-warming pass. With
-    # delay_iterations + max_iterations in the YAML's profiler-config,
-    # the worker's CudaProfilerWrapper.start() trips immediately, then
-    # counts engine steps. Calling start_all_profiling here ensures step 0
-    # of the counter aligns with the start of the main run, so the
-    # configured [start_step, stop_step] window lands cleanly inside the
-    # main benchmark's saturated phase rather than during warmup.
+    # only the measurement window, not the cache-warming pass.
+    #
+    # --skip-initial-test on the main pass is REQUIRED for vLLM DP+EP nsys
+    # runs (see VLLM_NSYS_CAPTURE_NOTES.md § Gotcha 17). benchmark_serving.py's
+    # default "initial single prompt test run" routes one probe request to
+    # one decode rank via dynamo. With delay_iterations=N + max_iterations=M
+    # in the YAML's profiler-config, that single recipient's step counter
+    # ticks alone through both thresholds — it fires cudaProfilerStart and
+    # Stop while the other 15 ranks sit at step 0 — and the asymmetric
+    # CUPTI cycle later trips cudaErrorLaunchFailure in
+    # coordinate_batch_across_dp. The upstream warmup pass has already
+    # verified the server is healthy, so we don't lose any safety.
     start_all_profiling
 
     set -x
@@ -223,6 +228,7 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
         --host "$HOST" --port "$PORT" \
         --backend "dynamo" --endpoint /v1/completions \
         --disable-tqdm \
+        --skip-initial-test \
         "${DATASET_ARGS[@]}" \
         --num-prompts "$num_prompts" \
         "${RANDOM_LEN_ARGS[@]}" \
