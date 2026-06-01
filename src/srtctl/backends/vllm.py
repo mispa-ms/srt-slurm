@@ -356,10 +356,16 @@ class VLLMProtocol:
             # DP+EP mode: each GPU runs its own process
             # process.node_rank is the dp_rank (set in endpoints_to_processes)
             dp_rank = process.node_rank
-            dp_rpc_port = config.pop("data-parallel-rpc-port", None) or config.pop(
+            dp_rpc_port_base = config.pop("data-parallel-rpc-port", None) or config.pop(
                 "data_parallel_rpc_port",
                 VLLM_DATA_PARALLEL_RPC_PORT,
             )
+            # Offset the DP master port by the replica index so multiple
+            # replicas sharing a node do not collide on the same TCP port.
+            # Each Process within the same Endpoint shares endpoint_index, so
+            # the N DP ranks of one replica all compute the same target port
+            # (the leader binds; the others connect to the same port).
+            dp_rpc_port = int(dp_rpc_port_base) + process.endpoint_index
 
             cmd.extend(
                 [
