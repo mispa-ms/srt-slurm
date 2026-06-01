@@ -68,6 +68,8 @@ new_start = """    @override
     def _start(self) -> None:
         import torch
         torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         self._cuda_profiler.start()"""
 old_stop = """    @override
     def _stop(self) -> None:
@@ -76,6 +78,8 @@ new_stop = """    @override
     def _stop(self) -> None:
         import torch
         torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         self._cuda_profiler.stop()"""
 
 if "torch.cuda.synchronize()" in content:
