@@ -89,3 +89,91 @@ def test_eight_replicas_two_per_node_no_port_collision():
     # 8 globally distinct ports overall (offset is unique).
     all_ports = [BASE + p.endpoint_index for p in processes]
     assert len(set(all_ports)) == 8, f"expected 8 unique ports, got {sorted(set(all_ports))}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# NIXL handshake-listener port collision (the SECOND bug observed
+# after the data-parallel-rpc-port fix: same node, 2 replicas, each
+# vLLM internally binds base + stride * dp_rank for the NIXL
+# handshake listener — stride observed = 2 — so consecutive 1-port-
+# per-rank allocation overlaps between replicas)
+# ─────────────────────────────────────────────────────────────────
+
+
+def _backend(dp_size_p: int, dp_size_d: int):
+    from srtctl.backends.vllm import VLLMProtocol, VLLMServerConfig
+    return VLLMProtocol(
+        connector="nixl",
+        vllm_config=VLLMServerConfig(
+            prefill={"data-parallel-size": dp_size_p},
+            decode={"data-parallel-size": dp_size_d},
+        ),
+    )
+
+
+def test_nixl_port_same_within_replica():
+    """All DP ranks of one replica share the same VLLM_NIXL_SIDE_CHANNEL_PORT base."""
+    eps = allocate_endpoints(
+        num_prefill=2, num_decode=0, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001",),
+    )
+    procs = _backend(4, 8).endpoints_to_processes(eps)
+    by_replica = {}
+    for p in procs:
+        by_replica.setdefault(p.endpoint_index, set()).add(p.nixl_port)
+    for idx, ports in by_replica.items():
+        assert len(ports) == 1, f"replica {idx} has multiple nixl_port values: {ports}"
+
+
+def test_nixl_port_gap_between_replicas_dp4():
+    """DP=4 replicas need >=8 port gap (dp_size*2) so vLLM's stride=2 fits without overlap."""
+    eps = allocate_endpoints(
+        num_prefill=8, num_decode=0, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002", "bia0003", "bia0004"),
+    )
+    procs = _backend(4, 8).endpoints_to_processes(eps)
+    bases = sorted({p.nixl_port for p in procs})
+    assert len(bases) == 8, f"expected 8 distinct replica bases, got {bases}"
+    gaps = [b - a for a, b in zip(bases, bases[1:])]
+    assert all(g >= 8 for g in gaps), f"some replica-to-replica gap < 8: gaps={gaps}"
+
+
+def test_nixl_port_gap_between_replicas_dp8():
+    """DP=8 replicas need >=16 port gap."""
+    eps = allocate_endpoints(
+        num_prefill=0, num_decode=2, num_agg=0,
+        gpus_per_prefill=8, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002"),
+    )
+    procs = _backend(8, 8).endpoints_to_processes(eps)
+    bases = sorted({p.nixl_port for p in procs})
+    assert len(bases) == 2
+    assert bases[1] - bases[0] >= 16, f"DP=8 gap too small: {bases}"
+
+
+def test_no_replica_port_block_overlap_at_stride_2():
+    """Simulate vLLM stride=2 per rank; reserved blocks per replica must not overlap."""
+    eps = allocate_endpoints(
+        num_prefill=7, num_decode=1, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002", "bia0003", "bia0004", "bia0005"),
+    )
+    procs = _backend(4, 8).endpoints_to_processes(eps)
+    # Compute actual port footprint of each replica: {base, base+2, base+4, base+6} for DP=4.
+    occupied = set()
+    for p in procs:
+        if p.node_rank == 0:  # only the leader-rank entry, but all share base
+            dp_size = 4 if p.endpoint_mode == "prefill" else 8
+            for r in range(dp_size):
+                actual = p.nixl_port + 2 * r
+                assert actual not in occupied, (
+                    f"port {actual} (replica {p.endpoint_index} {p.endpoint_mode} dp={r}) "
+                    f"collides with another replica"
+                )
+                occupied.add(actual)

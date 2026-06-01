@@ -246,8 +246,17 @@ class VLLMProtocol:
                     )
                     current_sys_port += 1
             else:
-                # DP+EP mode: one process per GPU
-                # Each process gets a single GPU and a unique dp_rank
+                # DP+EP mode: one process per GPU.
+                # vLLM v0.22's NIXL handshake listener binds base + stride * dp_rank
+                # (stride observed = 2). When multiple replicas share a node and
+                # we allocate 1 port per rank in increasing order, adjacent replicas
+                # overlap (replica 0 DP3 collides with replica 1 DP1). Reserve a
+                # contiguous block of dp_size * 2 ports per replica so the per-rank
+                # value (base + rank) plus vLLM's internal stride still fits inside
+                # the replica's block with no overlap.
+                dp_size = sum(1 for _ in endpoint.nodes) * len(endpoint.gpu_indices)
+                replica_nixl_base = port_allocator.next_nixl_port_block(max(8, dp_size * 2))
+
                 dp_rank = 0
                 for _node_rank, node in enumerate(endpoint.nodes):
                     for gpu_idx in sorted(endpoint.gpu_indices):
@@ -259,7 +268,10 @@ class VLLMProtocol:
                             else None
                         )
                         kv_events_port = port_allocator.next_kv_events_port()
-                        nixl_port = port_allocator.next_nixl_port()
+                        # Each rank within a replica reads the same env var; vLLM
+                        # adds its own per-rank stride internally. Hand out the
+                        # SAME base to every rank of this replica.
+                        nixl_port = replica_nixl_base
 
                         processes.append(
                             Process(

@@ -102,6 +102,20 @@ class NodePortAllocator:
         self._next_nixl_port += 1
         return port
 
+    def next_nixl_port_block(self, count: int) -> int:
+        """Reserve a contiguous block of `count` NIXL ports and return the base.
+
+        vLLM v0.22 binds NIXL handshake listener at base + stride * dp_rank
+        (stride observed = 2). Single-port-per-rank allocation collides
+        across replicas sharing a node (replica 0 DP3 == replica 1 DP1 etc).
+        Use this for DP+EP endpoints to reserve enough headroom.
+        """
+        if self._next_nixl_port == 0:
+            self._next_nixl_port = self.base_nixl_port
+        port = self._next_nixl_port
+        self._next_nixl_port += max(1, count)
+        return port
+
 
 @dataclass(frozen=True)
 class Endpoint:
