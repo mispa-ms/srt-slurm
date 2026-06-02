@@ -207,42 +207,96 @@ for concurrency in "${CONCURRENCY_LIST[@]}"; do
     echo "Running benchmark with concurrency: $concurrency"
     echo "$(date '+%Y-%m-%d %H:%M:%S')"
 
-    # Fire /engine/start_profile *between* warmup and main so nsys captures
-    # only the measurement window, not the cache-warming pass.
+    # Two profile modes — switched by PROFILE_RPC_DURATION_SEC env var.
+    # See VLLM_NSYS_CAPTURE_NOTES.md § Gotcha 17 + Gotcha 18.
     #
-    # --skip-initial-test on the main pass is REQUIRED for vLLM DP+EP nsys
-    # runs (see VLLM_NSYS_CAPTURE_NOTES.md § Gotcha 17). benchmark_serving.py's
-    # default "initial single prompt test run" routes one probe request to
-    # one decode rank via dynamo. With delay_iterations=N + max_iterations=M
-    # in the YAML's profiler-config, that single recipient's step counter
-    # ticks alone through both thresholds — it fires cudaProfilerStart and
-    # Stop while the other 15 ranks sit at step 0 — and the asymmetric
-    # CUPTI cycle later trips cudaErrorLaunchFailure in
-    # coordinate_batch_across_dp. The upstream warmup pass has already
-    # verified the server is healthy, so we don't lose any safety.
-    start_all_profiling
+    #   (1) ITERATION MODE (legacy, default):
+    #       PROFILE_RPC_DURATION_SEC unset. start_all_profiling fires before
+    #       main; worker auto-stops via max_iterations in YAML profiler-config.
+    #       Vulnerable to per-rank step-counter asymmetry under short windows.
+    #
+    #   (2) RPC-TIMED MODE (Kyle BTK workload-mode pattern):
+    #       PROFILE_RPC_DURATION_SEC=<seconds>. Main runs in BACKGROUND;
+    #       bench sleeps PROFILE_RPC_DELAY_SEC (default 60s) for load to
+    #       saturate, then fires start_all_profiling, sleeps the duration,
+    #       then fires stop_all_profiling. RPC start/stop reach all ranks
+    #       within ms — eliminates the asymmetric profile-cycle issue.
+    #       YAML profiler-config should be just '{"profiler": "cuda"}'
+    #       (no delay_iterations / max_iterations) so the wrapper is
+    #       purely RPC-driven.
+    #
+    # --skip-initial-test is required in BOTH modes — the single-rank probe
+    # routes one request to one decode rank via dynamo, and under iteration
+    # mode that rank ticks alone through delay_iterations / max_iterations
+    # while the others sit at step 0, tripping cudaErrorLaunchFailure in
+    # coordinate_batch_across_dp. Warmup already verifies server health.
+    if [ -n "${PROFILE_RPC_DURATION_SEC:-}" ]; then
+        PROFILE_RPC_DELAY_SEC="${PROFILE_RPC_DELAY_SEC:-60}"
+        echo "[bench.sh] RPC-timed profile mode: delay=${PROFILE_RPC_DELAY_SEC}s window=${PROFILE_RPC_DURATION_SEC}s"
 
-    set -x
-    python3 -u "${WORK_DIR}/benchmark_serving.py" \
-        --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
-        --host "$HOST" --port "$PORT" \
-        --backend "dynamo" --endpoint /v1/completions \
-        --disable-tqdm \
-        --skip-initial-test \
-        "${DATASET_ARGS[@]}" \
-        --num-prompts "$num_prompts" \
-        "${RANDOM_LEN_ARGS[@]}" \
-        --ignore-eos \
-        --request-rate "${REQ_RATE}" \
-        --percentile-metrics ttft,tpot,itl,e2el \
-        --max-concurrency "$concurrency" \
-        --trust-remote-code \
-        "${CHAT_TEMPLATE_ARGS[@]}" \
-        "${CUSTOM_TOKENIZER_ARGS[@]}" \
-        "${SLOW_DOWN_ARGS[@]}" \
-        "${SLOW_DOWN_EXTRA[@]}" \
-        --save-result --result-dir "$result_dir" --result-filename "$result_filename"
-    set +x
+        set -x
+        python3 -u "${WORK_DIR}/benchmark_serving.py" \
+            --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
+            --host "$HOST" --port "$PORT" \
+            --backend "dynamo" --endpoint /v1/completions \
+            --disable-tqdm \
+            --skip-initial-test \
+            "${DATASET_ARGS[@]}" \
+            --num-prompts "$num_prompts" \
+            "${RANDOM_LEN_ARGS[@]}" \
+            --ignore-eos \
+            --request-rate "${REQ_RATE}" \
+            --percentile-metrics ttft,tpot,itl,e2el \
+            --max-concurrency "$concurrency" \
+            --trust-remote-code \
+            "${CHAT_TEMPLATE_ARGS[@]}" \
+            "${CUSTOM_TOKENIZER_ARGS[@]}" \
+            "${SLOW_DOWN_ARGS[@]}" \
+            "${SLOW_DOWN_EXTRA[@]}" \
+            --save-result --result-dir "$result_dir" --result-filename "$result_filename" &
+        BENCH_PID=$!
+        set +x
+        echo "[bench.sh] main run PID: $BENCH_PID"
+
+        echo "[bench.sh] waiting ${PROFILE_RPC_DELAY_SEC}s for load to saturate..."
+        sleep "$PROFILE_RPC_DELAY_SEC"
+
+        echo "[bench.sh] firing start_all_profiling (RPC start)"
+        start_all_profiling
+
+        echo "[bench.sh] capture window ${PROFILE_RPC_DURATION_SEC}s..."
+        sleep "$PROFILE_RPC_DURATION_SEC"
+
+        echo "[bench.sh] firing stop_all_profiling (RPC stop)"
+        stop_all_profiling
+
+        echo "[bench.sh] waiting for main run to complete (PID $BENCH_PID)..."
+        wait "$BENCH_PID"
+    else
+        start_all_profiling
+
+        set -x
+        python3 -u "${WORK_DIR}/benchmark_serving.py" \
+            --model "${MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
+            --host "$HOST" --port "$PORT" \
+            --backend "dynamo" --endpoint /v1/completions \
+            --disable-tqdm \
+            --skip-initial-test \
+            "${DATASET_ARGS[@]}" \
+            --num-prompts "$num_prompts" \
+            "${RANDOM_LEN_ARGS[@]}" \
+            --ignore-eos \
+            --request-rate "${REQ_RATE}" \
+            --percentile-metrics ttft,tpot,itl,e2el \
+            --max-concurrency "$concurrency" \
+            --trust-remote-code \
+            "${CHAT_TEMPLATE_ARGS[@]}" \
+            "${CUSTOM_TOKENIZER_ARGS[@]}" \
+            "${SLOW_DOWN_ARGS[@]}" \
+            "${SLOW_DOWN_EXTRA[@]}" \
+            --save-result --result-dir "$result_dir" --result-filename "$result_filename"
+        set +x
+    fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S')"
     echo "Completed benchmark with concurrency: $concurrency"
