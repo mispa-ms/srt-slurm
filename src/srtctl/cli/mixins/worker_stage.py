@@ -138,7 +138,19 @@ class WorkerStageMixin:
         if profiling.enabled:
             (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
         if profiling.is_nsys:
-            nsys_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}_profile"
+            # Include the GPU id(s) so per-DP-rank processes on the same node
+            # don't race for the same output file. Without this, vLLM
+            # data-parallel-size>1 spawns N processes per node that all wrap
+            # nsys with the same `-o ...` path; with --force-overwrite=true
+            # the last finalizer wipes earlier writers and the others race
+            # to delete/recreate it. Observed on dsv4-pro 1P+1D decode-only
+            # c=4096 nsys-v13: all 16 DP ranks across 4 decode nodes
+            # finalized simultaneously and ZERO .nsys-rep files were
+            # written. Earlier cascade-prone runs (v3/v8/v10) still produced
+            # files because one rank per node typically crashed first,
+            # leaving the survivor's file intact.
+            gpu_tag = "_gpu" + "-".join(str(i) for i in sorted(process.gpu_indices)) if process.gpu_indices else ""
+            nsys_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}{gpu_tag}_profile"
             nsys_prefix = profiling.get_nsys_prefix(
                 nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
             )
