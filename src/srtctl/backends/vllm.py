@@ -191,6 +191,11 @@ class VLLMProtocol:
         config = self.get_config_for_mode(mode)
         return config.get("data-parallel-size") or config.get("data_parallel_size")
 
+    def _get_tp_size(self, mode: WorkerMode) -> int | None:
+        """Get the tensor-parallel-size for a mode, or None if not set."""
+        config = self.get_config_for_mode(mode)
+        return config.get("tensor-parallel-size") or config.get("tensor_parallel_size")
+
     def endpoints_to_processes(
         self,
         endpoints: list[Endpoint],
@@ -202,14 +207,52 @@ class VLLMProtocol:
         For DP+EP mode (data-parallel-size set), creates one process per GPU.
         For standard TP mode, creates one process per node.
         """
-        from srtctl.core.topology import NodePortAllocator, Process, endpoints_to_processes
+        from srtctl.core.topology import NodePortAllocator, Process
 
         # Check if any endpoint uses DP mode
         has_dp_mode = any(self._is_dp_mode(ep.mode) for ep in endpoints)
 
         if not has_dp_mode:
-            # Standard TP mode: one process per node
-            return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
+            # TP-only mode (no DP). Same NIXL port collision risk as the DP+EP
+            # path below: vLLM v0.22's NIXL handshake listener binds
+            # base + stride*tp_rank (stride observed = 2). With 1 port per
+            # replica from the generic allocator, 3+ TP replicas on the same
+            # node collide (replica 2's base==replica 0's tp_rank=1 port).
+            # Reserve a tp_size*2 contiguous block per replica so ranks have
+            # no overlap regardless of how many replicas share a node.
+            processes: list[Process] = []
+            current_sys_port = base_sys_port
+            if port_allocator is None:
+                port_allocator = NodePortAllocator()
+
+            for endpoint in endpoints:
+                tp_size = self._get_tp_size(endpoint.mode) or 1
+                replica_nixl_base = port_allocator.next_nixl_port_block(max(8, tp_size * 2))
+                # Bootstrap port: prefill only, shared by all node-ranks of the endpoint.
+                leader_node = endpoint.nodes[0]
+                endpoint_bootstrap_port = (
+                    port_allocator.next_bootstrap_port(leader_node) if endpoint.mode == "prefill" else None
+                )
+                for node_rank, node in enumerate(endpoint.nodes):
+                    is_leader = node_rank == 0
+                    http_port = port_allocator.next_http_port(node) if is_leader else 0
+                    kv_events_port = port_allocator.next_kv_events_port()
+                    processes.append(
+                        Process(
+                            node=node,
+                            gpu_indices=endpoint.gpu_indices,
+                            sys_port=current_sys_port,
+                            http_port=http_port,
+                            endpoint_mode=endpoint.mode,
+                            endpoint_index=endpoint.index,
+                            node_rank=node_rank,
+                            bootstrap_port=endpoint_bootstrap_port,
+                            kv_events_port=kv_events_port,
+                            nixl_port=replica_nixl_base,
+                        )
+                    )
+                    current_sys_port += 1
+            return processes
 
         # DP+EP mode: one process per GPU
         processes: list[Process] = []

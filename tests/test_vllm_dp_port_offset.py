@@ -177,3 +177,105 @@ def test_no_replica_port_block_overlap_at_stride_2():
                     f"collides with another replica"
                 )
                 occupied.add(actual)
+
+
+# ─────────────────────────────────────────────────────────────────
+# TP-only multi-replica NIXL port block (no DP).
+# Same root cause as the DP+EP path: vLLM binds base + stride*tp_rank.
+# Without per-replica block reservation, 3+ TP replicas/node would collide.
+# ─────────────────────────────────────────────────────────────────
+
+
+def _backend_tp(tp_size_p: int, tp_size_d: int):
+    from srtctl.backends.vllm import VLLMProtocol, VLLMServerConfig
+    return VLLMProtocol(
+        connector="nixl",
+        vllm_config=VLLMServerConfig(
+            prefill={"tensor-parallel-size": tp_size_p},
+            decode={"tensor-parallel-size": tp_size_d},
+        ),
+    )
+
+
+def test_tp_only_nixl_port_same_within_replica():
+    """All node-ranks of one TP replica share the same nixl_port base."""
+    eps = allocate_endpoints(
+        num_prefill=2, num_decode=0, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001",),
+    )
+    procs = _backend_tp(4, 4).endpoints_to_processes(eps)
+    by_replica: dict[int, set[int]] = {}
+    for p in procs:
+        by_replica.setdefault(p.endpoint_index, set()).add(p.nixl_port)
+    for idx, ports in by_replica.items():
+        assert len(ports) == 1, f"TP replica {idx} has multiple nixl_port values: {ports}"
+
+
+def test_tp_only_nixl_port_gap_between_replicas_tp4():
+    """TP=4 replicas need >=8 port gap (tp_size*2) so vLLM's stride=2 fits."""
+    eps = allocate_endpoints(
+        num_prefill=4, num_decode=0, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002"),
+    )
+    procs = _backend_tp(4, 4).endpoints_to_processes(eps)
+    bases = sorted({p.nixl_port for p in procs})
+    assert len(bases) == 4, f"expected 4 distinct TP replica bases, got {bases}"
+    gaps = [b - a for a, b in zip(bases, bases[1:])]
+    assert all(g >= 8 for g in gaps), f"TP=4 replica-to-replica gap < 8: gaps={gaps}"
+
+
+def test_tp_only_three_replicas_per_node_no_stride2_overlap():
+    """Pre-patch failure case: 3 TP=4 replicas on one node would collide.
+
+    Without the port-block reservation, bases were sequential (e.g. 5400,
+    5401, 5402). vLLM TP rank-r binds base + 2*r, so:
+      R0 ranks: 5400, 5402, 5404, 5406
+      R2 ranks: 5402, 5404, 5406, 5408  ← collides with R0
+    With the patch, each replica gets a tp_size*2 = 8 port block, so bases
+    are at least 8 apart and no two replicas' stride-2 footprints overlap.
+    """
+    eps = allocate_endpoints(
+        num_prefill=3, num_decode=0, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=8, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002"),  # 12 GPU total; 3 replicas × TP=4
+    )
+    procs = _backend_tp(4, 4).endpoints_to_processes(eps)
+    occupied: set[int] = set()
+    for p in procs:
+        if p.node_rank != 0:
+            continue  # leader-rank entry carries the replica base
+        for r in range(4):  # TP=4 stride-2 footprint
+            actual = p.nixl_port + 2 * r
+            assert actual not in occupied, (
+                f"TP-only port {actual} (replica {p.endpoint_index} tp_rank={r}) "
+                f"collides with another replica"
+            )
+            occupied.add(actual)
+
+
+def test_tp_only_2p1d_tp4_no_collision():
+    """Production reproducer: 2p1d-tp4-tp4 (2 prefill TP=4 + 1 decode TP=4)."""
+    eps = allocate_endpoints(
+        num_prefill=2, num_decode=1, num_agg=0,
+        gpus_per_prefill=4, gpus_per_decode=4, gpus_per_agg=8,
+        gpus_per_node=8,
+        available_nodes=("bia0001", "bia0002"),
+    )
+    procs = _backend_tp(4, 4).endpoints_to_processes(eps)
+    occupied: set[int] = set()
+    for p in procs:
+        if p.node_rank != 0:
+            continue
+        tp = 4
+        for r in range(tp):
+            actual = p.nixl_port + 2 * r
+            assert actual not in occupied, (
+                f"2p1d-tp4-tp4 port {actual} (replica {p.endpoint_index} {p.endpoint_mode} "
+                f"tp_rank={r}) collides"
+            )
+            occupied.add(actual)
