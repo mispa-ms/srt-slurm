@@ -85,7 +85,7 @@ new_start = """    @override
         import torch
         torch.cuda.synchronize()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.start()"""
 old_stop = """    @override
     def _stop(self) -> None:
@@ -95,12 +95,39 @@ new_stop = """    @override
         import torch
         torch.cuda.synchronize()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.stop()"""
 
-if "torch.distributed.barrier()" in content:
-    print("[vllm-cuda-profiler-sync-patch] Already patched (sync + barrier), skipping.")
+if "torch.distributed.barrier(device_ids=" in content:
+    print("[vllm-cuda-profiler-sync-patch] Already patched (sync + barrier w/ device_ids), skipping.")
     sys.exit(0)
+if "torch.distributed.barrier()" in content:
+    # v16 baseline (8da9b99) used a device-less barrier; that hangs NCCL on
+    # the 4-DP prefill where every rank sees CUDA_VISIBLE_DEVICES as device 0
+    # but global rank 0..3, so NCCL "guesses device ID based on global rank"
+    # and the four ranks attempt the collective on four different (and mostly
+    # nonexistent) device IDs. Observed on v16 #53446741: barrier(): using
+    # the device under current context warning, then 10 min of shm_broadcast
+    # hangs, then prefill_0 dies.
+    bad_start_v16 = """    @override
+    def _start(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        self._cuda_profiler.start()"""
+    bad_stop_v16 = """    @override
+    def _stop(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        self._cuda_profiler.stop()"""
+    if bad_start_v16 in content and bad_stop_v16 in content:
+        content = content.replace(bad_start_v16, new_start).replace(bad_stop_v16, new_stop)
+        target.write_text(content)
+        print("[vllm-cuda-profiler-sync-patch] Upgraded device-less barrier -> device_ids=[current] in", target)
+        sys.exit(0)
 if old_start not in content or old_stop not in content:
     # Maybe already patched with sync-only (prior srt-slurm 92ac1b3 baseline).
     sync_only_start = """    @override
