@@ -58,8 +58,25 @@ profiling__start_profile_on_worker() {
 
     local num_steps=$((stop_step - start_step))
     if [[ "${num_steps}" -le 0 ]]; then
-        echo "Warning: invalid step range for ${hostport}: start=${start_step} stop=${stop_step}, skipping"
-        return 0
+        # Iteration-driven mode: an empty range really is invalid; skip.
+        # RPC-timed mode (PROFILE_RPC_DURATION_SEC set in bench.sh):
+        # bench.sh times the start/stop itself and worker-side profiling
+        # fires immediately on the /engine/start_profile RPC regardless of
+        # start_step/num_steps. Setting start/stop to 0 in the YAML in
+        # RPC-mode meant the original validation skipped the start RPC
+        # entirely, leaving nsys never triggered (observed on v13/v15:
+        # benchmark completed cleanly with no .nsys-rep files written
+        # anywhere). Bypass the skip here when the bench is in RPC-mode.
+        if [[ -z "${PROFILE_RPC_DURATION_SEC:-}" ]]; then
+            echo "Warning: invalid step range for ${hostport}: start=${start_step} stop=${stop_step}, skipping"
+            return 0
+        fi
+        # num_steps stays in the JSON payload; force it to a positive
+        # integer so downstream JSON parsing on the worker doesn't choke.
+        # The worker wrapper (vLLM: profiler-config '{"profiler":"cuda"}',
+        # SGLang: ProfileReq with no num_steps override) does NOT honor
+        # this field in RPC-mode, so the value itself is cosmetic.
+        num_steps=1
     fi
 
     local activities
