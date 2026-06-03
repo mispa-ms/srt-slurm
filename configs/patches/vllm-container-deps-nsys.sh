@@ -179,6 +179,44 @@ double_sync_stop = """    @override
         torch.cuda.synchronize()
         self._cuda_profiler.stop()"""
 
+# Variant: cpu_barrier — mirror SGLang's exact pattern. Use the DP group's
+# CPU sub-communicator (gloo backend) so the barrier does NOT enqueue a
+# NCCL kernel on the same CUDA stream as the in-flight cudagraph replays.
+# Prior variants (default, dp_barrier, double_sync) all used NCCL barriers
+# on the device, which compete with the running cudagraph for stream
+# ordering — that's the underlying cause of the sample_tokens RPC timeout
+# we keep seeing. The CPU barrier is exactly what SGLang's profile_utils.py
+# does on `dist.barrier(cpu_group)` (line 313, 385 in sglang/srt/utils/
+# profile_utils.py).
+cpu_barrier_start = """    @override
+    def _start(self) -> None:
+        import torch
+        # Drain in-flight CUDA work on this rank before snapping the profiler.
+        torch.cuda.synchronize()
+        # Cross-rank synchronize on the DP group's gloo (CPU) communicator
+        # so cudaProfilerStart fires simultaneously across all DP ranks
+        # without queueing any CUDA-side collective.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                from vllm.distributed.parallel_state import get_dp_group
+                _cpu_grp = get_dp_group().cpu_group
+            except Exception:
+                _cpu_grp = None
+            torch.distributed.barrier(group=_cpu_grp)
+        self._cuda_profiler.start()"""
+cpu_barrier_stop = """    @override
+    def _stop(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                from vllm.distributed.parallel_state import get_dp_group
+                _cpu_grp = get_dp_group().cpu_group
+            except Exception:
+                _cpu_grp = None
+            torch.distributed.barrier(group=_cpu_grp)
+        self._cuda_profiler.stop()"""
+
 if variant == "dp_barrier":
     new_start, new_stop = dp_barrier_start, dp_barrier_stop
     marker = "from vllm.distributed.parallel_state import get_dp_group"
@@ -188,6 +226,10 @@ elif variant == "double_sync":
     # Distinct marker: TWO torch.cuda.synchronize() calls in _start.
     marker = None  # detected via prior variants below
     label = "sync + barrier + sync"
+elif variant == "cpu_barrier":
+    new_start, new_stop = cpu_barrier_start, cpu_barrier_stop
+    marker = "get_dp_group().cpu_group"
+    label = "sync + DP CPU-group (gloo) barrier — SGLang pattern"
 else:
     new_start, new_stop = default_start, default_stop
     marker = "torch.distributed.barrier(device_ids=["
@@ -234,6 +276,7 @@ for from_start, from_stop, from_label in (
     (default_start, default_stop, "default (sync + device_ids barrier)"),
     (dp_barrier_start, dp_barrier_stop, "dp_barrier"),
     (double_sync_start, double_sync_stop, "double_sync"),
+    (cpu_barrier_start, cpu_barrier_stop, "cpu_barrier"),
 ):
     if from_start in content and from_stop in content:
         content = content.replace(from_start, new_start).replace(from_stop, new_stop)
