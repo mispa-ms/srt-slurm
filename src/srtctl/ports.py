@@ -37,11 +37,15 @@ VLLM_DATA_PARALLEL_RPC_PORT = 8400
 # reserved per replica must be `size * STRIDE` to prevent adjacent replicas
 # from colliding on the odd-stride ports of the previous block.
 #
-# Observed values by vLLM version:
-#   - vLLM 0.21.x and earlier: STRIDE = 1 (single port per rank, contiguous)
+# Known stride values by vLLM version:
 #   - vLLM 0.22.x: STRIDE = 2 (verified from prefill worker logs:
 #       EngineCore_DP0 @ base+0, EngineCore_DP1 @ base+2, ...)
-# Users can override per-recipe via VLLMServerConfig.nixl_port_stride.
+#   - vLLM 0.21.x and earlier: STRIDE = 1 inferred (the older
+#       `actual_port = base + rank` documentation implies contiguous
+#       per-rank ports; users of 0.21.x should explicitly override
+#       VLLMProtocol.nixl_port_stride=1 to be safe).
+# Users can override per-recipe via VLLMProtocol.nixl_port_stride (set under
+# the backend block in the recipe YAML).
 VLLM_NIXL_PORT_STRIDE_DEFAULT = 2
 
 # Dynamo runtime and connector ports.

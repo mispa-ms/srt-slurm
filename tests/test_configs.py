@@ -16,6 +16,7 @@ from srtctl.ports import (
     SGLANG_HTTP_PORT_STRIDE,
     VLLM_DATA_PARALLEL_RPC_PORT,
     VLLM_NIXL_PORT_BASE,
+    VLLM_NIXL_PORT_STRIDE_DEFAULT,
 )
 
 
@@ -1412,8 +1413,12 @@ class TestVLLMPrefillDecodeColocation:
         assert {p.node for p in prefill + decode} == {"node0"}
         assert {p.dp_rpc_port for p in prefill} == {VLLM_DATA_PARALLEL_RPC_PORT}
         assert {p.dp_rpc_port for p in decode} == {VLLM_DATA_PARALLEL_RPC_PORT + 1}
+        # vLLM binds NIXL at base + stride * dp_rank; allocator reserves
+        # dp_size * stride ports per endpoint, so decode's base sits after
+        # prefill's full strided range.
+        nixl_block = 4 * VLLM_NIXL_PORT_STRIDE_DEFAULT
         assert {p.nixl_port for p in prefill} == {VLLM_NIXL_PORT_BASE}
-        assert {p.nixl_port for p in decode} == {VLLM_NIXL_PORT_BASE + 4}
+        assert {p.nixl_port for p in decode} == {VLLM_NIXL_PORT_BASE + nixl_block}
 
         leader_ports = [
             port
@@ -1427,10 +1432,13 @@ class TestVLLMPrefillDecodeColocation:
             SGLANG_BOOTSTRAP_PORT_BASE,
         ]
 
-        prefill_actual_nixl_ports = {next(iter(p.nixl_port for p in prefill)) + p.node_rank for p in prefill}
-        decode_actual_nixl_ports = {next(iter(p.nixl_port for p in decode)) + p.node_rank for p in decode}
-        assert prefill_actual_nixl_ports == {VLLM_NIXL_PORT_BASE + i for i in range(4)}
-        assert decode_actual_nixl_ports == {VLLM_NIXL_PORT_BASE + 4 + i for i in range(4)}
+        # Simulate vLLM's actual port binding: actual = base + stride * dp_rank.
+        # The two endpoints' actual port sets must remain disjoint.
+        s = VLLM_NIXL_PORT_STRIDE_DEFAULT
+        prefill_actual_nixl_ports = {next(iter(p.nixl_port for p in prefill)) + s * p.node_rank for p in prefill}
+        decode_actual_nixl_ports = {next(iter(p.nixl_port for p in decode)) + s * p.node_rank for p in decode}
+        assert prefill_actual_nixl_ports == {VLLM_NIXL_PORT_BASE + s * i for i in range(4)}
+        assert decode_actual_nixl_ports == {VLLM_NIXL_PORT_BASE + nixl_block + s * i for i in range(4)}
         assert prefill_actual_nixl_ports.isdisjoint(decode_actual_nixl_ports)
 
     def test_enabled_does_not_pack_when_one_node_does_not_fit(self):
@@ -1858,8 +1866,12 @@ class TestVLLMDataParallelMode:
 
         assert {p.dp_rpc_port for p in first_endpoint} == {VLLM_DATA_PARALLEL_RPC_PORT}
         assert {p.dp_rpc_port for p in second_endpoint} == {VLLM_DATA_PARALLEL_RPC_PORT + 1}
+        # Allocator reserves dp_size * stride ports per endpoint (vLLM binds at
+        # base + stride * dp_rank). Second endpoint sits after the first's
+        # full strided range.
+        nixl_block = 4 * VLLM_NIXL_PORT_STRIDE_DEFAULT
         assert {p.nixl_port for p in first_endpoint} == {VLLM_NIXL_PORT_BASE}
-        assert {p.nixl_port for p in second_endpoint} == {VLLM_NIXL_PORT_BASE + 4}
+        assert {p.nixl_port for p in second_endpoint} == {VLLM_NIXL_PORT_BASE + nixl_block}
         assert [p.node_rank for p in first_endpoint] == list(range(4))
         assert [p.node_rank for p in second_endpoint] == list(range(4))
 

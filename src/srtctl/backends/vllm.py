@@ -101,8 +101,10 @@ class VLLMProtocol:
 
     # vLLM NIXL side-channel port stride. The handshake listener binds at
     #   VLLM_NIXL_SIDE_CHANNEL_PORT + nixl_port_stride * rank
-    # Default 2 matches vLLM 0.22.x. Set to 1 for vLLM 0.21.x and earlier.
-    # See ports.py VLLM_NIXL_PORT_STRIDE_DEFAULT for the observed values.
+    # where rank is dp_rank (DP-EP mode) or tp_rank (TP-only mode).
+    # Default 2 matches vLLM 0.22.x. Set to 1 for vLLM 0.21.x and earlier
+    # (or any version that uses contiguous per-rank ports).
+    # See ports.VLLM_NIXL_PORT_STRIDE_DEFAULT for the observed values.
     nixl_port_stride: int = VLLM_NIXL_PORT_STRIDE_DEFAULT
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
@@ -249,17 +251,14 @@ class VLLMProtocol:
 
         For DP+EP mode (data-parallel-size set), creates one process per GPU.
         For standard TP mode, creates one process per node.
+
+        Both paths reserve a stride-aware NIXL port block per replica so
+        2+ replicas on the same node (or sharing a contiguous port counter)
+        do not collide on vLLM's strided NIXL handshake listeners. See
+        ports.VLLM_NIXL_PORT_STRIDE_DEFAULT for the version matrix.
         """
-        from srtctl.core.topology import NodePortAllocator, Process, endpoints_to_processes
+        from srtctl.core.topology import NodePortAllocator, Process
 
-        # Check if any endpoint uses DP mode
-        has_dp_mode = any(self._is_dp_mode(ep.mode) for ep in endpoints)
-
-        if not has_dp_mode:
-            # Standard TP mode: one process per node
-            return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
-
-        # DP+EP mode: one process per GPU
         processes: list[Process] = []
         current_sys_port = base_sys_port
         if port_allocator is None:
@@ -267,20 +266,24 @@ class VLLMProtocol:
 
         for endpoint in endpoints:
             if not self._is_dp_mode(endpoint.mode):
-                # Non-DP endpoints get standard processing
-                # (This shouldn't happen in practice since all modes should be consistent)
-                # TP-only mode: vLLM still binds NIXL at base + stride*tp_rank,
-                # so reserve a tp_size * stride block per replica to avoid
-                # collisions when 2+ TP replicas share a node (or even across
-                # nodes when the global port counter is contiguous).
-                tp_size = self._get_tp_size(endpoint.mode) or len(endpoint.gpu_indices)
+                # TP-only mode: vLLM binds NIXL at base + stride * tp_rank,
+                # so reserve a tp_size * stride block per replica. Falls
+                # back to len(gpu_indices) (= implicit TP across all node
+                # GPUs) when tensor-parallel-size is not set in the recipe
+                # — mirrors the DP path's dp_size fallback.
+                tp_size = self._get_tp_size(endpoint.mode) or len(endpoint.gpu_indices) or 1
                 nixl_block_per_replica = max(1, tp_size * self.nixl_port_stride)
+                # Allocate bootstrap port once per prefill endpoint (shared
+                # by all node processes — matches the upstream topology
+                # helper semantics for multi-node TP prefill).
+                endpoint_bootstrap_port = (
+                    port_allocator.next_bootstrap_port(endpoint.leader_node)
+                    if endpoint.mode == "prefill"
+                    else None
+                )
                 for node_rank, node in enumerate(endpoint.nodes):
                     is_leader = node_rank == 0
                     http_port = port_allocator.next_http_port(node) if is_leader else 0
-                    bootstrap_port = (
-                        port_allocator.next_bootstrap_port(node) if endpoint.mode == "prefill" and is_leader else None
-                    )
                     kv_events_port = port_allocator.next_kv_events_port()
                     nixl_port = port_allocator.next_nixl_port_block(nixl_block_per_replica)
 
@@ -293,9 +296,10 @@ class VLLMProtocol:
                             endpoint_mode=endpoint.mode,
                             endpoint_index=endpoint.index,
                             node_rank=node_rank,
-                            bootstrap_port=bootstrap_port,
+                            bootstrap_port=endpoint_bootstrap_port,
                             kv_events_port=kv_events_port,
                             nixl_port=nixl_port,
+                            het_group=endpoint.het_group,
                         )
                     )
                     current_sys_port += 1
@@ -338,6 +342,7 @@ class VLLMProtocol:
                                 kv_events_port=kv_events_port,
                                 nixl_port=nixl_port,
                                 dp_rpc_port=dp_rpc_port,
+                                het_group=endpoint.het_group,
                             )
                         )
                         current_sys_port += 1

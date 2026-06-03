@@ -58,12 +58,11 @@ def get_local_ip(network_interface: str | None = None) -> str:
 
     def _select_best_ip(candidates: list[str]) -> str | None:
         # Prefer mgmt range 10.* first. This is the routable cross-node
-        # network on most NVIDIA SLURM clusters (lyris, bia, etc.); workers
-        # resolve infra hostnames to mgmt IPs via DNS, so etcd must advertise
-        # on the same range. On multi-NIC nodes where the first private IP
-        # from `hostname -I` is a compute IB IP (e.g. 172.20.*), preferring
-        # 10.* avoids the advertise/connect mismatch documented in
-        # docs/clusters/bia/disagg-network-interface-fix.md.
+        # network on most NVIDIA SLURM clusters; workers resolve infra
+        # hostnames to mgmt IPs via DNS, so etcd must advertise on the same
+        # range. On multi-NIC nodes where the first private IP from
+        # `hostname -I` is a compute IB IP (e.g. 172.20.*), preferring 10.*
+        # avoids the advertise/connect mismatch.
         for ip in candidates:
             if not _is_bad_ip(ip) and ip.startswith("10."):
                 return ip
@@ -92,7 +91,9 @@ def get_local_ip(network_interface: str | None = None) -> str:
             if result.returncode != 0:
                 logger.warning(
                     "Method 0: 'ip addr show dev %s' rc=%d stderr=%r — falling back",
-                    network_interface, result.returncode, result.stderr.strip(),
+                    network_interface,
+                    result.returncode,
+                    result.stderr.strip(),
                 )
             elif not result.stdout.strip():
                 logger.warning(
@@ -106,15 +107,14 @@ def get_local_ip(network_interface: str | None = None) -> str:
                     if "inet" in parts:
                         ip = parts[parts.index("inet") + 1].split("/")[0]
                         if not _is_bad_ip(ip):
-                            logger.info(
-                                "Method 0: resolved %s -> %s", network_interface, ip
-                            )
+                            logger.info("Method 0: resolved %s -> %s", network_interface, ip)
                             return ip
                         found = True
                 if not found:
                     logger.warning(
                         "Method 0: 'ip addr show dev %s' returned no inet line — falling back. Output: %r",
-                        network_interface, result.stdout.strip()[:200],
+                        network_interface,
+                        result.stdout.strip()[:200],
                     )
         except FileNotFoundError:
             logger.warning("Method 0: 'ip' command not found in container — falling back")
