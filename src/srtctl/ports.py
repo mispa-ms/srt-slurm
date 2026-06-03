@@ -31,6 +31,19 @@ MOONCAKE_HTTP_METADATA_PORT = 8701
 VLLM_NIXL_PORT_BASE = 5400
 VLLM_DATA_PARALLEL_RPC_PORT = 8400
 
+# vLLM NIXL side-channel stride: the handshake listener binds at
+#   VLLM_NIXL_SIDE_CHANNEL_PORT + STRIDE * rank
+# where rank is dp_rank (DP-EP mode) or tp_rank (TP-only mode). The block
+# reserved per replica must be `size * STRIDE` to prevent adjacent replicas
+# from colliding on the odd-stride ports of the previous block.
+#
+# Observed values by vLLM version:
+#   - vLLM 0.21.x and earlier: STRIDE = 1 (single port per rank, contiguous)
+#   - vLLM 0.22.x: STRIDE = 2 (verified from prefill worker logs:
+#       EngineCore_DP0 @ base+0, EngineCore_DP1 @ base+2, ...)
+# Users can override per-recipe via VLLMServerConfig.nixl_port_stride.
+VLLM_NIXL_PORT_STRIDE_DEFAULT = 2
+
 # Dynamo runtime and connector ports.
 DYN_SYSTEM_PORT_BASE = 7500
 KVBM_ZMQ_PORT_BASE = 5600

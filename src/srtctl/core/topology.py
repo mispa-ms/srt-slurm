@@ -107,12 +107,18 @@ class NodePortAllocator:
         return port
 
     def next_nixl_port_block(self, size: int) -> int:
-        """Reserve a block of consecutive NIXL ports, return the base port.
+        """Reserve a block of `size` consecutive NIXL ports, return the base.
 
-        Used in DP mode where vLLM computes:
-            actual_port = VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_rank
-        All DP ranks within an endpoint share the same base port, so we
-        must reserve `size` ports to avoid collisions with other endpoints.
+        vLLM computes its NIXL handshake-listener port as:
+            actual_port = VLLM_NIXL_SIDE_CHANNEL_PORT + stride * rank
+        where rank is dp_rank (DP-EP mode) or tp_rank (TP-only mode), and
+        `stride` is a vLLM-internal constant (= 1 in 0.21.x, = 2 in 0.22.x).
+        Callers must therefore pass `size = parallel_size * stride` to
+        prevent the next replica's block from overlapping the highest
+        rank's odd-stride port in the current block.
+
+        See VLLMProtocol.nixl_port_stride (configurable per recipe) and
+        ports.VLLM_NIXL_PORT_STRIDE_DEFAULT for the stride values.
         """
         if self._next_nixl_port == 0:
             self._next_nixl_port = self.base_nixl_port

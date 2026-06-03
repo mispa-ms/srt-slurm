@@ -24,7 +24,7 @@ from typing import (
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
-from srtctl.ports import DYN_SYSTEM_PORT_BASE, VLLM_DATA_PARALLEL_RPC_PORT
+from srtctl.ports import DYN_SYSTEM_PORT_BASE, VLLM_DATA_PARALLEL_RPC_PORT, VLLM_NIXL_PORT_STRIDE_DEFAULT
 
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
@@ -98,6 +98,12 @@ class VLLMProtocol:
     # request fits within gpus_per_node. Defaults off to preserve existing P/D
     # node separation.
     allow_prefill_decode_colocation: bool = False
+
+    # vLLM NIXL side-channel port stride. The handshake listener binds at
+    #   VLLM_NIXL_SIDE_CHANNEL_PORT + nixl_port_stride * rank
+    # Default 2 matches vLLM 0.22.x. Set to 1 for vLLM 0.21.x and earlier.
+    # See ports.py VLLM_NIXL_PORT_STRIDE_DEFAULT for the observed values.
+    nixl_port_stride: int = VLLM_NIXL_PORT_STRIDE_DEFAULT
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
 
@@ -228,6 +234,11 @@ class VLLMProtocol:
         config = self.get_config_for_mode(mode)
         return config.get("data-parallel-size") or config.get("data_parallel_size")
 
+    def _get_tp_size(self, mode: WorkerMode) -> int | None:
+        """Get the tensor-parallel-size for a mode (used for NIXL port block sizing)."""
+        config = self.get_config_for_mode(mode)
+        return config.get("tensor-parallel-size") or config.get("tensor_parallel_size")
+
     def endpoints_to_processes(
         self,
         endpoints: list[Endpoint],
@@ -258,6 +269,12 @@ class VLLMProtocol:
             if not self._is_dp_mode(endpoint.mode):
                 # Non-DP endpoints get standard processing
                 # (This shouldn't happen in practice since all modes should be consistent)
+                # TP-only mode: vLLM still binds NIXL at base + stride*tp_rank,
+                # so reserve a tp_size * stride block per replica to avoid
+                # collisions when 2+ TP replicas share a node (or even across
+                # nodes when the global port counter is contiguous).
+                tp_size = self._get_tp_size(endpoint.mode) or len(endpoint.gpu_indices)
+                nixl_block_per_replica = max(1, tp_size * self.nixl_port_stride)
                 for node_rank, node in enumerate(endpoint.nodes):
                     is_leader = node_rank == 0
                     http_port = port_allocator.next_http_port(node) if is_leader else 0
@@ -265,7 +282,7 @@ class VLLMProtocol:
                         port_allocator.next_bootstrap_port(node) if endpoint.mode == "prefill" and is_leader else None
                     )
                     kv_events_port = port_allocator.next_kv_events_port()
-                    nixl_port = port_allocator.next_nixl_port()
+                    nixl_port = port_allocator.next_nixl_port_block(nixl_block_per_replica)
 
                     processes.append(
                         Process(
@@ -288,11 +305,14 @@ class VLLMProtocol:
                 dp_rank = 0
                 # Allocate a unique DP RPC port for this endpoint's leader node
                 dp_rpc_port = port_allocator.next_dp_rpc_port(endpoint.leader_node)
-                # Allocate a single NIXL base port for this endpoint.
-                # vLLM internally computes: actual_port = base + data_parallel_rank
-                # so all DP ranks in the endpoint share the same base port.
+                # Allocate a NIXL port block for this endpoint.
+                # vLLM internally computes: actual_port = base + stride * dp_rank
+                # (stride observed = 2 in vLLM 0.22.x; was 1 in 0.21.x).
+                # All DP ranks in the endpoint share the same base port, so we
+                # reserve dp_size * stride ports to avoid collisions with the
+                # next replica's allocation.
                 dp_size = self._get_dp_size(endpoint.mode) or len(endpoint.gpu_indices)
-                nixl_base_port = port_allocator.next_nixl_port_block(dp_size)
+                nixl_base_port = port_allocator.next_nixl_port_block(dp_size * self.nixl_port_stride)
                 for _node_rank, node in enumerate(endpoint.nodes):
                     for gpu_idx in sorted(endpoint.gpu_indices):
                         is_leader = dp_rank == 0
