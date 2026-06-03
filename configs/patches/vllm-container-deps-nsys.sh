@@ -217,6 +217,30 @@ cpu_barrier_stop = """    @override
             torch.distributed.barrier(group=_cpu_grp)
         self._cuda_profiler.stop()"""
 
+# Variant: rank0_only — match SGLang's actual pattern (profiler_manager.py:224).
+# SGLang gates cudaProfilerStart on `gpu_id == base_gpu_id`, i.e. only the
+# one process per node whose first visible GPU is rank 0 calls into CUPTI.
+# Other ranks set a flag but never touch cudaProfilerStart.
+# Why this works where every prior variant failed:
+#   * No barrier => no cross-rank deadlock against DP allreduce
+#   * Single caller per node => per-rank step counter drift is irrelevant;
+#     cross-rank races on CUPTI state can't happen because peer ranks
+#     never enter the start path
+#   * Trace covers 1 GPU per node, which is exactly what SGLang produces
+#     and is sufficient for DLB lane_0 analysis.
+rank0_only_start = """    @override
+    def _start(self) -> None:
+        import os
+        if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+            return
+        self._cuda_profiler.start()"""
+rank0_only_stop = """    @override
+    def _stop(self) -> None:
+        import os
+        if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+            return
+        self._cuda_profiler.stop()"""
+
 if variant == "dp_barrier":
     new_start, new_stop = dp_barrier_start, dp_barrier_stop
     marker = "from vllm.distributed.parallel_state import get_dp_group"
@@ -230,6 +254,10 @@ elif variant == "cpu_barrier":
     new_start, new_stop = cpu_barrier_start, cpu_barrier_stop
     marker = "get_dp_group().cpu_group"
     label = "sync + DP CPU-group (gloo) barrier — SGLang pattern"
+elif variant == "rank0_only":
+    new_start, new_stop = rank0_only_start, rank0_only_stop
+    marker = 'os.environ.get("LOCAL_RANK", "0")'
+    label = "rank0-only cudaProfilerStart (SGLang gpu_id==base_gpu_id pattern)"
 else:
     new_start, new_stop = default_start, default_stop
     marker = "torch.distributed.barrier(device_ids=["
@@ -277,6 +305,7 @@ for from_start, from_stop, from_label in (
     (dp_barrier_start, dp_barrier_stop, "dp_barrier"),
     (double_sync_start, double_sync_stop, "double_sync"),
     (cpu_barrier_start, cpu_barrier_stop, "cpu_barrier"),
+    (rank0_only_start, rank0_only_stop, "rank0_only"),
 ):
     if from_start in content and from_stop in content:
         content = content.replace(from_start, new_start).replace(from_stop, new_stop)
