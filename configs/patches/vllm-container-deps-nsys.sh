@@ -65,8 +65,33 @@ nsys --version
 #
 # Apply via Python AST-safe rewrite — the wrapper.py override block has a
 # stable shape since vLLM 0.21.0.
-python3 - <<'PYPATCH'
-import pathlib, sys
+#
+# WRAPPER_VARIANT env var selects the wrapper variant to install:
+#   default     : sync + dist.barrier(device_ids=[current_device])     [v17 baseline]
+#   dp_barrier  : sync + barrier on vllm DP group (lazy import)         [v19 experiment]
+#   double_sync : sync + barrier(device_ids) + sync again before        [v20 experiment]
+#                 cudaProfilerStart (drain barrier's NCCL kernel)
+#
+# v17 evidence (#53454633): default variant cleared the barrier
+# itself (no "Guessing device ID" warning), but a SUBSEQUENT
+# coordinate_batch_across_dp ALLREDUCE on the DP group (PG 6,
+# NumelIn=16 matches dp_utils.py:47 torch.zeros(4, dp_size)) hung
+# for 600s and tripped the NCCL watchdog. Our wrapper barrier is on
+# default_pg (PG 0) — a different NCCL communicator than the DP
+# group that hangs. dp_barrier and double_sync are two competing
+# hypotheses for why PG 6 hangs after our default-pg barrier:
+#   - dp_barrier  : the right group to sync is DP group, not default
+#   - double_sync : barrier's own NCCL kernel is still in flight when
+#                   cudaProfilerStart fires, CUPTI's hooks land on a
+#                   busy stream and corrupt the DP group's communicator
+WRAPPER_VARIANT="${WRAPPER_VARIANT:-default}"
+echo "[vllm-cuda-profiler-sync-patch] WRAPPER_VARIANT=${WRAPPER_VARIANT}"
+
+WRAPPER_VARIANT="${WRAPPER_VARIANT}" python3 - <<'PYPATCH'
+import os, pathlib, sys
+
+variant = os.environ.get("WRAPPER_VARIANT", "default")
+
 candidates = [
     pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/profiler/wrapper.py"),
     pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/profiler/wrapper.py"),
@@ -77,20 +102,24 @@ if target is None:
     sys.exit(0)
 
 content = target.read_text()
+
+# Pristine source blocks (what vLLM v0.21.0 ships).
 old_start = """    @override
     def _start(self) -> None:
-        self._cuda_profiler.start()"""
-new_start = """    @override
-    def _start(self) -> None:
-        import torch
-        torch.cuda.synchronize()
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.start()"""
 old_stop = """    @override
     def _stop(self) -> None:
         self._cuda_profiler.stop()"""
-new_stop = """    @override
+
+# Variant: default — sync + barrier(device_ids).
+default_start = """    @override
+    def _start(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        self._cuda_profiler.start()"""
+default_stop = """    @override
     def _stop(self) -> None:
         import torch
         torch.cuda.synchronize()
@@ -98,58 +127,121 @@ new_stop = """    @override
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.stop()"""
 
-if "torch.distributed.barrier(device_ids=" in content:
-    print("[vllm-cuda-profiler-sync-patch] Already patched (sync + barrier w/ device_ids), skipping.")
-    sys.exit(0)
-if "torch.distributed.barrier()" in content:
-    # v16 baseline (8da9b99) used a device-less barrier; that hangs NCCL on
-    # the 4-DP prefill where every rank sees CUDA_VISIBLE_DEVICES as device 0
-    # but global rank 0..3, so NCCL "guesses device ID based on global rank"
-    # and the four ranks attempt the collective on four different (and mostly
-    # nonexistent) device IDs. Observed on v16 #53446741: barrier(): using
-    # the device under current context warning, then 10 min of shm_broadcast
-    # hangs, then prefill_0 dies.
-    bad_start_v16 = """    @override
+# Variant: dp_barrier — barrier on vLLM DP group, fall back to default.
+dp_barrier_start = """    @override
     def _start(self) -> None:
         import torch
         torch.cuda.synchronize()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            try:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp_grp = get_dp_group().device_group
+            except Exception:
+                _dp_grp = None
+            if _dp_grp is not None:
+                torch.distributed.barrier(group=_dp_grp, device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.start()"""
-    bad_stop_v16 = """    @override
+dp_barrier_stop = """    @override
     def _stop(self) -> None:
         import torch
         torch.cuda.synchronize()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            try:
+                from vllm.distributed.parallel_state import get_dp_group
+                _dp_grp = get_dp_group().device_group
+            except Exception:
+                _dp_grp = None
+            if _dp_grp is not None:
+                torch.distributed.barrier(group=_dp_grp, device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         self._cuda_profiler.stop()"""
-    if bad_start_v16 in content and bad_stop_v16 in content:
-        content = content.replace(bad_start_v16, new_start).replace(bad_stop_v16, new_stop)
-        target.write_text(content)
-        print("[vllm-cuda-profiler-sync-patch] Upgraded device-less barrier -> device_ids=[current] in", target)
-        sys.exit(0)
-if old_start not in content or old_stop not in content:
-    # Maybe already patched with sync-only (prior srt-slurm 92ac1b3 baseline).
-    sync_only_start = """    @override
+
+# Variant: double_sync — default + extra sync between barrier and
+# cudaProfilerStart so the barrier's NCCL kernel finishes before
+# CUPTI activation lands.
+double_sync_start = """    @override
     def _start(self) -> None:
         import torch
         torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        torch.cuda.synchronize()
         self._cuda_profiler.start()"""
-    sync_only_stop = """    @override
+double_sync_stop = """    @override
     def _stop(self) -> None:
         import torch
         torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        torch.cuda.synchronize()
         self._cuda_profiler.stop()"""
-    if sync_only_start in content and sync_only_stop in content:
-        content = content.replace(sync_only_start, new_start).replace(sync_only_stop, new_stop)
-        target.write_text(content)
-        print("[vllm-cuda-profiler-sync-patch] Upgraded sync-only -> sync + barrier in", target)
-        sys.exit(0)
-    print("[vllm-cuda-profiler-sync-patch] Expected blocks not found — vLLM source drift?")
-    print("[vllm-cuda-profiler-sync-patch] File:", target)
+
+if variant == "dp_barrier":
+    new_start, new_stop = dp_barrier_start, dp_barrier_stop
+    marker = "from vllm.distributed.parallel_state import get_dp_group"
+    label = "sync + DP-group barrier"
+elif variant == "double_sync":
+    new_start, new_stop = double_sync_start, double_sync_stop
+    # Distinct marker: TWO torch.cuda.synchronize() calls in _start.
+    marker = None  # detected via prior variants below
+    label = "sync + barrier + sync"
+else:
+    new_start, new_stop = default_start, default_stop
+    marker = "torch.distributed.barrier(device_ids=["
+    label = "sync + barrier(device_ids)"
+
+# Idempotency: skip if exact target is already in file.
+if new_start in content and new_stop in content:
+    print(f"[vllm-cuda-profiler-sync-patch] Already patched ({label}), skipping.")
     sys.exit(0)
 
-content = content.replace(old_start, new_start).replace(old_stop, new_stop)
-target.write_text(content)
-print("[vllm-cuda-profiler-sync-patch] Patched CudaProfilerWrapper._start/_stop (sync + barrier) in", target)
+# Known prior forms: pristine, sync-only, device-less barrier, default
+# (sync + device_ids barrier), dp_barrier, double_sync — try each in
+# turn; whichever matches both blocks gets replaced with the chosen
+# variant.
+sync_only_start = """    @override
+    def _start(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        self._cuda_profiler.start()"""
+sync_only_stop = """    @override
+    def _stop(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        self._cuda_profiler.stop()"""
+device_less_start = """    @override
+    def _start(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        self._cuda_profiler.start()"""
+device_less_stop = """    @override
+    def _stop(self) -> None:
+        import torch
+        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        self._cuda_profiler.stop()"""
+
+for from_start, from_stop, from_label in (
+    (old_start, old_stop, "pristine"),
+    (sync_only_start, sync_only_stop, "sync-only"),
+    (device_less_start, device_less_stop, "device-less barrier"),
+    (default_start, default_stop, "default (sync + device_ids barrier)"),
+    (dp_barrier_start, dp_barrier_stop, "dp_barrier"),
+    (double_sync_start, double_sync_stop, "double_sync"),
+):
+    if from_start in content and from_stop in content:
+        content = content.replace(from_start, new_start).replace(from_stop, new_stop)
+        target.write_text(content)
+        print(f"[vllm-cuda-profiler-sync-patch] Patched ({from_label} -> {label}) in {target}")
+        sys.exit(0)
+
+print("[vllm-cuda-profiler-sync-patch] Expected blocks not found — vLLM source drift?")
+print("[vllm-cuda-profiler-sync-patch] File:", target)
+sys.exit(0)
 PYPATCH
