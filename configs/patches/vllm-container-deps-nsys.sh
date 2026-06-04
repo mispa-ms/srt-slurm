@@ -317,3 +317,85 @@ print("[vllm-cuda-profiler-sync-patch] Expected blocks not found — vLLM source
 print("[vllm-cuda-profiler-sync-patch] File:", target)
 sys.exit(0)
 PYPATCH
+
+# ----------------------------------------------------------------------------
+# Patch vLLM's gpu_worker.execute_dummy_batch to tick the WorkerProfiler
+# step counter on 0-token iters, restoring symmetry with execute_model.
+#
+# Why this is needed:
+#   wrapper.step() (which advances `_active_iteration_count` and triggers
+#   cudaProfilerStart after `delay_iterations`) is only called from
+#   `gpu_worker.annotate_profile`, which is wrapped around
+#   `model_runner.execute_model` (gpu_worker.py:840). On 0-token iters
+#   in multiproc DP mode, `DPEngineCoreProc.run_busy_loop` (core.py:1858)
+#   dispatches `execute_dummy_batch` RPC instead of `execute_model` — and
+#   `execute_dummy_batch` calls `_dummy_run` directly without
+#   `annotate_profile`. So 0-token iters skip the wrapper.step() tick.
+#
+# Consequence: ranks with more tokens during warmup tick the counter
+# more often than 0-token ranks → `delay_iters=500` is reached at
+# different wall-clock times across ranks (36 s spread observed on
+# v25 #53594803) → cudaProfilerStart fires at different wall-clock
+# times across DP ranks → DeepGEMM mega_moe nvlink_barrier counter
+# drifts post-profile → cascade.
+#
+# The fix: tick wrapper.step() inside execute_dummy_batch as well so
+# every iter (token or dummy) advances the counter. wrapper.step() is
+# a pure CPU op (no NCCL, no CUDA collective) — just increments
+# `_active_iteration_count` and conditionally calls _call_start when
+# the threshold is reached. So it adds no extra collective.
+#
+# This is the symmetric counterpart of the existing
+# `annotate_profile.profiler.step()` call at gpu_worker.py:755 and
+# does NOT need any patch to execute_model itself (v27-dpdummy's
+# mistake — that introduced an EXTRA `_dummy_run` call which
+# duplicated the coordinate_batch_across_dp allreduce and caused
+# SeqNum=35 mismatch on #53615976).
+#
+# Always applied (defensive). Idempotent via string presence check.
+python3 - <<'PYPATCH_DUMMY_TICK'
+import os, pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/gpu_worker.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-dummy-batch-tick-patch] gpu_worker.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    def execute_dummy_batch(self) -> None:
+        num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        self.model_runner._dummy_run(num_tokens, uniform_decode=True)"""
+
+new_block = """    def execute_dummy_batch(self) -> None:
+        # [PATCHED by vllm-container-deps-nsys.sh] Tick WorkerProfiler step
+        # counter on 0-token iters so `delay_iterations`-based profile trigger
+        # fires synchronously across DP ranks. Without this, wrapper.step() is
+        # only ticked via annotate_profile (which wraps execute_model), and
+        # 0-token iters reach execute_dummy_batch instead — leaving the
+        # counter stuck. Token-distribution asymmetry across DP ranks then
+        # produces per-rank counter drift → cudaProfilerStart staggers →
+        # DeepGEMM mega_moe barrier counter mismatch post-profile → cascade.
+        # wrapper.step() itself is a pure CPU op (no NCCL / CUDA collective).
+        if self.profiler is not None:
+            self.profiler.step()
+        num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        self.model_runner._dummy_run(num_tokens, uniform_decode=True)"""
+
+if new_block in content:
+    print(f"[vllm-dummy-batch-tick-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-dummy-batch-tick-patch] Expected block not found — vLLM source drift?")
+    print("[vllm-dummy-batch-tick-patch] File:", target)
+    sys.exit(0)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-dummy-batch-tick-patch] Patched (added wrapper.step() to execute_dummy_batch) in {target}")
+PYPATCH_DUMMY_TICK
