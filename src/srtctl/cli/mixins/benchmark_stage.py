@@ -252,7 +252,20 @@ class BenchmarkStageMixin:
         if p.is_torch:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiles_dir_in_container
 
-        # Collect worker leader IPs and system server ports by mode
+        # Collect worker IPs + ports by mode. Two emission patterns based on
+        # frontend + role:
+        #
+        #   (1) Dynamo + decode: emit EVERY DP rank. vLLM's
+        #       AsyncMPClient.call_utility_async only fans the profile RPC to
+        #       the local engine_core, so a single-endpoint POST activates
+        #       profile on 1-of-N decode ranks -> asymmetric CUPTI overhead
+        #       -> NCCL all-reduce timeout under load. Per-rank POST fixes it.
+        #
+        #   (2) Dynamo + prefill / agg, plus all non-dynamo frontends: emit
+        #       only the leader endpoint. Framework-native routers fan out
+        #       internally; per-rank POST would double-trigger. Dynamo
+        #       prefill workloads are short-lived so the leader-only
+        #       asymmetry doesn't have time to drift state across ranks.
         prefill_ips = []
         decode_ips = []
         agg_ips = []
@@ -262,20 +275,25 @@ class BenchmarkStageMixin:
 
         use_sys_port = self.config.frontend.type == "dynamo"
         for process in self.backend_processes:
-            if not process.is_leader:
+            decode_fanout = use_sys_port and process.endpoint_mode == "decode"
+            if not decode_fanout and not process.is_leader:
                 continue
-            leader_ip = get_hostname_ip(process.node, self.runtime.network_interface)
+            worker_ip = get_hostname_ip(process.node, self.runtime.network_interface)
             port = process.sys_port if use_sys_port else process.http_port
-            leader_endpoint = f"{leader_ip}:{port}"
+            worker_endpoint = f"{worker_ip}:{port}"
             if process.endpoint_mode == "prefill":
-                prefill_ips.append(leader_ip)
-                prefill_endpoints.append(leader_endpoint)
+                prefill_ips.append(worker_ip)
+                prefill_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "decode":
-                decode_ips.append(leader_ip)
-                decode_endpoints.append(leader_endpoint)
+                # PROFILE_DECODE_IPS stays leader-only (used for hostname-level
+                # operations); PROFILE_DECODE_ENDPOINTS carries every DP rank
+                # so profile RPCs reach all of them.
+                if process.is_leader:
+                    decode_ips.append(worker_ip)
+                decode_endpoints.append(worker_endpoint)
             elif process.endpoint_mode == "agg":
-                agg_ips.append(leader_ip)
-                agg_endpoints.append(leader_endpoint)
+                agg_ips.append(worker_ip)
+                agg_endpoints.append(worker_endpoint)
 
         if prefill_ips:
             env["PROFILE_PREFILL_IPS"] = ",".join(prefill_ips)

@@ -84,10 +84,30 @@ profiling__start_profile_on_worker() {
             ;;
     esac
 
-    if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
+    # Hardened curl: --max-time bounds the call so a hung worker can't stall
+    # the benchmark; --retry catches transient races between worker readiness
+    # and the start_profile POST. Failures are reported per-worker but do not
+    # abort the benchmark — missing one rank's profile is recoverable, an
+    # aborted benchmark is not.
+    #
+    # Diagnostics: capture the actual curl exit code + HTTP status + response
+    # body when the call doesn't return 2xx. The previous version logged
+    # "(curl exit $?)" but bash's `if cmd; ...; fi` resets $? to the if
+    # statement's exit, so the reported exit was misleading.
+    local _curl_output _curl_rc
+    _curl_output="$(curl -sS --max-time 30 --retry 3 --retry-delay 2 \
+        -w $'\nHTTP_CODE:%{http_code} TIME_TOTAL:%{time_total}s' \
+        -X POST "http://${hostport}${start_path}" \
+        -H "Content-Type: application/json" -d "${payload}" 2>&1)"
+    _curl_rc=$?
+    if [[ "${_curl_rc}" -eq 0 ]] && [[ "${_curl_output}" == *"HTTP_CODE:2"* ]]; then
         return 0
     fi
-    echo "Warning: failed to start profiling on ${hostport}"
+    # Squash response to a single line and bound length so multi-MB error
+    # bodies don't blow up the bench log.
+    local _curl_summary
+    _curl_summary="$(printf '%s' "${_curl_output}" | tr '\n' ' ' | head -c 1500)"
+    echo "Warning: failed to start profiling on ${hostport} (curl_rc=${_curl_rc}); response: ${_curl_summary}" >&2
     return 0
 }
 
@@ -117,7 +137,20 @@ profiling__stop_profile_on_worker() {
             ;;
     esac
 
-    curl -sS -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null || true
+    # Same hardening as start_profile: bounded time, retries, non-fatal on
+    # failure. Capture the real curl exit code and HTTP body for diagnostics.
+    local _curl_output _curl_rc
+    _curl_output="$(curl -sS --max-time 30 --retry 3 --retry-delay 2 \
+        -w $'\nHTTP_CODE:%{http_code} TIME_TOTAL:%{time_total}s' \
+        -X POST "http://${hostport}${stop_path}" \
+        -H "Content-Type: application/json" -d '{}' 2>&1)"
+    _curl_rc=$?
+    if [[ "${_curl_rc}" -eq 0 ]] && [[ "${_curl_output}" == *"HTTP_CODE:2"* ]]; then
+        return 0
+    fi
+    local _curl_summary
+    _curl_summary="$(printf '%s' "${_curl_output}" | tr '\n' ' ' | head -c 1500)"
+    echo "Warning: failed to stop profiling on ${hostport} (curl_rc=${_curl_rc}); response: ${_curl_summary}" >&2
     return 0
 }
 
