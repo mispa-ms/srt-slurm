@@ -317,3 +317,81 @@ print("[vllm-cuda-profiler-sync-patch] Expected blocks not found — vLLM source
 print("[vllm-cuda-profiler-sync-patch] File:", target)
 sys.exit(0)
 PYPATCH
+
+# ----------------------------------------------------------------------------
+# Patch vLLM's gpu_model_runner.py to call _dummy_run(1) on 0-token iters for
+# ALL DP backends, not just `external_launcher`. Without this, multiproc_executor
+# (the default and what we use) skips the entire forward pass on a 0-token iter
+# and the rank's mega_moe / DeepGEMM nvlink_barrier counter drifts vs peers.
+# After enough drift, a barrier deadlocks at 30s (vllm-bundled DeepGEMM
+# timeout) which surfaces as cudaErrorLaunchFailure → sample_tokens RPC
+# cascade ~5 min later (VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=300).
+#
+# The vLLM developers explicitly KNEW about this: the existing comment in the
+# code says "to avoid out of sync issues" but the dummy_run is gated only on
+# `distributed_executor_backend == "external_launcher"`. multiproc_executor +
+# DP > 1 was missed.
+#
+# Evidence:
+#   - v25 (#53594803, 2026-06-03) — 4 early-profile ranks hit barrier timeout
+#     with signal=12, target=0 (= they're 1 barrier call ahead of the other 12
+#     ranks because the 12 late-profile ranks skipped mega_moe on some 0-token
+#     iter during the 36-second profile entry skew).
+#   - SGLang doesn't hit this because its `should_use_mega_moe()` decides via
+#     `max(get_dp_global_num_tokens())` — all-or-nothing across DP — and IDLE
+#     batches still execute the forward pass with padding.
+#
+# Always applied (defensive fix). Idempotent via string presence check.
+python3 - <<'PYPATCH_GMR'
+import os, pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/gpu_model_runner.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-dp-dummy-run-patch] gpu_model_runner.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """            if not num_scheduled_tokens:
+                if (
+                    self.parallel_config.distributed_executor_backend
+                    == "external_launcher"
+                    and self.parallel_config.data_parallel_size > 1
+                ):
+                    # this is a corner case when both external launcher
+                    # and DP are enabled, num_scheduled_tokens could be
+                    # 0, and has_unfinished_requests in the outer loop
+                    # returns True. before returning early here we call
+                    # dummy run to ensure coordinate_batch_across_dp
+                    # is called into to avoid out of sync issues.
+                    self._dummy_run(1)"""
+
+new_block = """            if not num_scheduled_tokens:
+                if self.parallel_config.data_parallel_size > 1:
+                    # [PATCHED by vllm-container-deps-nsys.sh] Originally gated
+                    # on `distributed_executor_backend == "external_launcher"`;
+                    # extended to ALL DP backends so multiproc_executor also
+                    # calls _dummy_run on 0-token iters. Without this, the
+                    # rank's mega_moe / DeepGEMM nvlink_barrier counter drifts
+                    # vs peers and a barrier deadlocks at 30s (vllm-bundled
+                    # DeepGEMM timeout). See VLLM_NSYS_CAPTURE_NOTES.md
+                    # Gotcha 20 and V25_TRACE_VALIDATION.md.
+                    self._dummy_run(1)"""
+
+if new_block in content:
+    print(f"[vllm-dp-dummy-run-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-dp-dummy-run-patch] Expected block not found — vLLM source drift?")
+    print("[vllm-dp-dummy-run-patch] File:", target)
+    sys.exit(0)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-dp-dummy-run-patch] Patched (external_launcher-only -> any DP > 1) in {target}")
+PYPATCH_GMR
