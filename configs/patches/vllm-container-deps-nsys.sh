@@ -399,3 +399,88 @@ content = content.replace(old_block, new_block)
 target.write_text(content)
 print(f"[vllm-dummy-batch-tick-patch] Patched (added wrapper.step() to execute_dummy_batch) in {target}")
 PYPATCH_DUMMY_TICK
+
+# ----------------------------------------------------------------------------
+# Patch vLLM's gpu_worker.annotate_profile to gate the wrapper.step() tick
+# on `total_num_scheduled_tokens > 0`, completing the symmetric counter
+# update across all DP iter types.
+#
+# Why this is needed (edge case discovered after PYPATCH_DUMMY_TICK):
+#   execute_model is called by EngineCore.step() whenever
+#   `scheduler.has_requests()` is True — including iters where
+#   `total_num_scheduled_tokens == 0` but KV-connector work is pending
+#   (NIXL KV-transfer iter in disagg decode). In those iters:
+#     1. annotate_profile is called → ticks wrapper.step() (this patch removes
+#        the tick by gating on tokens > 0)
+#     2. execute_model hits early return at gpu_model_runner.py:4007,
+#        runs kv_connector_no_forward, returns
+#     3. EngineCore.step() returns model_executed=False
+#     4. DPEngineCoreProc.run_busy_loop sees not-executed → calls
+#        execute_dummy_batch → PYPATCH_DUMMY_TICK ticks wrapper.step()
+#   Without this gate: wrapper.step() would tick TWICE on KV-only iters,
+#   reintroducing per-rank asymmetry (token-poor ranks have more KV-only
+#   iters and thus tick more).
+#
+# With BOTH PYPATCH_DUMMY_TICK and this gate:
+#   - Active token iter (tokens > 0): annotate_profile ticks (gate passes),
+#     dummy not called → 1 tick
+#   - 0-token + KV iter: annotate_profile skips tick (gated), dummy ticks
+#     → 1 tick
+#   - Pure-dummy iter (no requests at all): step() early returns without
+#     calling execute_model, dummy ticks → 1 tick
+#   Every iter type has exactly 1 wrapper.step() tick across all DP ranks.
+#
+# Always applied. Idempotent.
+python3 - <<'PYPATCH_ANNOTATE_GATE'
+import os, pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/gpu_worker.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-annotate-profile-gate-patch] gpu_worker.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    def annotate_profile(self, scheduler_output):
+        # add trace annotation so that we can easily distinguish
+        # context/generation request numbers in each iteration.
+        # A context request is a request that has not yet generated any tokens
+        if not self.profiler:
+            return nullcontext()
+
+        self.profiler.step()"""
+
+new_block = """    def annotate_profile(self, scheduler_output):
+        # add trace annotation so that we can easily distinguish
+        # context/generation request numbers in each iteration.
+        # A context request is a request that has not yet generated any tokens
+        if not self.profiler:
+            return nullcontext()
+
+        # [PATCHED by vllm-container-deps-nsys.sh] Gate the wrapper.step()
+        # tick on tokens > 0. This pairs with PYPATCH_DUMMY_TICK
+        # (execute_dummy_batch always ticks). Without this gate, KV-only
+        # iters (tokens=0 but kv_connector work pending) tick twice —
+        # once here, once via execute_dummy_batch fired from
+        # DPEngineCoreProc.run_busy_loop because model_executed=False —
+        # reintroducing per-rank counter asymmetry.
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            self.profiler.step()"""
+
+if new_block in content:
+    print(f"[vllm-annotate-profile-gate-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-annotate-profile-gate-patch] Expected block not found — vLLM source drift?")
+    print("[vllm-annotate-profile-gate-patch] File:", target)
+    sys.exit(0)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-annotate-profile-gate-patch] Patched (gated wrapper.step() on tokens > 0) in {target}")
+PYPATCH_ANNOTATE_GATE
