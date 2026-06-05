@@ -255,6 +255,11 @@ new_block = """            if not executed:
                 # this, the two counters diverge whenever the engine is
                 # idle, making it impossible to map a captured nsys window
                 # back to a specific Iteration(N) range from the engine log.
+                #
+                # The dummy emit is explicitly tagged with " [DUMMY]" so it
+                # is grep-distinguishable from real engine iters (active and
+                # KV-only) that also legitimately log all-zero counts on
+                # KV-transfer-only iters.
                 _vlnsys_emit_log = (
                     self.vllm_config.observability_config.enable_logging_iteration_details
                 )
@@ -274,7 +279,7 @@ new_block = """            if not executed:
                                 "0 generation requests, 0 generation tokens, ",
                                 "iteration elapsed time: ",
                                 format((time.monotonic() - _vlnsys_before) * 1000, ".2f"),
-                                " ms",
+                                " ms [DUMMY]",
                             ]
                         )
                     )

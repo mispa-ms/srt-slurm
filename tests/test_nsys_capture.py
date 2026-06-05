@@ -486,6 +486,10 @@ class TestDummyLogSyncPatch:
         assert 0 <= before_idx < edb_idx < emit_idx, (
             "before-mark must precede execute_dummy_batch which must precede emit"
         )
+        # Dummy emits are explicitly tagged so they are distinguishable from
+        # real (active/KV-only) Iteration(N) logs that also legitimately have
+        # all-zero counts on KV-transfer-only iters.
+        assert "[DUMMY]" in new, "dummy emit must include explicit [DUMMY] marker"
         # And the result must still be valid python
         compile(new, str(stub), "exec")
 
