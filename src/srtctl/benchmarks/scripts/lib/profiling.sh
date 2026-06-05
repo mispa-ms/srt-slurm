@@ -90,6 +90,12 @@ profiling__start_profile_on_worker() {
     # abort the benchmark — missing one rank's profile is recoverable, an
     # aborted benchmark is not.
     #
+    # Note: --retry retries connection-level failures only (refused, reset,
+    # timeout) — not HTTP 5xx. That's intentional. If start_profile returns
+    # 5xx, the worker began handling the call before failing, so re-issuing
+    # the POST could land on a different rank (under dynamo) or double-fire
+    # on the same rank. Fail fast and surface the response body instead.
+    #
     # Diagnostics: capture the actual curl exit code + HTTP status + response
     # body when the call doesn't return 2xx. The previous version logged
     # "(curl exit $?)" but bash's `if cmd; ...; fi` resets $? to the if

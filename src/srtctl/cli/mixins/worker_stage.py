@@ -144,6 +144,11 @@ class WorkerStageMixin:
             # nsys with the same `-o ...` path; with --force-overwrite=true
             # the last finalizer wipes earlier writers and the others race
             # to delete/recreate it.
+            #
+            # Process.cuda_visible_devices (topology.py:225) builds the same
+            # sorted indices joined by `,` — correct for the env var, but
+            # `,` is filename-unsafe on tools that scan directories, so we
+            # rebuild the string here with `-`.
             gpu_tag = "_gpu" + "-".join(str(i) for i in sorted(process.gpu_indices)) if process.gpu_indices else ""
             nsys_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}{gpu_tag}_profile"
             nsys_prefix = profiling.get_nsys_prefix(

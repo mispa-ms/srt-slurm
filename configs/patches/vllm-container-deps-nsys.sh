@@ -91,9 +91,16 @@ if new_block in content:
     sys.exit(0)
 
 if old_block not in content:
-    print("[vllm-dummy-batch-tick-patch] Expected block not found - vLLM source drift?")
-    print("[vllm-dummy-batch-tick-patch] File:", target)
-    sys.exit(0)
+    # Fail hard rather than silently no-op. A silent skip on source drift
+    # would let the asymmetric-tick cascade quietly re-emerge on a newer
+    # vLLM image — the bench would still run, profile would still fire,
+    # and the post-stop EngineDeadError would just come back. Failing the
+    # container init forces a "update this patch for the new vLLM shape"
+    # signal at the right time.
+    print("[vllm-dummy-batch-tick-patch] ERROR: expected block not found in", target)
+    print("[vllm-dummy-batch-tick-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_DUMMY_TICK")
+    print("[vllm-dummy-batch-tick-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
 
 content = content.replace(old_block, new_block)
 target.write_text(content)
@@ -171,9 +178,11 @@ if new_block in content:
     sys.exit(0)
 
 if old_block not in content:
-    print("[vllm-annotate-profile-gate-patch] Expected block not found - vLLM source drift?")
-    print("[vllm-annotate-profile-gate-patch] File:", target)
-    sys.exit(0)
+    # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
+    print("[vllm-annotate-profile-gate-patch] ERROR: expected block not found in", target)
+    print("[vllm-annotate-profile-gate-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_ANNOTATE_GATE")
+    print("[vllm-annotate-profile-gate-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
 
 content = content.replace(old_block, new_block)
 target.write_text(content)

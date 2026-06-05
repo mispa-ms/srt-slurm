@@ -368,17 +368,22 @@ class TestWrapperStepPatches:
         # And must still be valid python
         compile(new, str(stub), "exec")
 
-    def test_drift_safe_when_block_missing(self, tmp_path):
-        """If upstream vLLM changes the block shape, the patch must exit 0
-        with an informative message rather than corrupting the file."""
-        target = tmp_path / "gpu_worker.py"
-        target.write_text("# vLLM source has drifted; no execute_dummy_batch in this shape\n")
-        body = self._extract_heredoc("PYPATCH_DUMMY_TICK")
-        result = self._run_heredoc_against(body, target)
-        assert result.returncode == 0
-        assert "Expected block not found" in result.stdout
-        # File must be untouched
-        assert target.read_text() == "# vLLM source has drifted; no execute_dummy_batch in this shape\n"
+    def test_fails_loud_on_source_drift(self, tmp_path):
+        """If upstream vLLM changes the block shape, the patch must fail
+        hard (non-zero exit) rather than silently no-op. A silent skip
+        would let the asymmetric-tick cascade quietly re-emerge on a
+        newer vLLM image."""
+        original = "# vLLM source has drifted; no execute_dummy_batch in this shape\n"
+        for name in ("PYPATCH_DUMMY_TICK", "PYPATCH_ANNOTATE_GATE"):
+            target = tmp_path / f"gpu_worker_{name}.py"
+            target.write_text(original)
+            body = self._extract_heredoc(name)
+            result = self._run_heredoc_against(body, target)
+            assert result.returncode != 0, f"{name} should hard-fail on drift, got {result.returncode}"
+            assert "ERROR" in result.stdout
+            assert "drifted" in result.stdout
+            # File must be untouched
+            assert target.read_text() == original
 
     def test_install_script_parses_with_bash(self):
         """Defense-in-depth: the install script must be syntactically valid bash."""
