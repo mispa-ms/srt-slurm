@@ -221,6 +221,20 @@ PYPATCH_ANNOTATE_GATE
 # only; non-DP `EngineCoreProc.run_busy_loop` is untouched because it
 # doesn't have an execute_dummy_batch path (blocks on input_queue when
 # no requests, so no pure-dummy iters happen).
+#
+# Important: KV-only iters (tokens=0 but has_requests=True) already go
+# through EngineCore.step() and its log_iteration_details, which emits
+# Iteration(N) and ticks _iteration_index. The patch must NOT
+# double-emit on those. We use a delta check on _iteration_index
+# (snapshot before _process_engine_step, compare after) as the signal —
+# only emit a dummy log when the index did NOT advance during the step
+# call, which is the exact upstream contract for "step() decided not to
+# log this iter". This is more robust than inferring from `not
+# executed` since that flag is True for BOTH KV-only and pure-dummy.
+# The emit is tagged "[dp-idle]" right after the Iteration(N) prefix
+# so users can `grep -v "\\[dp-idle\\]"` to exclude synthetic iters
+# from throughput counts while keeping the index continuous for
+# capture-window planning.
 python3 - <<'PYPATCH_DUMMY_LOG_SYNC'
 import pathlib, sys
 
@@ -235,7 +249,11 @@ if target is None:
 
 content = target.read_text()
 
-old_block = """            if not executed:
+old_block = """            executed = self._process_engine_step()
+            self._maybe_publish_request_counts()
+
+            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
                     continue
@@ -244,46 +262,64 @@ old_block = """            if not executed:
                 # if the model didn't execute any ready requests.
                 self.execute_dummy_batch()"""
 
-new_block = """            if not executed:
+new_block = """            # [PATCHED by vllm-container-deps-nsys.sh] Snapshot
+            # _iteration_index BEFORE _process_engine_step so we can later
+            # detect whether log_iteration_details inside EngineCore.step()
+            # actually emitted an Iteration(N) log (i.e. scheduler had
+            # requests). This lets us emit a dummy Iteration(N) log for
+            # pure-dummy iters ONLY (no requests at all), without
+            # double-counting KV-only iters where step() already emitted
+            # with all-zero counts.
+            _vlnsys_iter_log_enabled = (
+                self.vllm_config.observability_config.enable_logging_iteration_details
+            )
+            if _vlnsys_iter_log_enabled:
+                _vlnsys_iter_before = getattr(self, "_iteration_index", 0)
+
+            executed = self._process_engine_step()
+            self._maybe_publish_request_counts()
+
+            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
                     continue
 
-                # [PATCHED by vllm-container-deps-nsys.sh] Emit Iteration(N)
-                # log for the dummy iter so the engine iteration counter
-                # matches the worker-side wrapper.step() counter. Without
-                # this, the two counters diverge whenever the engine is
-                # idle, making it impossible to map a captured nsys window
-                # back to a specific Iteration(N) range from the engine log.
-                #
-                # The dummy emit is explicitly tagged with " [DUMMY]" so it
-                # is grep-distinguishable from real engine iters (active and
-                # KV-only) that also legitimately log all-zero counts on
-                # KV-transfer-only iters.
-                _vlnsys_emit_log = (
-                    self.vllm_config.observability_config.enable_logging_iteration_details
+                # [PATCHED] Only emit dummy log if step() did NOT already
+                # tick _iteration_index (i.e. this is a pure-dummy iter, not
+                # a KV-only iter). Using the index delta as the signal is
+                # more robust than inferring from `not executed`, which
+                # covers both KV-only and pure-dummy cases. The emit is
+                # tagged with "[dp-idle]" right after the Iteration(N)
+                # prefix so it is grep-distinguishable from real engine
+                # iters that also log all-zero counts on KV-transfer-only
+                # iters — e.g. `grep "Iteration(" | grep -v "dp-idle"`
+                # gives just the real-work iters for throughput stats.
+                _vlnsys_emit_dummy_log = (
+                    _vlnsys_iter_log_enabled
+                    and getattr(self, "_iteration_index", 0) == _vlnsys_iter_before
                 )
-                if _vlnsys_emit_log:
-                    self._iteration_index = getattr(self, "_iteration_index", 0)
+                if _vlnsys_emit_dummy_log:
                     _vlnsys_before = time.monotonic()
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
                 self.execute_dummy_batch()
-                if _vlnsys_emit_log:
+                if _vlnsys_emit_dummy_log:
+                    _vlnsys_idx = getattr(self, "_iteration_index", 0)
                     logger.info(
                         "".join(
                             [
                                 "Iteration(",
-                                str(self._iteration_index),
-                                "): 0 context requests, 0 context tokens, ",
+                                str(_vlnsys_idx),
+                                ") [dp-idle]: 0 context requests, 0 context tokens, ",
                                 "0 generation requests, 0 generation tokens, ",
                                 "iteration elapsed time: ",
                                 format((time.monotonic() - _vlnsys_before) * 1000, ".2f"),
-                                " ms [DUMMY]",
+                                " ms",
                             ]
                         )
                     )
-                    self._iteration_index += 1"""
+                    self._iteration_index = _vlnsys_idx + 1"""
 
 if new_block in content:
     print(f"[vllm-dummy-log-sync-patch] Already patched, skipping. File: {target}")

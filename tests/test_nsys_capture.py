@@ -474,22 +474,43 @@ class TestDummyLogSyncPatch:
         assert result.returncode == 0, result.stderr
         new = stub.read_text()
         # The patch adds the Iteration() emit and the iteration_index tick
-        assert "Iteration(" in new
         assert "_iteration_index" in new
         assert "enable_logging_iteration_details" in new
-        # And gates them on the iter-log config flag
-        assert "if _vlnsys_emit_log:" in new
-        # And keeps execute_dummy_batch() between the before/after marks
+        # Gate uses the delta-detection variable
+        assert "_vlnsys_emit_dummy_log" in new
+        # Pre-step snapshot must happen BEFORE _process_engine_step, so we can
+        # detect whether log_iteration_details inside step() advanced
+        # _iteration_index (KV-only iter) vs not (pure dummy iter).
+        snap_idx = new.find("_vlnsys_iter_before = getattr(self,")
+        step_idx = new.find("executed = self._process_engine_step()")
+        assert 0 <= snap_idx < step_idx, (
+            "_iteration_index snapshot must happen BEFORE _process_engine_step"
+        )
+        # Dummy-emit is gated on the delta of _iteration_index being zero —
+        # i.e., step() did NOT already emit Iteration(N). Without this guard,
+        # KV-only iters (which DO emit via step's log_iteration_details) would
+        # be DOUBLE-counted.
+        delta_check_idx = new.find('getattr(self, "_iteration_index", 0) == _vlnsys_iter_before')
+        assert delta_check_idx > step_idx, (
+            "dummy-emit guard must compare _iteration_index against pre-step snapshot"
+        )
+        # Order inside the if-not-executed branch: gate-compute -> before-mark
+        # -> execute_dummy_batch -> emit. Use logger.info as the emit anchor
+        # (it's unique to the emit site; "Iteration(" appears in comments too).
+        gate_idx = new.find("_vlnsys_emit_dummy_log = (")
         before_idx = new.find("_vlnsys_before = time.monotonic()")
         edb_idx = new.find("self.execute_dummy_batch()")
-        emit_idx = new.find('"Iteration("')
-        assert 0 <= before_idx < edb_idx < emit_idx, (
-            "before-mark must precede execute_dummy_batch which must precede emit"
+        emit_idx = new.find("logger.info(")
+        assert 0 <= gate_idx < before_idx < edb_idx < emit_idx, (
+            "expected order in not-executed branch: gate -> before-mark -> "
+            f"execute_dummy_batch -> emit; got {gate_idx=} {before_idx=} "
+            f"{edb_idx=} {emit_idx=}"
         )
-        # Dummy emits are explicitly tagged so they are distinguishable from
-        # real (active/KV-only) Iteration(N) logs that also legitimately have
-        # all-zero counts on KV-transfer-only iters.
-        assert "[DUMMY]" in new, "dummy emit must include explicit [DUMMY] marker"
+        # Dummy emits are tagged with "[dp-idle]" right after the Iteration(N)
+        # prefix so they are grep-distinguishable from real engine iters that
+        # also legitimately log all-zero counts on KV-transfer-only iters
+        # (`grep "Iteration(" | grep -v "dp-idle"` gives real-work iters).
+        assert "[dp-idle]" in new, "dummy emit must include [dp-idle] marker"
         # And the result must still be valid python
         compile(new, str(stub), "exec")
 
@@ -515,17 +536,47 @@ class TestDummyLogSyncPatch:
         assert "drifted" in result.stdout
         assert target.read_text() == original
 
-    def test_no_op_when_iter_log_disabled(self, tmp_path):
-        """After patching, the dummy-iter emit block must be gated on
-        `enable_logging_iteration_details`, so runs without iter-log
-        enabled incur no runtime cost beyond the original execute_dummy_batch
-        invocation."""
+    def test_kv_only_iter_not_double_counted(self, tmp_path):
+        """Regression test for the bug Codex caught: when step() emits its
+        own Iteration(N) for a KV-only iter (tokens=0 but has_requests),
+        the dummy-emit branch must skip — otherwise wrapper and engine
+        counters diverge in the opposite direction.
+
+        The guard is implemented via _iteration_index delta detection.
+        Verify by inspecting the patched source: there must be NO code
+        path that unconditionally emits an Iteration() in the dummy
+        branch when _vlnsys_iter_log_enabled is true."""
         stub = self._materialize_stub(tmp_path)
         body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
         result = self._run_heredoc(body, stub)
         assert result.returncode == 0
         new = stub.read_text()
-        # The gate must be EVALUATED ONCE before execute_dummy_batch (so when
-        # iter-log is off, the only added work is one boolean read).
-        emit_section = new.split("self.execute_dummy_batch()")[0].split("if not executed:")[-1]
-        assert "self.vllm_config.observability_config.enable_logging_iteration_details" in emit_section
+        # The dummy branch must check `_iteration_index == _vlnsys_iter_before`
+        # before emitting — that's the signal that step() did NOT log this iter.
+        not_executed_block = new.split("if not executed:")[1].split("# 3) All-reduce")[0]
+        # The emit gate must reference the pre-step snapshot for the delta check
+        assert "_vlnsys_iter_before" in not_executed_block, (
+            "dummy-emit guard must use pre-step _iteration_index snapshot to detect KV-only"
+        )
+        # Specifically: an equality check between current _iteration_index and the snapshot
+        assert "== _vlnsys_iter_before" in not_executed_block, (
+            "dummy-emit must only fire when _iteration_index has NOT advanced "
+            "(== _vlnsys_iter_before); KV-only iters advance it via step's log_iteration_details"
+        )
+
+    def test_no_op_when_iter_log_disabled(self, tmp_path):
+        """After patching, the dummy-iter emit block must be gated on
+        `enable_logging_iteration_details`, so runs without iter-log
+        enabled incur no runtime cost beyond the pre-step snapshot guard
+        and the original execute_dummy_batch invocation."""
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
+        result = self._run_heredoc(body, stub)
+        assert result.returncode == 0
+        new = stub.read_text()
+        # The iter-log gate must be evaluated ONCE before _process_engine_step
+        # so when iter-log is off the only added work is one boolean read
+        # (the pre-step snapshot is gated and skipped entirely).
+        pre_step_section = new.split("executed = self._process_engine_step()")[0]
+        assert "_vlnsys_iter_log_enabled" in pre_step_section
+        assert "enable_logging_iteration_details" in pre_step_section
