@@ -336,3 +336,87 @@ content = content.replace(old_block, new_block)
 target.write_text(content)
 print(f"[vllm-dummy-log-sync-patch] Patched (added dummy-iter Iteration(N) emit) in {target}")
 PYPATCH_DUMMY_LOG_SYNC
+
+# ----------------------------------------------------------------------------
+# Patch vLLM's CudaProfilerWrapper._stop to fence around cudaProfilerStop.
+#
+# Why this is needed:
+#   On DP+EP topologies with per-rank nsys fanout (every DP rank calls
+#   /engine/start_profile), all 16 ranks hit cudaProfilerStop at the
+#   max_iterations boundary. Without a fence:
+#     1. cudaProfilerStop returns immediately on each rank
+#     2. CUPTI starts a background drain (proportional to capture size)
+#     3. Engine proceeds to next iter; subsequent NCCL all_reduce / EP
+#        all_to_all collectives launch while CUPTI drain is still in flight
+#     4. Rank-to-rank state drift accumulates over ~200 iters
+#     5. All ranks wedge at the same iter; 5-min RPC timeout fires
+#
+#   Empirical signature: v34 (delay=500, max=50, ~5 MB capture) succeeds;
+#   v35 (delay=4500, max=120, ~14 MB capture) deadlocks at iter ~5195
+#   exactly 15 sec after "Profiler stopped successfully" log on all ranks.
+#   Buffer-size dependent → CUPTI drain overlap with collectives.
+#
+# Fix: torch.cuda.synchronize() before AND after the stop syscall, on
+# every rank. The pre-stop sync ensures no GPU work is in flight when the
+# profiler tears down; the post-stop sync blocks until CUPTI drain
+# completes on this rank. Since every rank does this independently, ranks
+# naturally converge — by the time any rank starts iter N+1, all 16 have
+# completed drain.
+#
+# This is the same shape as SGLang's profile_manager.py torch_profiler
+# path (explicit torch.distributed.barrier after stop), adapted to the
+# vLLM per-rank profiler architecture.
+#
+# Idempotent.
+python3 - <<'PYPATCH_STOP_FENCE'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/profiler/wrapper.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/profiler/wrapper.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-stop-fence-patch] vllm/profiler/wrapper.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    @override
+    def _start(self) -> None:
+        self._cuda_profiler.start()
+
+    @override
+    def _stop(self) -> None:
+        self._cuda_profiler.stop()"""
+
+new_block = """    @override
+    def _start(self) -> None:
+        self._cuda_profiler.start()
+
+    @override
+    def _stop(self) -> None:
+        # [PATCHED by vllm-container-deps-nsys.sh] Fence cudaProfilerStop
+        # with torch.cuda.synchronize() on every rank to avoid post-stop
+        # CUPTI-drain / NCCL-collective contention deadlock observed on
+        # per-rank DP+EP fanout (cascade signature: all ranks wedge at
+        # the same iter ~200 iters after stop, 5-min RPC timeout).
+        torch.cuda.synchronize()
+        self._cuda_profiler.stop()
+        torch.cuda.synchronize()"""
+
+if new_block in content:
+    print(f"[vllm-stop-fence-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
+    print("[vllm-stop-fence-patch] ERROR: expected block not found in", target)
+    print("[vllm-stop-fence-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_STOP_FENCE")
+    print("[vllm-stop-fence-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-stop-fence-patch] Patched (cuda.synchronize fence around cudaProfilerStop) in {target}")
+PYPATCH_STOP_FENCE

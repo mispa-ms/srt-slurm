@@ -580,3 +580,122 @@ class TestDummyLogSyncPatch:
         pre_step_section = new.split("executed = self._process_engine_step()")[0]
         assert "_vlnsys_iter_log_enabled" in pre_step_section
         assert "enable_logging_iteration_details" in pre_step_section
+
+
+# ---------------------------------------------------------------------------
+# 5. PYPATCH_STOP_FENCE: cuda.synchronize fence around cudaProfilerStop
+# ---------------------------------------------------------------------------
+
+
+_STUB_PROFILER_WRAPPER = """\
+import torch
+
+
+class WorkerProfiler:
+    pass
+
+
+class CudaProfilerWrapper(WorkerProfiler):
+    def __init__(self, profiler_config) -> None:
+        super().__init__()
+        # Note: lazy import to avoid dependency issues if CUDA is not available.
+        import torch.cuda.profiler as cuda_profiler
+
+        self._cuda_profiler = cuda_profiler
+
+    @override
+    def _start(self) -> None:
+        self._cuda_profiler.start()
+
+    @override
+    def _stop(self) -> None:
+        self._cuda_profiler.stop()
+
+    @override
+    def annotate_context_manager(self, name):
+        return torch.cuda.nvtx.range(name)
+"""
+
+
+class TestStopFencePatch:
+    """PYPATCH_STOP_FENCE wraps cudaProfilerStop with torch.cuda.synchronize()
+    on each rank to avoid post-stop CUPTI/NCCL contention deadlock observed on
+    per-rank DP+EP fanout (v35-delay4500 cascade signature)."""
+
+    @staticmethod
+    def _extract_heredoc(name: str) -> str:
+        src = PATCH_SCRIPT.read_text()
+        m = re.search(rf"python3 - <<'{name}'\n(.*?)\n{name}\n", src, re.DOTALL)
+        assert m is not None, f"heredoc {name} not found in {PATCH_SCRIPT}"
+        return m.group(1)
+
+    @staticmethod
+    def _materialize_stub(tmp_path: Path) -> Path:
+        target = tmp_path / "wrapper.py"
+        target.write_text(_STUB_PROFILER_WRAPPER)
+        return target
+
+    def _run_heredoc(self, heredoc_body: str, stub_path: Path) -> subprocess.CompletedProcess:
+        rewritten = heredoc_body.replace(
+            'pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/profiler/wrapper.py")',
+            f'pathlib.Path("{stub_path}")',
+        ).replace(
+            'pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/profiler/wrapper.py")',
+            f'pathlib.Path("{stub_path}.unused")',
+        )
+        return subprocess.run(
+            [sys.executable, "-c", rewritten],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_applies(self, tmp_path):
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_STOP_FENCE")
+        result = self._run_heredoc(body, stub)
+        assert result.returncode == 0, result.stderr
+        new = stub.read_text()
+        # The fence must be three contiguous CALL lines (8-space indent, no
+        # `#` prefix). Using a literal block match avoids false positives
+        # from the patch's explanatory comment, which mentions the method
+        # names in prose.
+        fence_block = (
+            "        torch.cuda.synchronize()\n"
+            "        self._cuda_profiler.stop()\n"
+            "        torch.cuda.synchronize()"
+        )
+        assert fence_block in new, "expected sync→stop→sync contiguous block in _stop"
+        # And the fence must be inside _stop, not _start.
+        start_idx = new.find("def _start(self)")
+        stop_def_idx = new.find("def _stop(self)")
+        fence_idx = new.find(fence_block)
+        assert start_idx < stop_def_idx < fence_idx
+        # The _start path is unchanged (no synchronize there).
+        start_section = new[start_idx:stop_def_idx]
+        assert "torch.cuda.synchronize" not in start_section
+
+    def test_idempotent(self, tmp_path):
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_STOP_FENCE")
+        r1 = self._run_heredoc(body, stub)
+        first = stub.read_text()
+        r2 = self._run_heredoc(body, stub)
+        second = stub.read_text()
+        assert r1.returncode == 0 and r2.returncode == 0
+        assert first == second
+        assert "Already patched, skipping" in r2.stdout
+
+    def test_fails_loud_on_drift(self, tmp_path):
+        """If upstream vLLM changes CudaProfilerWrapper._stop's shape, the
+        patch must hard-fail rather than silently no-op — silently skipping
+        would let the post-stop cascade quietly re-emerge."""
+        original = "# vLLM source has drifted; no CudaProfilerWrapper here\n"
+        target = tmp_path / "wrapper.py"
+        target.write_text(original)
+        body = self._extract_heredoc("PYPATCH_STOP_FENCE")
+        result = self._run_heredoc(body, target)
+        assert result.returncode != 0
+        assert "ERROR" in result.stdout
+        assert "drifted" in result.stdout
+        assert target.read_text() == original
