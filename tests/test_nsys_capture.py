@@ -389,3 +389,139 @@ class TestWrapperStepPatches:
         """Defense-in-depth: the install script must be syntactically valid bash."""
         result = subprocess.run(["bash", "-n", str(PATCH_SCRIPT)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 4. PYPATCH_DUMMY_LOG_SYNC: engine-side dummy iter Iteration(N) emit
+# ---------------------------------------------------------------------------
+
+
+_STUB_ENGINE_CORE = """\
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class DPEngineCoreProc:
+    def __init__(self):
+        self.vllm_config = None
+        self.scheduler = None
+        self.engines_running = False
+
+    def run_busy_loop(self):
+        while True:
+            self._process_input_queue()
+            self._maybe_publish_request_counts()
+
+            executed = self._process_engine_step()
+            self._maybe_publish_request_counts()
+
+            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            if not executed:
+                if not local_unfinished_reqs and not self.engines_running:
+                    # All engines are idle.
+                    continue
+
+                # We are in a running state and so must execute a dummy pass
+                # if the model didn't execute any ready requests.
+                self.execute_dummy_batch()
+
+            # 3) All-reduce operation to determine global unfinished reqs.
+            self.engines_running = self._has_global_unfinished_reqs(
+                local_unfinished_reqs
+            )
+"""
+
+
+class TestDummyLogSyncPatch:
+    """`PYPATCH_DUMMY_LOG_SYNC` must rewrite DPEngineCoreProc.run_busy_loop to
+    emit an `Iteration(N)` log on the pure-dummy iter path, unifying the
+    engine iteration counter with the worker wrapper.step() counter."""
+
+    @staticmethod
+    def _extract_heredoc(name: str) -> str:
+        src = PATCH_SCRIPT.read_text()
+        m = re.search(rf"python3 - <<'{name}'\n(.*?)\n{name}\n", src, re.DOTALL)
+        assert m is not None, f"heredoc {name} not found in {PATCH_SCRIPT}"
+        return m.group(1)
+
+    @staticmethod
+    def _materialize_stub(tmp_path: Path) -> Path:
+        target = tmp_path / "core.py"
+        target.write_text(_STUB_ENGINE_CORE)
+        return target
+
+    def _run_heredoc(self, body: str, stub_path: Path) -> subprocess.CompletedProcess:
+        rewritten = body.replace(
+            'pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py")',
+            f'pathlib.Path("{stub_path}")',
+        ).replace(
+            'pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/engine/core.py")',
+            f'pathlib.Path("{stub_path}.unused")',
+        )
+        return subprocess.run(
+            [sys.executable, "-c", rewritten],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_applies(self, tmp_path):
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
+        result = self._run_heredoc(body, stub)
+        assert result.returncode == 0, result.stderr
+        new = stub.read_text()
+        # The patch adds the Iteration() emit and the iteration_index tick
+        assert "Iteration(" in new
+        assert "_iteration_index" in new
+        assert "enable_logging_iteration_details" in new
+        # And gates them on the iter-log config flag
+        assert "if _vlnsys_emit_log:" in new
+        # And keeps execute_dummy_batch() between the before/after marks
+        before_idx = new.find("_vlnsys_before = time.monotonic()")
+        edb_idx = new.find("self.execute_dummy_batch()")
+        emit_idx = new.find('"Iteration("')
+        assert 0 <= before_idx < edb_idx < emit_idx, (
+            "before-mark must precede execute_dummy_batch which must precede emit"
+        )
+        # And the result must still be valid python
+        compile(new, str(stub), "exec")
+
+    def test_idempotent(self, tmp_path):
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
+        r1 = self._run_heredoc(body, stub)
+        first = stub.read_text()
+        r2 = self._run_heredoc(body, stub)
+        second = stub.read_text()
+        assert r1.returncode == 0 and r2.returncode == 0
+        assert first == second
+        assert "Already patched, skipping" in r2.stdout
+
+    def test_fails_loud_on_drift(self, tmp_path):
+        original = "# upstream core.py has refactored run_busy_loop\n"
+        target = tmp_path / "core.py"
+        target.write_text(original)
+        body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
+        result = self._run_heredoc(body, target)
+        assert result.returncode != 0
+        assert "ERROR" in result.stdout
+        assert "drifted" in result.stdout
+        assert target.read_text() == original
+
+    def test_no_op_when_iter_log_disabled(self, tmp_path):
+        """After patching, the dummy-iter emit block must be gated on
+        `enable_logging_iteration_details`, so runs without iter-log
+        enabled incur no runtime cost beyond the original execute_dummy_batch
+        invocation."""
+        stub = self._materialize_stub(tmp_path)
+        body = self._extract_heredoc("PYPATCH_DUMMY_LOG_SYNC")
+        result = self._run_heredoc(body, stub)
+        assert result.returncode == 0
+        new = stub.read_text()
+        # The gate must be EVALUATED ONCE before execute_dummy_batch (so when
+        # iter-log is off, the only added work is one boolean read).
+        emit_section = new.split("self.execute_dummy_batch()")[0].split("if not executed:")[-1]
+        assert "self.vllm_config.observability_config.enable_logging_iteration_details" in emit_section

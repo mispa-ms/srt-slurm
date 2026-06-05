@@ -188,3 +188,110 @@ content = content.replace(old_block, new_block)
 target.write_text(content)
 print(f"[vllm-annotate-profile-gate-patch] Patched (gated wrapper.step() on tokens > 0) in {target}")
 PYPATCH_ANNOTATE_GATE
+
+# ----------------------------------------------------------------------------
+# Patch vLLM's DPEngineCoreProc.run_busy_loop to emit an `Iteration(N)` log
+# line for pure-dummy iters too, unifying the engine-side iteration counter
+# with the worker-side wrapper.step() counter.
+#
+# Why this is needed:
+#   With PYPATCH_DUMMY_TICK and PYPATCH_ANNOTATE_GATE applied, the
+#   worker-side wrapper.step() counter ticks exactly once per iter for ALL
+#   iter types (active, KV-only, pure-dummy). But the engine-side
+#   `Iteration(N)` log only emits when `EngineCore.step()` runs, which
+#   early-returns when `scheduler.has_requests() == False` (pure-dummy iter).
+#   Result: in DP mode, the two counters diverge whenever the engine is
+#   idle — making it impossible to map a captured nsys window back to a
+#   specific Iteration(N) range from the engine log.
+#
+# This breaks the standard workflow where users read the engine log to
+# decide which iteration range to capture (e.g., `start_step=6000` to land
+# on iter 6000 of the bench's steady-state main loop), because in vLLM DP
+# the wrapper.step() count != Iteration(N) count.
+#
+# The fix: when DPEngineCoreProc.run_busy_loop dispatches
+# `execute_dummy_batch` (the pure-dummy iter path), also emit an
+# `Iteration(N)` log entry with all-zero counts and increment the same
+# `_iteration_index` counter that EngineCoreProc.log_iteration_details
+# uses. Now Iteration(N) ticks once per iter for ALL iter types,
+# matching wrapper.step().
+#
+# Gated on `enable_logging_iteration_details=True` so it's no-op when
+# iter-logging is off (default). Idempotent. Affects DPEngineCoreProc
+# only; non-DP `EngineCoreProc.run_busy_loop` is untouched because it
+# doesn't have an execute_dummy_batch path (blocks on input_queue when
+# no requests, so no pure-dummy iters happen).
+python3 - <<'PYPATCH_DUMMY_LOG_SYNC'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/engine/core.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-dummy-log-sync-patch] core.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """            if not executed:
+                if not local_unfinished_reqs and not self.engines_running:
+                    # All engines are idle.
+                    continue
+
+                # We are in a running state and so must execute a dummy pass
+                # if the model didn't execute any ready requests.
+                self.execute_dummy_batch()"""
+
+new_block = """            if not executed:
+                if not local_unfinished_reqs and not self.engines_running:
+                    # All engines are idle.
+                    continue
+
+                # [PATCHED by vllm-container-deps-nsys.sh] Emit Iteration(N)
+                # log for the dummy iter so the engine iteration counter
+                # matches the worker-side wrapper.step() counter. Without
+                # this, the two counters diverge whenever the engine is
+                # idle, making it impossible to map a captured nsys window
+                # back to a specific Iteration(N) range from the engine log.
+                _vlnsys_emit_log = (
+                    self.vllm_config.observability_config.enable_logging_iteration_details
+                )
+                if _vlnsys_emit_log:
+                    self._iteration_index = getattr(self, "_iteration_index", 0)
+                    _vlnsys_before = time.monotonic()
+                # We are in a running state and so must execute a dummy pass
+                # if the model didn't execute any ready requests.
+                self.execute_dummy_batch()
+                if _vlnsys_emit_log:
+                    logger.info(
+                        "".join(
+                            [
+                                "Iteration(",
+                                str(self._iteration_index),
+                                "): 0 context requests, 0 context tokens, ",
+                                "0 generation requests, 0 generation tokens, ",
+                                "iteration elapsed time: ",
+                                format((time.monotonic() - _vlnsys_before) * 1000, ".2f"),
+                                " ms",
+                            ]
+                        )
+                    )
+                    self._iteration_index += 1"""
+
+if new_block in content:
+    print(f"[vllm-dummy-log-sync-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
+    print("[vllm-dummy-log-sync-patch] ERROR: expected block not found in", target)
+    print("[vllm-dummy-log-sync-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_DUMMY_LOG_SYNC")
+    print("[vllm-dummy-log-sync-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-dummy-log-sync-patch] Patched (added dummy-iter Iteration(N) emit) in {target}")
+PYPATCH_DUMMY_LOG_SYNC
