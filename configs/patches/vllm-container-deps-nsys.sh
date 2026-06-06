@@ -12,6 +12,26 @@ apt-get -y update && apt-get install -y --no-install-recommends --allow-change-h
 
 pip install msgpack
 
+# ----------------------------------------------------------------------------
+# Upgrade NCCL 2.28.9 -> 2.30.3 (REAL root-cause fix for the decode wedge).
+#
+# The base vllm/vllm-openai:v0.21.0-aarch64-ubuntu2404 image ships nccl==2.28.9
+# (torch bundle). vLLM issue #40969 (multi-team, reproduced on DeepSeek V4-Flash,
+# V4-Pro, GLM-5.1, K2.6) shows NCCL 2.28.9 wedges MoE decode after a number of
+# requests — ~100% SM, 0 tok/s, no Python exception / no NCCL watchdog timeout /
+# no OOM — which is exactly our drain-tail wedge (shm_broadcast + sample_tokens
+# RPC timeout). Upgrading to NCCL 2.30.x clears it (50/50 clean across all four
+# models). enforce-eager/PIECEWISE only delay it, so it is NOT a cudagraph bug.
+#
+# Pin 2.30.3 (not 2.30.4): 2.30.4 introduced a separate NVLS boot-hang
+# regression at >=384 routed experts (NVIDIA/nccl#2167, workaround
+# NCCL_NVLS_ENABLE=0). 2.30.3 is the last release before that regression, so we
+# keep NCCL_NVLS_ENABLE=1 for GB300 perf. Comms-library-only change — kernel mix
+# and per-iter timing are unchanged, so harvested nsys traces stay representative.
+# See reports/dsv4_pro_gb300_sweep/DRAIN_TAIL_DEADLOCK_MECHANISM.md.
+pip install --upgrade nvidia-nccl-cu13==2.30.3
+python3 -c "import ctypes,glob,os; libs=glob.glob('/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so*'); print('[nccl-upgrade] installed libnccl:', libs)" || true
+
 if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
