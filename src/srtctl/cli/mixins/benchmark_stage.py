@@ -274,8 +274,23 @@ class BenchmarkStageMixin:
         agg_endpoints = []
 
         use_sys_port = self.config.frontend.type == "dynamo"
+        # Opt-out of the decode per-rank fanout (pattern 1 above) via the global
+        # `environment: PROFILE_DECODE_LEADER_ONLY: "1"`. When set, only the
+        # decode leader endpoint is emitted, so cudaProfilerStart fires on a
+        # single rank (SGLang-style, gpu_id==base_gpu_id). Use this when the
+        # 16-way simultaneous CUPTI capture+teardown at full steady-state load
+        # triggers a post-capture collective deadlock at the benchmark drain
+        # tail (see VLLM_NSYS_DP_COUNTER_UNIFICATION.md "OPEN BUG"). The in-capture
+        # counter asymmetry that originally motivated the fanout is now handled
+        # by the wrapper.step() symmetry patches (DUMMY_TICK / ANNOTATE_GATE),
+        # so leader-only no longer reintroduces the NCCL all-reduce timeout.
+        decode_leader_only = str(self.runtime.environment.get("PROFILE_DECODE_LEADER_ONLY", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         for process in self.backend_processes:
-            decode_fanout = use_sys_port and process.endpoint_mode == "decode"
+            decode_fanout = use_sys_port and process.endpoint_mode == "decode" and not decode_leader_only
             if not decode_fanout and not process.is_leader:
                 continue
             worker_ip = get_hostname_ip(process.node, self.runtime.network_interface)

@@ -135,7 +135,7 @@ class TestDecodeEndpointFanout:
     every DP rank's endpoint. PROFILE_DECODE_IPS stays leader-only."""
 
     @staticmethod
-    def _stub_benchmark_stage(frontend_type: str, processes):
+    def _stub_benchmark_stage(frontend_type: str, processes, environment=None):
         from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
 
         # backend_processes / endpoints are @property in the mixin that
@@ -157,6 +157,9 @@ class TestDecodeEndpointFanout:
                 self.runtime.network_interface = "eth0"
                 self.runtime.nodes.head = "theia0127"
                 self.runtime.frontend_port = 8000
+                # Real dict so benchmark_stage's PROFILE_DECODE_LEADER_ONLY
+                # lookup behaves like production (MagicMock would never match).
+                self.runtime.environment = environment or {}
 
             @property
             def backend_processes(self):
@@ -181,11 +184,11 @@ class TestDecodeEndpointFanout:
         proc.http_port = 30000
         return proc
 
-    def _collect_env(self, frontend_type, processes):
+    def _collect_env(self, frontend_type, processes, environment=None):
         """Invoke the IPs/endpoints loop and return the resulting env dict."""
         from srtctl.cli.mixins import benchmark_stage as bench_module
 
-        stage = self._stub_benchmark_stage(frontend_type, processes)
+        stage = self._stub_benchmark_stage(frontend_type, processes, environment)
         runner = MagicMock()
         runner.name = "SA-Bench"
 
@@ -216,6 +219,36 @@ class TestDecodeEndpointFanout:
         # IPS stays leader-only (one per node)
         ips = env.get("PROFILE_DECODE_IPS", "").split(",")
         assert sorted(ips) == ["10.0.0.8", "10.0.0.9"]
+
+    def test_dynamo_decode_leader_only_optout(self):
+        """With PROFILE_DECODE_LEADER_ONLY=1 in the global environment, the
+        Dynamo decode fanout is disabled — only leader endpoints are emitted,
+        so cudaProfilerStart fires on a single rank per node (SGLang-style),
+        avoiding the 16-way CUPTI capture+teardown drain-tail deadlock."""
+        processes = [
+            self._decode_process(node="theia0128", sys_port=8081, is_leader=True),
+            self._decode_process(node="theia0128", sys_port=8082, is_leader=False),
+            self._decode_process(node="theia0129", sys_port=8081, is_leader=True),
+            self._decode_process(node="theia0129", sys_port=8082, is_leader=False),
+        ]
+        env = self._collect_env("dynamo", processes, environment={"PROFILE_DECODE_LEADER_ONLY": "1"})
+
+        # Only the two leaders (one per node) are emitted, not all 4 ranks.
+        endpoints = sorted(env.get("PROFILE_DECODE_ENDPOINTS", "").split(","))
+        assert endpoints == ["10.0.0.8:8081", "10.0.0.9:8081"]
+        # IPS unchanged (always leader-only)
+        assert sorted(env.get("PROFILE_DECODE_IPS", "").split(",")) == ["10.0.0.8", "10.0.0.9"]
+
+    def test_dynamo_decode_fanout_default_on(self):
+        """Sanity: without the opt-out, the default is still full fanout
+        (guards against the gate accidentally flipping the default)."""
+        processes = [
+            self._decode_process(node="theia0128", sys_port=8081, is_leader=True),
+            self._decode_process(node="theia0128", sys_port=8082, is_leader=False),
+        ]
+        env = self._collect_env("dynamo", processes, environment={})
+        endpoints = sorted(env.get("PROFILE_DECODE_ENDPOINTS", "").split(","))
+        assert endpoints == ["10.0.0.8:8081", "10.0.0.8:8082"]
 
     def test_non_dynamo_decode_is_leader_only(self):
         processes = [
