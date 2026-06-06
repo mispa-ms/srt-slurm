@@ -491,3 +491,125 @@ content = content.replace(old_block, new_block)
 target.write_text(content)
 print(f"[vllm-stop-fence-patch] Patched (cross-rank DP barrier + cuda.synchronize around cudaProfilerStart/Stop) in {target}")
 PYPATCH_STOP_FENCE
+
+# ----------------------------------------------------------------------------
+# PYPATCH_DP_ZEROTOKEN_DUMMY — fix for the drain-tail deadlock (vLLM #43547).
+#
+# On a zero-token-scheduled step, gpu_model_runner.execute_model early-returns
+# EMPTY_MODEL_RUNNER_OUTPUT. The existing `_dummy_run(1)` that fires the
+# per-step coordinate_batch_across_dp collective is gated on
+# `distributed_executor_backend == "external_launcher"` ONLY — so on the
+# multiproc (mp) executor that AIB uses, a zero-token DP rank skips the
+# collective, the DP group's participation desyncs, and at the benchmark
+# drain tail all ranks deadlock in coordinate_batch_across_dp's all_reduce.
+#
+# This broadens the guard to ANY DP > 1 (== upstream PR #44601). Byte-identical
+# to the reverted v27-dpdummy (1ec54b5); re-applied here on the full v41 stack
+# (counter-unification + STOP_FENCE present), so the v27 cascade confounder is
+# gone. See reports/dsv4_pro_gb300_sweep/DRAIN_TAIL_DEADLOCK_MECHANISM.md.
+python3 - <<'PYPATCH_DP_ZEROTOKEN_DUMMY'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/gpu_model_runner.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-dp-zerotoken-dummy-patch] gpu_model_runner.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """            if not num_scheduled_tokens:
+                if (
+                    self.parallel_config.distributed_executor_backend
+                    == "external_launcher"
+                    and self.parallel_config.data_parallel_size > 1
+                ):
+                    # this is a corner case when both external launcher
+                    # and DP are enabled, num_scheduled_tokens could be
+                    # 0, and has_unfinished_requests in the outer loop
+                    # returns True. before returning early here we call
+                    # dummy run to ensure coordinate_batch_across_dp
+                    # is called into to avoid out of sync issues.
+                    self._dummy_run(1)"""
+
+new_block = """            if not num_scheduled_tokens:
+                if self.parallel_config.data_parallel_size > 1:
+                    # [PATCHED by vllm-container-deps-nsys.sh] Broaden the
+                    # zero-token coordinate_batch_across_dp guard from
+                    # external_launcher-only to ALL DP backends (mp/ray), per
+                    # upstream vLLM #43547 / PR #44601. Without this a
+                    # zero-token-scheduled rank on the mp executor returns
+                    # EMPTY early without firing coordinate_batch_across_dp,
+                    # the DP group desyncs, and the drain deadlocks.
+                    self._dummy_run(1)"""
+
+if new_block in content:
+    print(f"[vllm-dp-zerotoken-dummy-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
+    print("[vllm-dp-zerotoken-dummy-patch] ERROR: expected zero-token block not found in", target)
+    print("[vllm-dp-zerotoken-dummy-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_DP_ZEROTOKEN_DUMMY")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-dp-zerotoken-dummy-patch] Patched (external_launcher-only -> any DP > 1) in {target}")
+PYPATCH_DP_ZEROTOKEN_DUMMY
+
+# ----------------------------------------------------------------------------
+# PYPATCH_DP_AR_COUNT — DIAGNOSTIC (paired with PYPATCH_DP_ZEROTOKEN_DUMMY).
+#
+# coordinate_batch_across_dp's all_reduce is a DP collective: in a healthy run
+# EVERY rank's call count is identical at any global step. Divergence is the
+# #43547 participation desync — the rank that is AHEAD double-fired, the one
+# BEHIND skipped. We log a per-rank monotonic counter every 100 calls so the
+# decode worker logs reveal, at the drain, whether the zero-token fix produced
+# clean 1:1 participation or a v27-style double. Logging only; no behavior
+# change.
+python3 - <<'PYPATCH_DP_AR_COUNT'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/dp_utils.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/dp_utils.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-dp-ar-count-patch] dp_utils.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    tensor[3][dp_rank] = cudagraph_mode
+    dist.all_reduce(tensor, group=group)
+    return tensor"""
+
+new_block = """    tensor[3][dp_rank] = cudagraph_mode
+    dist.all_reduce(tensor, group=group)
+    # [PATCHED by vllm-container-deps-nsys.sh] DIAGNOSTIC: per-rank
+    # coordinate_batch_across_dp participation counter (see #43547).
+    _run_ar._ar_count = getattr(_run_ar, "_ar_count", 0) + 1
+    if _run_ar._ar_count % 100 == 0:
+        logger.info("[dp-ar-count] dp_rank=%s ar_count=%d",
+                    dp_rank, _run_ar._ar_count)
+    return tensor"""
+
+if new_block in content:
+    print(f"[vllm-dp-ar-count-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
+    print("[vllm-dp-ar-count-patch] ERROR: expected _run_ar block not found in", target)
+    print("[vllm-dp-ar-count-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_DP_AR_COUNT")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-dp-ar-count-patch] Patched (per-rank ar_count diagnostic) in {target}")
+PYPATCH_DP_AR_COUNT
