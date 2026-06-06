@@ -367,10 +367,15 @@ PYPATCH_DUMMY_LOG_SYNC
 # adapted to vLLM's per-rank profiler. The local torch.cuda.synchronize()
 # fence is KEPT around stop (drains in-flight GPU work before teardown).
 #
-# REQUIRES per-rank profile fanout (every DP rank calls /engine/start_profile)
-# so that ALL ranks reach the barrier — do NOT combine with
-# PROFILE_DECODE_LEADER_ONLY (only 1 rank would call the barrier -> hang).
-# The barrier is a no-op when torch.distributed is not initialized or the DP
+# GATED off by default and enabled per-worker-group via
+# VLLM_NSYS_XRANK_BARRIER=1 — set it ONLY where EVERY DP rank receives
+# /engine/start_profile (the decode per-rank fanout). It is FATAL on any
+# leader-only path: the prefill always profiles leader-only, so an
+# unconditional barrier there makes the leader wait forever for the
+# non-participating ranks -> prefill deadlock -> decode starves -> whole
+# disagg job wedges (observed v40 #53863808). Therefore set the env var in
+# decode_environment ONLY, never globally or in prefill_environment. The
+# barrier is also a no-op when torch.distributed is uninitialized or the DP
 # group is unavailable (single-rank / non-DP), so TP/TEP captures are safe.
 #
 # Idempotent. Two edits: (1) inject the _vlnsys_dp_barrier helper after the
@@ -400,10 +405,27 @@ def _vlnsys_dp_barrier() -> None:
     # synchronized global event across all DP ranks. Without it an
     # uncoordinated toggle under full NVLS/NVSHMEM collective load desyncs
     # ranks and deadlocks at the next small/uneven-batch collective (the
-    # benchmark drain tail). No-op if distributed is not initialized or the
-    # DP group / cpu_group is unavailable (single-rank / non-DP). Requires
-    # ALL participating ranks to call it -> use only with per-rank profile
-    # fanout, never leader-only.
+    # benchmark drain tail).
+    #
+    # GATED off by default — it must run ONLY where EVERY DP rank of this
+    # worker's group also receives /engine/start_profile (i.e. the decode
+    # per-rank fanout). It is FATAL on any leader-only path: e.g. the prefill
+    # always profiles leader-only (1-of-N ranks), so an unconditional barrier
+    # there makes the leader wait forever for the N-1 ranks that never call it
+    # -> the prefill deadlocks at its capture iter, the decode starves, and
+    # the whole disagg job wedges (observed in v40 #53863808: prefill DP0
+    # blocked in dist.barrier at iter 30, decode frozen at iter 31, etcd lease
+    # lost 11 min later). Enable per-worker-group via VLLM_NSYS_XRANK_BARRIER=1
+    # in decode_environment ONLY. No-op otherwise (incl. dist uninitialized /
+    # non-DP / missing cpu_group).
+    import os
+
+    if os.environ.get("VLLM_NSYS_XRANK_BARRIER", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
     try:
         import torch.distributed as dist
 

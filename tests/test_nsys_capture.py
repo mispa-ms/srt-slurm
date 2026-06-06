@@ -697,6 +697,14 @@ class TestStopFencePatch:
         # Helper injected once at module level.
         assert "def _vlnsys_dp_barrier() -> None:" in new
         assert "get_dp_group()" in new and "cpu_group" in new
+        # The barrier MUST be gated off by default behind VLLM_NSYS_XRANK_BARRIER
+        # (prefill profiles leader-only; an unconditional barrier there
+        # deadlocks the prefill leader — v40 #53863808). The env check must
+        # precede the get_dp_group()/barrier call.
+        assert "VLLM_NSYS_XRANK_BARRIER" in new
+        gate_idx = new.find("VLLM_NSYS_XRANK_BARRIER")
+        barrier_call_idx = new.find("dist.barrier(group=cpu_group)")
+        assert 0 <= gate_idx < barrier_call_idx, "env gate must precede dist.barrier"
         # _stop: barrier → sync → stop → sync → barrier (contiguous block,
         # literal match avoids false positives from the prose comment).
         stop_block = (
