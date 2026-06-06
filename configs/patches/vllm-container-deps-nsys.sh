@@ -33,9 +33,10 @@ pip install --upgrade nvidia-nccl-cu13==2.30.3
 python3 -c "import ctypes,glob,os; libs=glob.glob('/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so*'); print('[nccl-upgrade] installed libnccl:', libs)" || true
 
 # ----------------------------------------------------------------------------
-# DIAGNOSTIC: arm faulthandler.dump_traceback_later in every Python process via
-# sitecustomize (auto-imported at interpreter startup; no vLLM source patch, no
-# drift risk). Gated on VLLM_DIAG_FAULTHANDLER=1 so only the diag run engages it.
+# DIAGNOSTIC: arm faulthandler.dump_traceback_later at gpu_worker.py module level
+# (runs once per worker process on import — GUARANTEED, unlike sitecustomize,
+# which v44 showed is shadowed/not-imported in this image). Gated on
+# VLLM_DIAG_FAULTHANDLER=1 so only the diag run engages it.
 #
 # Purpose: the drain-tail wedge holds ~5 min (until VLLM_RPC_TIMEOUT) before the
 # SIGKILL teardown. PYTHONFAULTHANDLER alone only dumps on a fatal signal — it
@@ -45,28 +46,47 @@ python3 -c "import ctypes,glob,os; libs=glob.glob('/usr/local/lib/python3.12/dis
 # (NVSHMEM all2all vs DeepGEMM barrier vs CPU coordinate) and the real-vs-idle
 # split. Works even when the main thread is blocked in a C/CUDA call (the timer
 # runs on a separate thread and prints the frozen Python frames).
-DIAG_SC="$(python3 -c "import sys; d=[p for p in sys.path if 'dist-packages' in p or 'site-packages' in p]; print(d[0] if d else sys.path[-1])")/sitecustomize.py"
-if grep -q "vllm-diag-faulthandler" "$DIAG_SC" 2>/dev/null; then
-    echo "[vllm-diag-faulthandler] already present in $DIAG_SC"
-else
-    cat >> "$DIAG_SC" <<'PYDIAG_SITECUSTOMIZE'
+python3 - <<'PYPATCH_FAULTHANDLER'
+import pathlib, sys
 
-# [vllm-diag-faulthandler] periodic all-thread Python stack dump, gated on env.
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/gpu_worker.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-diag-faulthandler] gpu_worker.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = "logger = init_logger(__name__)"
+new_block = """logger = init_logger(__name__)
+
+# [vllm-diag-faulthandler] periodic all-thread Python stack dump (gated on env).
 import os as _fh_os
 if _fh_os.environ.get("VLLM_DIAG_FAULTHANDLER") == "1":
     try:
-        import faulthandler as _fh, sys as _fh_sys
+        import faulthandler as _fh
         _fh.dump_traceback_later(
             int(_fh_os.environ.get("VLLM_DIAG_FH_INTERVAL", "90")), repeat=True
         )
-        _fh_sys.stderr.write("[vllm-diag-faulthandler] armed dump_traceback_later\n")
-        _fh_sys.stderr.flush()
+        logger.warning("[vllm-diag-faulthandler] armed dump_traceback_later in gpu_worker")
     except Exception as _fh_e:
-        import sys as _fh_sys
-        _fh_sys.stderr.write("[vllm-diag-faulthandler] arm failed: %r\n" % (_fh_e,))
-PYDIAG_SITECUSTOMIZE
-    echo "[vllm-diag-faulthandler] appended diag block to $DIAG_SC"
-fi
+        logger.warning("[vllm-diag-faulthandler] arm failed: %r", _fh_e)"""
+
+if "[vllm-diag-faulthandler]" in content:
+    print(f"[vllm-diag-faulthandler] already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-diag-faulthandler] ERROR: 'logger = init_logger(__name__)' not found in", target)
+    sys.exit(1)
+
+content = content.replace(old_block, new_block, 1)
+target.write_text(content)
+print(f"[vllm-diag-faulthandler] Patched (module-level arm) in {target}")
+PYPATCH_FAULTHANDLER
 
 if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
