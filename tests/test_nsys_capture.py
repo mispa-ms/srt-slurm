@@ -623,6 +623,10 @@ class TestDummyLogSyncPatch:
 _STUB_PROFILER_WRAPPER = """\
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class WorkerProfiler:
     pass
@@ -651,9 +655,10 @@ class CudaProfilerWrapper(WorkerProfiler):
 
 
 class TestStopFencePatch:
-    """PYPATCH_STOP_FENCE wraps cudaProfilerStop with torch.cuda.synchronize()
-    on each rank to avoid post-stop CUPTI/NCCL contention deadlock observed on
-    per-rank DP+EP fanout (v35-delay4500 cascade signature)."""
+    """PYPATCH_STOP_FENCE wraps the cudaProfilerStart/Stop CUPTI toggle with a
+    cross-rank DP barrier (+ local cuda.synchronize around stop) so the capture
+    window opens/closes as a synchronized global event across all DP ranks —
+    the fix for the per-rank-fanout drain-tail collective deadlock."""
 
     @staticmethod
     def _extract_heredoc(name: str) -> str:
@@ -689,24 +694,33 @@ class TestStopFencePatch:
         result = self._run_heredoc(body, stub)
         assert result.returncode == 0, result.stderr
         new = stub.read_text()
-        # The fence must be three contiguous CALL lines (8-space indent, no
-        # `#` prefix). Using a literal block match avoids false positives
-        # from the patch's explanatory comment, which mentions the method
-        # names in prose.
-        fence_block = (
+        # Helper injected once at module level.
+        assert "def _vlnsys_dp_barrier() -> None:" in new
+        assert "get_dp_group()" in new and "cpu_group" in new
+        # _stop: barrier → sync → stop → sync → barrier (contiguous block,
+        # literal match avoids false positives from the prose comment).
+        stop_block = (
+            "        _vlnsys_dp_barrier()\n"
             "        torch.cuda.synchronize()\n"
             "        self._cuda_profiler.stop()\n"
-            "        torch.cuda.synchronize()"
+            "        torch.cuda.synchronize()\n"
+            "        _vlnsys_dp_barrier()"
         )
-        assert fence_block in new, "expected sync→stop→sync contiguous block in _stop"
-        # And the fence must be inside _stop, not _start.
+        assert stop_block in new, "expected barrier→sync→stop→sync→barrier block in _stop"
+        # _start: barrier → start → barrier.
+        start_block = (
+            "        _vlnsys_dp_barrier()\n"
+            "        self._cuda_profiler.start()\n"
+            "        _vlnsys_dp_barrier()"
+        )
+        assert start_block in new, "expected barrier→start→barrier block in _start"
+        # Ordering: helper def before _start before _stop.
+        helper_idx = new.find("def _vlnsys_dp_barrier")
         start_idx = new.find("def _start(self)")
         stop_def_idx = new.find("def _stop(self)")
-        fence_idx = new.find(fence_block)
-        assert start_idx < stop_def_idx < fence_idx
-        # The _start path is unchanged (no synchronize there).
-        start_section = new[start_idx:stop_def_idx]
-        assert "torch.cuda.synchronize" not in start_section
+        assert helper_idx < start_idx < stop_def_idx
+        # Local GPU drain (synchronize) only in _stop, not _start.
+        assert "torch.cuda.synchronize" not in new[start_idx:stop_def_idx]
 
     def test_idempotent(self, tmp_path):
         stub = self._materialize_stub(tmp_path)

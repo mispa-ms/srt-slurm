@@ -338,36 +338,43 @@ print(f"[vllm-dummy-log-sync-patch] Patched (added dummy-iter Iteration(N) emit)
 PYPATCH_DUMMY_LOG_SYNC
 
 # ----------------------------------------------------------------------------
-# Patch vLLM's CudaProfilerWrapper._stop to fence around cudaProfilerStop.
+# Patch vLLM's CudaProfilerWrapper._start/_stop to put a CROSS-RANK barrier
+# around the cudaProfilerStart/Stop CUPTI toggle.
 #
-# Why this is needed:
-#   On DP+EP topologies with per-rank nsys fanout (every DP rank calls
-#   /engine/start_profile), all 16 ranks hit cudaProfilerStop at the
-#   max_iterations boundary. Without a fence:
-#     1. cudaProfilerStop returns immediately on each rank
-#     2. CUPTI starts a background drain (proportional to capture size)
-#     3. Engine proceeds to next iter; subsequent NCCL all_reduce / EP
-#        all_to_all collectives launch while CUPTI drain is still in flight
-#     4. Rank-to-rank state drift accumulates over ~200 iters
-#     5. All ranks wedge at the same iter; 5-min RPC timeout fires
+# Root cause (confirmed by elimination — see VLLM_NSYS_DP_COUNTER_UNIFICATION.md
+# "OPEN BUG"):
+#   vLLM's nsys CUPTI capture toggle (cudaProfilerStart/Stop) is NOT
+#   coordinated across DP ranks. Toggling CUPTI on a subset (leader-only)
+#   or asynchronously (all-N ranks at uncoordinated instants) WHILE the
+#   NVLS / NVSHMEM one-sided EP all2all is under full steady-state load
+#   desyncs the collective state. The desync is latent and detonates at the
+#   next small/uneven-batch collective — the benchmark drain tail — as a
+#   synchronized collective deadlock (all ranks stall at the same iter;
+#   surfaces as shm_broadcast RPC TimeoutError). The more asymmetric the
+#   toggle, the sooner it fires:
+#     - leader-only (1-of-16 captures): deadlock right after the capture
+#       window (v39 #53855636, iter ~6910)
+#     - all-16 fanout + local cuda.synchronize fence: survives to the
+#       measured-run drain tail (v35/36/37, iter ~17000)
+#     - capture at rampup / light load (v34, delay=500): clean (the toggle
+#       perturbs a lightly-loaded collective)
 #
-#   Empirical signature: v34 (delay=500, max=50, ~5 MB capture) succeeds;
-#   v35 (delay=4500, max=120, ~14 MB capture) deadlocks at iter ~5195
-#   exactly 15 sec after "Profiler stopped successfully" log on all ranks.
-#   Buffer-size dependent → CUPTI drain overlap with collectives.
+# Fix: a real CROSS-RANK barrier on the DP gloo CPU group around BOTH the
+# start and stop toggles, so the CUPTI capture window opens and closes as a
+# synchronized global event across all DP ranks — no rank-to-rank desync.
+# This is exactly SGLang's profile_manager.py shape
+# (torch.distributed.barrier(dp_tp_cpu_group) around the profiler toggle),
+# adapted to vLLM's per-rank profiler. The local torch.cuda.synchronize()
+# fence is KEPT around stop (drains in-flight GPU work before teardown).
 #
-# Fix: torch.cuda.synchronize() before AND after the stop syscall, on
-# every rank. The pre-stop sync ensures no GPU work is in flight when the
-# profiler tears down; the post-stop sync blocks until CUPTI drain
-# completes on this rank. Since every rank does this independently, ranks
-# naturally converge — by the time any rank starts iter N+1, all 16 have
-# completed drain.
+# REQUIRES per-rank profile fanout (every DP rank calls /engine/start_profile)
+# so that ALL ranks reach the barrier — do NOT combine with
+# PROFILE_DECODE_LEADER_ONLY (only 1 rank would call the barrier -> hang).
+# The barrier is a no-op when torch.distributed is not initialized or the DP
+# group is unavailable (single-rank / non-DP), so TP/TEP captures are safe.
 #
-# This is the same shape as SGLang's profile_manager.py torch_profiler
-# path (explicit torch.distributed.barrier after stop), adapted to the
-# vLLM per-rank profiler architecture.
-#
-# Idempotent.
+# Idempotent. Two edits: (1) inject the _vlnsys_dp_barrier helper after the
+# module logger; (2) wrap _start/_stop.
 python3 - <<'PYPATCH_STOP_FENCE'
 import pathlib, sys
 
@@ -382,6 +389,43 @@ if target is None:
 
 content = target.read_text()
 
+# --- Edit 1: inject the cross-rank barrier helper after the module logger ---
+helper_anchor = "logger = init_logger(__name__)"
+helper_def = '''logger = init_logger(__name__)
+
+
+def _vlnsys_dp_barrier() -> None:
+    # [PATCHED by vllm-container-deps-nsys.sh] Cross-rank CPU barrier on the
+    # DP gloo group so the CUPTI capture toggle (cudaProfilerStart/Stop) is a
+    # synchronized global event across all DP ranks. Without it an
+    # uncoordinated toggle under full NVLS/NVSHMEM collective load desyncs
+    # ranks and deadlocks at the next small/uneven-batch collective (the
+    # benchmark drain tail). No-op if distributed is not initialized or the
+    # DP group / cpu_group is unavailable (single-rank / non-DP). Requires
+    # ALL participating ranks to call it -> use only with per-rank profile
+    # fanout, never leader-only.
+    try:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            return
+        from vllm.distributed.parallel_state import get_dp_group
+
+        cpu_group = getattr(get_dp_group(), "cpu_group", None)
+        if cpu_group is None:
+            return
+        dist.barrier(group=cpu_group)
+    except Exception as exc:  # never let the barrier kill the run
+        logger.warning("[vllm-stop-fence-patch] DP barrier skipped: %s", exc)'''
+
+if "_vlnsys_dp_barrier" not in content:
+    if helper_anchor not in content:
+        print("[vllm-stop-fence-patch] ERROR: logger anchor not found in", target)
+        print("[vllm-stop-fence-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_STOP_FENCE")
+        sys.exit(1)
+    content = content.replace(helper_anchor, helper_def, 1)
+
+# --- Edit 2: wrap _start/_stop with the barrier (+ keep the local fence) ---
 old_block = """    @override
     def _start(self) -> None:
         self._cuda_profiler.start()
@@ -392,18 +436,23 @@ old_block = """    @override
 
 new_block = """    @override
     def _start(self) -> None:
+        # [PATCHED] cross-rank barrier so all DP ranks open the CUPTI capture
+        # window together (uncoordinated cudaProfilerStart under collective
+        # load desyncs NVLS/NVSHMEM -> drain-tail deadlock).
+        _vlnsys_dp_barrier()
         self._cuda_profiler.start()
+        _vlnsys_dp_barrier()
 
     @override
     def _stop(self) -> None:
-        # [PATCHED by vllm-container-deps-nsys.sh] Fence cudaProfilerStop
-        # with torch.cuda.synchronize() on every rank to avoid post-stop
-        # CUPTI-drain / NCCL-collective contention deadlock observed on
-        # per-rank DP+EP fanout (cascade signature: all ranks wedge at
-        # the same iter ~200 iters after stop, 5-min RPC timeout).
+        # [PATCHED] symmetric cross-rank barrier + local GPU drain around
+        # cudaProfilerStop. Matches SGLang profile_manager's
+        # torch.distributed.barrier(dp_tp_cpu_group) around the profiler stop.
+        _vlnsys_dp_barrier()
         torch.cuda.synchronize()
         self._cuda_profiler.stop()
-        torch.cuda.synchronize()"""
+        torch.cuda.synchronize()
+        _vlnsys_dp_barrier()"""
 
 if new_block in content:
     print(f"[vllm-stop-fence-patch] Already patched, skipping. File: {target}")
@@ -411,12 +460,12 @@ if new_block in content:
 
 if old_block not in content:
     # Hard fail on source drift — see the matching block in PYPATCH_DUMMY_TICK.
-    print("[vllm-stop-fence-patch] ERROR: expected block not found in", target)
+    print("[vllm-stop-fence-patch] ERROR: expected _start/_stop block not found in", target)
     print("[vllm-stop-fence-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_STOP_FENCE")
     print("[vllm-stop-fence-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
     sys.exit(1)
 
 content = content.replace(old_block, new_block)
 target.write_text(content)
-print(f"[vllm-stop-fence-patch] Patched (cuda.synchronize fence around cudaProfilerStop) in {target}")
+print(f"[vllm-stop-fence-patch] Patched (cross-rank DP barrier + cuda.synchronize around cudaProfilerStart/Stop) in {target}")
 PYPATCH_STOP_FENCE
