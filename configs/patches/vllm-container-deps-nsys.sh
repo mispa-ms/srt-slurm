@@ -32,6 +32,42 @@ pip install msgpack
 pip install --upgrade nvidia-nccl-cu13==2.30.3
 python3 -c "import ctypes,glob,os; libs=glob.glob('/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so*'); print('[nccl-upgrade] installed libnccl:', libs)" || true
 
+# ----------------------------------------------------------------------------
+# DIAGNOSTIC: arm faulthandler.dump_traceback_later in every Python process via
+# sitecustomize (auto-imported at interpreter startup; no vLLM source patch, no
+# drift risk). Gated on VLLM_DIAG_FAULTHANDLER=1 so only the diag run engages it.
+#
+# Purpose: the drain-tail wedge holds ~5 min (until VLLM_RPC_TIMEOUT) before the
+# SIGKILL teardown. PYTHONFAULTHANDLER alone only dumps on a fatal signal — it
+# does NOT dump during a hang. dump_traceback_later(N, repeat=True) dumps EVERY
+# thread's Python stack every N s to stderr (the worker log), so 2-3 dumps land
+# during the hang on all 16 ranks → reveals the exact stuck call site per rank
+# (NVSHMEM all2all vs DeepGEMM barrier vs CPU coordinate) and the real-vs-idle
+# split. Works even when the main thread is blocked in a C/CUDA call (the timer
+# runs on a separate thread and prints the frozen Python frames).
+DIAG_SC="$(python3 -c "import sys; d=[p for p in sys.path if 'dist-packages' in p or 'site-packages' in p]; print(d[0] if d else sys.path[-1])")/sitecustomize.py"
+if grep -q "vllm-diag-faulthandler" "$DIAG_SC" 2>/dev/null; then
+    echo "[vllm-diag-faulthandler] already present in $DIAG_SC"
+else
+    cat >> "$DIAG_SC" <<'PYDIAG_SITECUSTOMIZE'
+
+# [vllm-diag-faulthandler] periodic all-thread Python stack dump, gated on env.
+import os as _fh_os
+if _fh_os.environ.get("VLLM_DIAG_FAULTHANDLER") == "1":
+    try:
+        import faulthandler as _fh, sys as _fh_sys
+        _fh.dump_traceback_later(
+            int(_fh_os.environ.get("VLLM_DIAG_FH_INTERVAL", "90")), repeat=True
+        )
+        _fh_sys.stderr.write("[vllm-diag-faulthandler] armed dump_traceback_later\n")
+        _fh_sys.stderr.flush()
+    except Exception as _fh_e:
+        import sys as _fh_sys
+        _fh_sys.stderr.write("[vllm-diag-faulthandler] arm failed: %r\n" % (_fh_e,))
+PYDIAG_SITECUSTOMIZE
+    echo "[vllm-diag-faulthandler] appended diag block to $DIAG_SC"
+fi
+
 if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
