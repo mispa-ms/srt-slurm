@@ -567,3 +567,156 @@ content = content.replace(old_block, new_block)
 target.write_text(content)
 print(f"[vllm-stop-fence-patch] Patched (cross-rank DP barrier + cuda.synchronize around cudaProfilerStart/Stop) in {target}")
 PYPATCH_STOP_FENCE
+
+# ----------------------------------------------------------------------------
+# SGLang-style profiler IDLE-SKIP (generic capture-reliability fix).
+#
+# Problem this fixes (root cause of the v41 "vLLM faster than SGLang" artifact):
+#   The capture window is selected by `delay_iterations` (Nth worker step after
+#   /start_profile) + `max_iterations`. PYPATCH_DUMMY_TICK makes EVERY iter tick
+#   that counter — including dp-idle / request-lull iters — which is required to
+#   keep cudaProfilerStart synchronized across DP ranks. But it also means a
+#   fixed `delay_iterations` lands wherever the run happens to be at that total
+#   step count, and disagg decode has GLOBAL idle lulls (all DP ranks starved
+#   waiting on prefill KV transfer). v41 (delay=4500) landed squarely in such a
+#   lull: the profiled rank ran 121 empty dummy forwards → mega_moe recorded at
+#   ~91us (near-zero-token dummy) instead of ~441us → trace showed vLLM ~2.6x
+#   faster than reality. See reports/dsv4_pro_gb300_sweep/
+#   NSYS_CAPTURE_RELIABILITY_ROOTCAUSE.md.
+#
+# How SGLang avoids this (analyzed in sglang profiler_manager.py):
+#   SGLang's profiler is driven by `_profile_batch_predicate(batch)`, which
+#   classifies each batch by forward_mode and does `is_idle(): pass` — IDLE
+#   batches never advance the profiler counters. Under DP mlp-sync the ranks are
+#   lockstep (all idle or all busy together), so skipping idle stays synced.
+#   Result: `num_steps` counts REAL decode forwards, so the capture ALWAYS lands
+#   on real work — independent of model / config / framework / warmup / lull.
+#
+# Generic fix for vLLM (mirror SGLang): gate the profiler counter on the
+# DP-GLOBAL "real work this step" signal instead of counting every step. vLLM
+# already all-reduces that signal every iteration in coordinate_batch_across_dp
+# (dp_utils._run_ar): tensor[0] is the per-rank UNPADDED token count, so
+# tensor[0].sum() > 0 == "some rank has real decode work". It is identical on
+# every rank (same all-reduce), so gating on it keeps cudaProfilerStart
+# synchronized across ranks (preserving the PYPATCH_DUMMY_TICK / PYPATCH_STOP_FENCE
+# sync guarantees) while skipping warmup + lull iters. With this, delay_iterations
+# / max_iterations count REAL decode forwards — no per-model/config delay tuning,
+# no vLLM-DP-internal assumptions, no magic numbers.
+#
+# IMPORTANT config implication: delay_iterations now counts REAL decode iters
+# (not total incl. idle), so it should be SMALL (e.g. 100-400 to skip the ramp),
+# NOT the old large total-step values.
+#
+# Two edits, both idempotent + hard-fail on source drift:
+#   (A) dp_utils._synchronize_dp_ranks: stash _VLNSYS_LAST_GLOBAL_ACTIVE.
+#   (B) profiler/wrapper.py WorkerProfiler.step(): skip advancing when not active.
+# (A) PYPATCH_GLOBAL_ACTIVE_STASH
+python3 - <<'PYPATCH_GLOBAL_ACTIVE_STASH'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/dp_utils.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/worker/dp_utils.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-global-active-stash-patch] dp_utils.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)"""
+
+new_block = """    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+
+    # [PATCHED by vllm-container-deps-nsys.sh] Expose the DP-global "real decode
+    # work this step" signal for the profiler idle-skip gate
+    # (PYPATCH_WRAPPER_IDLE_SKIP). tensor[0] is the UNPADDED token count per DP
+    # rank, just all-reduced across ranks, so tensor[0].sum() > 0 == "some rank
+    # has real (unpadded) work this step". It is identical on every rank (same
+    # all-reduce result), so gating the profiler counter on it keeps
+    # cudaProfilerStart synchronized across DP ranks (mirrors SGLang
+    # forward_mode.is_idle() skip under DP mlp-sync lockstep). The PADDED counts
+    # (the returned num_tokens_across_dp) can be > 0 on globally-idle steps,
+    # which is why we read row 0 (unpadded), not the padded tensor.
+    import vllm.v1.worker.dp_utils as _vlnsys_dp_mod
+    _vlnsys_dp_mod._VLNSYS_LAST_GLOBAL_ACTIVE = bool(int(tensor[0, :].sum().item()) > 0)"""
+
+if new_block in content:
+    print(f"[vllm-global-active-stash-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-global-active-stash-patch] ERROR: expected block not found in", target)
+    print("[vllm-global-active-stash-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_GLOBAL_ACTIVE_STASH")
+    print("[vllm-global-active-stash-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-global-active-stash-patch] Patched (stash _VLNSYS_LAST_GLOBAL_ACTIVE) in {target}")
+PYPATCH_GLOBAL_ACTIVE_STASH
+
+# (B) PYPATCH_WRAPPER_IDLE_SKIP
+python3 - <<'PYPATCH_WRAPPER_IDLE_SKIP'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/vllm/profiler/wrapper.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/vllm/profiler/wrapper.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[vllm-wrapper-idle-skip-patch] wrapper.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """    def step(self) -> None:
+        \"\"\"Update the profiler state at each worker step,
+        to handle delayed starts and max iteration limits.\"\"\"
+        if not self._active:
+            return
+
+        self._active_iteration_count += 1"""
+
+new_block = """    def step(self) -> None:
+        \"\"\"Update the profiler state at each worker step,
+        to handle delayed starts and max iteration limits.\"\"\"
+        if not self._active:
+            return
+
+        # [PATCHED by vllm-container-deps-nsys.sh] SGLang-style idle-skip: only
+        # advance the delay/max counters on globally-active (non-idle) iters.
+        # _VLNSYS_LAST_GLOBAL_ACTIVE is the DP-global unpadded real-work signal
+        # stashed by PYPATCH_GLOBAL_ACTIVE_STASH in dp_utils — identical on every
+        # rank (all-reduced), so cudaProfilerStart stays synchronized while warmup
+        # and request-lull iters are skipped. This makes delay_iterations /
+        # max_iterations count REAL decode forwards, so the capture window lands on
+        # real work regardless of model / config / cudagraph-vs-eager / lull
+        # placement. The 1-step lag (previous step's flag) is uniform across ranks
+        # and negligible for window placement. Default True (non-DP / before the
+        # first forward) preserves stock behavior.
+        try:
+            import vllm.v1.worker.dp_utils as _vlnsys_dp_mod
+            if not getattr(_vlnsys_dp_mod, "_VLNSYS_LAST_GLOBAL_ACTIVE", True):
+                return
+        except Exception:
+            pass
+
+        self._active_iteration_count += 1"""
+
+if new_block in content:
+    print(f"[vllm-wrapper-idle-skip-patch] Already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[vllm-wrapper-idle-skip-patch] ERROR: expected step() block not found in", target)
+    print("[vllm-wrapper-idle-skip-patch] vLLM source has drifted past v0.21.0 — update PYPATCH_WRAPPER_IDLE_SKIP")
+    print("[vllm-wrapper-idle-skip-patch] in configs/patches/vllm-container-deps-nsys.sh to match the new shape.")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block)
+target.write_text(content)
+print(f"[vllm-wrapper-idle-skip-patch] Patched (idle-skip gate on _VLNSYS_LAST_GLOBAL_ACTIVE) in {target}")
+PYPATCH_WRAPPER_IDLE_SKIP
