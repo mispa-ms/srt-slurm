@@ -686,7 +686,20 @@ old_block = """    def step(self) -> None:
         if not self._active:
             return
 
-        self._active_iteration_count += 1"""
+        self._active_iteration_count += 1
+
+        if (
+            not self._running
+            and self._delay_iters > 0
+            and self._active_iteration_count == self._delay_iters
+        ):
+            logger.info_once("Starting profiler after delay...")
+            self._call_start()
+
+        # Call profiler step for schedule-based profiling
+        # Only count iterations where data is actually recorded (not warmup)
+        if self._running and self._profiler_step():
+            self._profiling_for_iters += 1"""
 
 new_block = """    def step(self) -> None:
         \"\"\"Update the profiler state at each worker step,
@@ -694,25 +707,44 @@ new_block = """    def step(self) -> None:
         if not self._active:
             return
 
-        # [PATCHED by vllm-container-deps-nsys.sh] SGLang-style idle-skip: only
-        # advance the delay/max counters on globally-active (non-idle) iters.
-        # _VLNSYS_LAST_GLOBAL_ACTIVE is the DP-global unpadded real-work signal
-        # stashed by PYPATCH_GLOBAL_ACTIVE_STASH in dp_utils — identical on every
-        # rank (all-reduced), so cudaProfilerStart stays synchronized while warmup
-        # and request-lull iters are skipped. This makes delay_iterations /
-        # max_iterations count REAL decode forwards, so the capture window lands on
-        # real work regardless of model / config / cudagraph-vs-eager / lull
-        # placement. The 1-step lag (previous step's flag) is uniform across ranks
-        # and negligible for window placement. Default True (non-DP / before the
-        # first forward) preserves stock behavior.
+        # [PATCHED by vllm-container-deps-nsys.sh] HYBRID dense-gated start.
+        # _VLNSYS_LAST_GLOBAL_ACTIVE (stashed by PYPATCH_GLOBAL_ACTIVE_STASH) is
+        # the DP-global DENSE signal: (nearly) all ranks have real work this step.
+        # It is identical on every rank (all-reduced), so every decision below
+        # stays synchronized across DP ranks.
+        #   - The step counter advances EVERY step, so delay_iterations keeps its
+        #     intuitive meaning (~engine iterations since start_profile): read the
+        #     decode log, set delay_iterations ~ the steady-state iter you want.
+        #   - cudaProfilerStart fires when count >= delay AND we are currently
+        #     dense. If delay lands in a warmup/lull (non-dense) moment, the start
+        #     WAITS for the next dense iter — the capture never begins on idle /
+        #     sparse forwards (the v41 failure), wherever the lulls fall.
+        #   - The captured window (max_iterations) counts DENSE iters only, so any
+        #     lull frames that land inside the window are not counted (kept clean).
+        # Default True (non-DP / before first forward) preserves stock behavior.
         try:
             import vllm.v1.worker.dp_utils as _vlnsys_dp_mod
-            if not getattr(_vlnsys_dp_mod, "_VLNSYS_LAST_GLOBAL_ACTIVE", True):
-                return
+            _vlnsys_dense = bool(
+                getattr(_vlnsys_dp_mod, "_VLNSYS_LAST_GLOBAL_ACTIVE", True)
+            )
         except Exception:
-            pass
+            _vlnsys_dense = True
 
-        self._active_iteration_count += 1"""
+        self._active_iteration_count += 1
+
+        if (
+            not self._running
+            and self._delay_iters > 0
+            and self._active_iteration_count >= self._delay_iters
+            and _vlnsys_dense
+        ):
+            logger.info_once("Starting profiler after delay (dense-gated)...")
+            self._call_start()
+
+        # Call profiler step for schedule-based profiling
+        # Only count iterations where data is actually recorded (not warmup)
+        if self._running and _vlnsys_dense and self._profiler_step():
+            self._profiling_for_iters += 1"""
 
 if new_block in content:
     print(f"[vllm-wrapper-idle-skip-patch] Already patched, skipping. File: {target}")
