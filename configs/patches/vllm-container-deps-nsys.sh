@@ -632,15 +632,23 @@ new_block = """    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
     # [PATCHED by vllm-container-deps-nsys.sh] Expose the DP-global "real decode
     # work this step" signal for the profiler idle-skip gate
     # (PYPATCH_WRAPPER_IDLE_SKIP). tensor[0] is the UNPADDED token count per DP
-    # rank, just all-reduced across ranks, so tensor[0].sum() > 0 == "some rank
-    # has real (unpadded) work this step". It is identical on every rank (same
-    # all-reduce result), so gating the profiler counter on it keeps
-    # cudaProfilerStart synchronized across DP ranks (mirrors SGLang
-    # forward_mode.is_idle() skip under DP mlp-sync lockstep). The PADDED counts
-    # (the returned num_tokens_across_dp) can be > 0 on globally-idle steps,
-    # which is why we read row 0 (unpadded), not the padded tensor.
+    # rank, just all-reduced across ranks. We gate on DENSE steady state =
+    # (nearly) ALL ranks have real work this step: busy_ranks >= dp_size - 1
+    # (tolerate one straggler). Using all-ranks-busy (NOT sum>0 = ANY rank busy)
+    # is what makes delay_iterations skip BOTH the warmup ramp (rotating partial
+    # batches) AND sparse request lulls — where only 1-2 of N ranks are busy so
+    # sum>0 would still count, landing the capture on near-idle forwards. With
+    # the dense gate the capture lands in full-batch decode regardless of where
+    # lulls fall. The value is identical on every rank (same all-reduce), so
+    # cudaProfilerStart stays synchronized across DP ranks (mirrors SGLang
+    # forward_mode.is_idle() under DP mlp-sync lockstep). Row 0 is UNPADDED — the
+    # returned padded num_tokens_across_dp can be > 0 on idle steps.
+    # NOTE: delay_iterations now counts DENSE iters, so it must be SMALL (a few
+    # hundred to land just inside the first dense plateau) — warmup + lulls
+    # contribute ~0 to the count.
     import vllm.v1.worker.dp_utils as _vlnsys_dp_mod
-    _vlnsys_dp_mod._VLNSYS_LAST_GLOBAL_ACTIVE = bool(int(tensor[0, :].sum().item()) > 0)"""
+    _vlnsys_busy_ranks = int((tensor[0, :] > 0).sum().item())
+    _vlnsys_dp_mod._VLNSYS_LAST_GLOBAL_ACTIVE = bool(_vlnsys_busy_ranks >= tensor.shape[1] - 1)"""
 
 if new_block in content:
     print(f"[vllm-global-active-stash-patch] Already patched, skipping. File: {target}")
