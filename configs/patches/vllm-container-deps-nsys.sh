@@ -633,21 +633,26 @@ new_block = """    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
     # work this step" signal for the profiler idle-skip gate
     # (PYPATCH_WRAPPER_IDLE_SKIP). tensor[0] is the UNPADDED token count per DP
     # rank, just all-reduced across ranks. We gate on DENSE steady state =
-    # (nearly) ALL ranks have real work this step: busy_ranks >= dp_size - 1
-    # (tolerate one straggler). Using all-ranks-busy (NOT sum>0 = ANY rank busy)
-    # is what makes delay_iterations skip BOTH the warmup ramp (rotating partial
-    # batches) AND sparse request lulls — where only 1-2 of N ranks are busy so
-    # sum>0 would still count, landing the capture on near-idle forwards. With
-    # the dense gate the capture lands in full-batch decode regardless of where
-    # lulls fall. The value is identical on every rank (same all-reduce), so
-    # cudaProfilerStart stays synchronized across DP ranks (mirrors SGLang
-    # forward_mode.is_idle() under DP mlp-sync lockstep). Row 0 is UNPADDED — the
-    # returned padded num_tokens_across_dp can be > 0 on idle steps.
-    # NOTE: delay_iterations now counts DENSE iters, so it must be SMALL (a few
-    # hundred to land just inside the first dense plateau) — warmup + lulls
-    # contribute ~0 to the count.
+    # (nearly) ALL ranks have REAL decode work this step.
+    #
+    # CRITICAL: an idle/dummy DP forward is NOT 0 tokens here. vLLM's
+    # gpu_worker.execute_dummy_batch runs _dummy_run(uniform_decode_query_len),
+    # and uniform_decode_query_len = 1 + num_spec_tokens (= 1 with no spec). So a
+    # dummy rank reports tensor[0][rank] == 1 (one fake token), NOT 0. During a
+    # GLOBAL idle lull every rank runs that dummy → tensor[0] = [1,1,...,1] →
+    # `> 0` would see all ranks "busy" (the gate would be a no-op and fire in the
+    # lull). We must threshold ABOVE the dummy floor: a real decode rank carries
+    # num_running_reqs tokens (>> 1), so `tensor[0][rank] > 1` cleanly separates
+    # real multi-request decode from the single-token dummy. (For speculative
+    # decode raise the threshold to > uniform_decode_query_len = 1 + num_spec.)
+    #
+    # busy_ranks >= dp_size - 1 (tolerate one straggler) = (nearly) all ranks
+    # doing real work = dense steady state. This skips BOTH warmup ramp AND
+    # sparse/idle lulls. The value is identical on every rank (same all-reduce),
+    # so cudaProfilerStart stays synchronized across DP ranks (mirrors SGLang
+    # forward_mode.is_idle() under DP mlp-sync lockstep). Row 0 is UNPADDED.
     import vllm.v1.worker.dp_utils as _vlnsys_dp_mod
-    _vlnsys_busy_ranks = int((tensor[0, :] > 0).sum().item())
+    _vlnsys_busy_ranks = int((tensor[0, :] > 1).sum().item())
     _vlnsys_dp_mod._VLNSYS_LAST_GLOBAL_ACTIVE = bool(_vlnsys_busy_ranks >= tensor.shape[1] - 1)"""
 
 if new_block in content:
