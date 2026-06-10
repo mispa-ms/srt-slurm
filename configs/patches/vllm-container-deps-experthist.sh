@@ -86,17 +86,22 @@ import numpy as _eh_np
 
 _EH_STATE = {}
 
-def _eh_accumulate(replay, num_experts, num_tokens, every):
+def _eh_accumulate(replay, num_experts, num_tokens, top_k, every):
     # replay: [rows>=num_tokens, top_k] int16 of selected (global) expert IDs.
+    # Slots the kernel did not write stay at the -1 sentinel and are filtered.
     ids = replay[:num_tokens].reshape(-1).to(_eh_torch.int64)
     valid = (ids >= 0) & (ids < num_experts)
     counts = _eh_torch.bincount(ids[valid], minlength=num_experts)  # GPU, async
+    nvalid = valid.sum()  # GPU, async
     st = _EH_STATE.get(num_tokens)
     if st is None:
         st = {"cum": _eh_torch.zeros(num_experts, dtype=_eh_torch.int64,
-                                     device=counts.device), "n": 0}
+                                     device=counts.device), "n": 0,
+              "valid": _eh_torch.zeros((), dtype=_eh_torch.int64,
+                                       device=counts.device)}
         _EH_STATE[num_tokens] = st
     st["cum"] += counts
+    st["valid"] += nvalid
     st["n"] += 1
     if st["n"] % every == 0:
         cum = st["cum"].detach().cpu().numpy().astype(_eh_np.int64)
@@ -109,9 +114,11 @@ def _eh_accumulate(replay, num_experts, num_tokens, every):
             ent = 0.0
         order = _eh_np.argsort(cum)[::-1][:10]
         top = [(int(e), int(cum[e])) for e in order]
-        print("[expert-hist-cum] ntok=%d calls=%d distinct=%d/%d "
+        expected = st["n"] * num_tokens * top_k  # slots the kernel could fill
+        fill = float(int(st["valid"].detach().cpu()) / expected) if expected else 0.0
+        print("[expert-hist-cum] ntok=%d calls=%d top_k=%d fill=%.3f distinct=%d/%d "
               "entropy=%.3f/%.2fbits total_slots=%d top10=%s"
-              % (num_tokens, st["n"], nzc, num_experts, ent,
+              % (num_tokens, st["n"], top_k, fill, nzc, num_experts, ent,
                  float(_eh_np.log2(num_experts)), s, top), flush=True)
 
 _eh_orig_trtllm_fp4_block_scale_moe = trtllm_fp4_block_scale_moe
@@ -130,8 +137,11 @@ def trtllm_fp4_block_scale_moe(*args, **kwargs):
             _nt = int(_rl.shape[0])
             _maxt = int(_eh_os.environ.get("VLLM_DUMP_EXPERT_HIST_MAXTOK", "512"))
             if _nt <= _maxt:
-                kwargs["routing_replay_out"] = _eh_torch.empty(
-                    (_nt, int(_tk)), dtype=_eh_torch.int16, device=_rl.device)
+                # -1 sentinel (NOT torch.empty): only kernel-written valid IDs
+                # are counted; unwritten slots stay -1 and get filtered. Using
+                # uninitialized memory inflates low expert indices with garbage.
+                kwargs["routing_replay_out"] = _eh_torch.full(
+                    (_nt, int(_tk)), -1, dtype=_eh_torch.int16, device=_rl.device)
                 _alloc = True
         except Exception:
             _alloc = False
@@ -141,7 +151,7 @@ def trtllm_fp4_block_scale_moe(*args, **kwargs):
             _ne = kwargs.get("num_experts")
             _every = int(_eh_os.environ.get("VLLM_DUMP_EXPERT_HIST_EVERY", "500"))
             _eh_accumulate(kwargs["routing_replay_out"], int(_ne),
-                           int(_rl.shape[0]), _every)
+                           int(_rl.shape[0]), int(_tk), _every)
         except Exception:
             pass
     return ret
