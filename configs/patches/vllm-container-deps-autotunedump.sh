@@ -105,3 +105,58 @@ content = content.replace(old_block, new_block, 1)
 target.write_text(content)
 print(f"[vllm-autotune-dump] Patched (read-only autotune tactic dump) in {target}")
 PYPATCH_AUTOTUNE_DUMP
+
+# ----------------------------------------------------------------------------
+# Patch FlashInfer's AutoTuner.choose_one profiling loop to log EACH candidate
+# tactic's measured time (and inf on profiling failure) for the
+# trtllm_fp4_block_scale_moe op. Gated on VLLM_DUMP_AUTOTUNE_TIMES=1. Read-only
+# (adds logging only). This distinguishes WHY the chosen tactic differs across
+# launches: (a) near-tied successful times reordered by noise, (b) the fast
+# tactic profiling-FAILED (t_ms=inf) — cf. FlashInfer #3168 autotune device-state
+# corruption, or (c) the startup profile mis-ranks the fast tactic (measures it
+# slower) for the synthetic m=32 shape. Idempotent; hard-fails on source drift.
+python3 - <<'PYPATCH_AUTOTUNE_TIMES'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/flashinfer/autotuner.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/flashinfer/autotuner.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[autotune-times] flashinfer/autotuner.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+# Insert a per-candidate timing log right before the argmin comparison.
+old_block = """                                if time_measured < min_time:
+                                    min_time = time_measured
+                                    runner_id, tactic = r_id, tac"""
+
+new_block = """                                import os as _att_os
+                                if _att_os.environ.get("VLLM_DUMP_AUTOTUNE_TIMES") and "trtllm_fp4_block_scale_moe" in str(custom_op):
+                                    try:
+                                        logger.info(
+                                            "[autotune-times] op=%s shapes=%s r=%d tac=%s t_ms=%s",
+                                            custom_op, self._get_input_sizes(tensors), r_id, tac, time_measured,
+                                        )
+                                    except Exception:
+                                        pass
+                                if time_measured < min_time:
+                                    min_time = time_measured
+                                    runner_id, tactic = r_id, tac"""
+
+if "[autotune-times]" in content:
+    print(f"[autotune-times] already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[autotune-times] ERROR: expected argmin block not found in", target)
+    print("[autotune-times] FlashInfer autotuner.py has drifted — update PYPATCH_AUTOTUNE_TIMES")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block, 1)
+target.write_text(content)
+print(f"[autotune-times] Patched (per-candidate timing log) in {target}")
+PYPATCH_AUTOTUNE_TIMES
