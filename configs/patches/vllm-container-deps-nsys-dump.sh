@@ -699,3 +699,59 @@ content = content.replace(old_block, new_block, 1)
 target.write_text(content)
 print(f"[autotune-times] Patched (per-candidate timing log) in {target}")
 PYPATCH_AUTOTUNE_TIMES
+
+# ----------------------------------------------------------------------------
+# Patch FlashInfer AutoTuner.choose_one SERVING path (is_tuning_mode False) to
+# log the (runner, tactic) the MoE op actually dispatches per shape at serving
+# time — deduped per (shape, runner, tactic) to bound volume. Gated on
+# VLLM_DUMP_AUTOTUNE_DISPATCH=1. Read-only. This pins whether the serving
+# dispatch uses the startup-cached config and whether it differs warm vs cold
+# (complements nsys, which shows the executed kernel NAME). Idempotent.
+python3 - <<'PYPATCH_AUTOTUNE_DISPATCH'
+import pathlib, sys
+
+candidates = [
+    pathlib.Path("/usr/local/lib/python3.12/dist-packages/flashinfer/autotuner.py"),
+    pathlib.Path("/usr/local/lib/python3.10/dist-packages/flashinfer/autotuner.py"),
+]
+target = next((p for p in candidates if p.exists()), None)
+if target is None:
+    print("[autotune-dispatch] flashinfer/autotuner.py not found, skipping")
+    sys.exit(0)
+
+content = target.read_text()
+
+old_block = """                return runner, tactic
+
+            assert len(runners) > 0, \"At least one runner is required\""""
+
+new_block = """                import os as _disp_os
+                if _disp_os.environ.get(\"VLLM_DUMP_AUTOTUNE_DISPATCH\") and \"trtllm_fp4_block_scale_moe\" in str(custom_op):
+                    try:
+                        _disp_seen = getattr(self, \"_vlnsys_disp_seen\", None)
+                        if _disp_seen is None:
+                            _disp_seen = set(); self._vlnsys_disp_seen = _disp_seen
+                        _disp_key = (str(input_shapes), runner_id, str(tactic))
+                        if _disp_key not in _disp_seen:
+                            _disp_seen.add(_disp_key)
+                            logger.info(\"[autotune-dispatch] op=%s shapes=%s runner=%s tactic=%s cache_hit=%s\",
+                                        custom_op, input_shapes, runner_id, tactic, is_cache_hit)
+                    except Exception:
+                        pass
+                return runner, tactic
+
+            assert len(runners) > 0, \"At least one runner is required\""""
+
+if "[autotune-dispatch]" in content:
+    print(f"[autotune-dispatch] already patched, skipping. File: {target}")
+    sys.exit(0)
+
+if old_block not in content:
+    print("[autotune-dispatch] ERROR: expected serving-return block not found in", target)
+    print("[autotune-dispatch] FlashInfer autotuner.py has drifted — update PYPATCH_AUTOTUNE_DISPATCH")
+    sys.exit(1)
+
+content = content.replace(old_block, new_block, 1)
+target.write_text(content)
+print(f"[autotune-dispatch] Patched (serving-time dispatch log) in {target}")
+PYPATCH_AUTOTUNE_DISPATCH
