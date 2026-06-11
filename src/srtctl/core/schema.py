@@ -954,15 +954,23 @@ class ProfilingConfig:
         - --cache-control none   : do NOT flush L2 between passes, so the kernel
           sees the real serving-pipeline cache state (default flushes L2, which
           would erase the warm-vs-cold residency signal we want to measure)
-        Keep --metrics minimal so collection stays single-pass (with kernel
-        replay + cache-control none, a multi-pass set lets pass N>1 see the
-        cache warmed by pass 1, inflating the hit rate).
+        CRITICAL for TP / collective-coupled kernels: keep --metrics to a
+        SINGLE pass. With multi-pass metric sets, ncu kernel-replay re-runs the
+        kernel with device state save/restore between passes, which pauses one
+        rank while the others proceed to the NCCL all-reduce -> desync ->
+        UnknownError (this killed the first in-situ attempt, 3/4 ranks failed).
+        A single-pass metric set runs ONE normal graph replay with counters,
+        so the collective executes normally and nothing deadlocks. The default
+        is therefore just the L2 hit-rate (one derived metric from the LTS unit
+        = one pass). `--replay-mode application` (the usual collective fix) is
+        not usable here because it would re-launch the whole server per pass.
         """
         if not self.is_ncu:
             return []
 
         kernel = self.ncu_kernel_name or "regex:bmm.*E2m1.*u2"
-        metrics = self.ncu_metrics or "lts__t_sector_hit_rate.pct,dram__bytes_read.sum,gpu__time_duration.sum"
+        # Single metric -> single pass -> no kernel replay -> no collective deadlock.
+        metrics = self.ncu_metrics or "lts__t_sector_hit_rate.pct"
 
         cmd = [
             "ncu",
