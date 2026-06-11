@@ -154,6 +154,12 @@ class WorkerStageMixin:
             nsys_prefix = profiling.get_nsys_prefix(
                 nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
             )
+        elif profiling.is_ncu:
+            gpu_tag = "_gpu" + "-".join(str(i) for i in sorted(process.gpu_indices)) if process.gpu_indices else ""
+            ncu_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}{gpu_tag}_profile"
+            nsys_prefix = profiling.get_ncu_prefix(
+                ncu_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
+            )
 
         # Build command using backend's method
         cmd = self.backend.build_worker_command(
@@ -294,6 +300,11 @@ class WorkerStageMixin:
             nsys_output = f"/logs/profiles/{mode}/{leader.node}_{mode}_w{index}_profile_rank%q{{SLURM_PROCID}}"
             nsys_prefix = profiling.get_nsys_prefix(
                 nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
+            )
+        elif profiling.is_ncu:
+            ncu_output = f"/logs/profiles/{mode}/{leader.node}_{mode}_w{index}_profile"
+            nsys_prefix = profiling.get_ncu_prefix(
+                ncu_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
             )
 
         # Build command using backend's method

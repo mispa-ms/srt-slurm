@@ -751,6 +751,15 @@ class ProfilingConfig:
     # Extra arguments passed to nsys profile (appended before `-o`; see get_nsys_prefix)
     extra_nsys_args: list[str] | None = None
 
+    # ncu (Nsight Compute) options — used when type == "ncu". ncu deep-profiles
+    # individual kernels (HW counters incl. L2 hit-rate), unlike nsys timeline
+    # sampling. Same cudaProfilerStart/Stop trigger as nsys (via /start_profile),
+    # so it reuses the per-phase start_step/stop_step + profiling.sh flow.
+    extra_ncu_args: list[str] | None = None
+    ncu_kernel_name: str | None = None  # --kernel-name regex (default targets trtllm-gen MoE GEMM)
+    ncu_launch_count: int = 8  # --launch-count (kernels to profile after cudaProfilerStart)
+    ncu_metrics: str | None = None  # --metrics (default: L2 hit-rate + DRAM bytes + duration)
+
     # Phase-specific profiling step configs (not used for nsys-time)
     prefill: ProfilingPhaseConfig | None = None
     decode: ProfilingPhaseConfig | None = None
@@ -780,6 +789,11 @@ class ProfilingConfig:
     def is_torch(self) -> bool:
         """Check if using PyTorch profiler."""
         return self.type == "torch"
+
+    @property
+    def is_ncu(self) -> bool:
+        """Check if using NVIDIA Nsight Compute per-kernel profiling."""
+        return self.type == "ncu"
 
     def _get_phase_config(self, mode: str) -> ProfilingPhaseConfig | None:
         """Get the phase config for the given mode."""
@@ -922,6 +936,60 @@ class ProfilingConfig:
 
         if frontend_type == "dynamo":
             cmd.insert(-2, "--trace-fork-before-exec=true")
+
+        return cmd
+
+    def get_ncu_prefix(
+        self, output_file: str, *, frontend_type: str | None = None, backend_type: str | None = None
+    ) -> list[str]:
+        """Get ncu (Nsight Compute) profiling command prefix.
+
+        Wraps the worker so individual kernels are deep-profiled (HW counters,
+        incl. L2 hit-rate). Profiling is gated to the cudaProfilerStart/Stop
+        window (`--profile-from-start off`) that vLLM's /start_profile fires at
+        the per-phase start_step — the same trigger nsys uses.
+
+        Key flags for an in-situ L2 measurement:
+        - --graph-profiling node : profile kernels replayed inside CUDA graphs
+        - --cache-control none   : do NOT flush L2 between passes, so the kernel
+          sees the real serving-pipeline cache state (default flushes L2, which
+          would erase the warm-vs-cold residency signal we want to measure)
+        Keep --metrics minimal so collection stays single-pass (with kernel
+        replay + cache-control none, a multi-pass set lets pass N>1 see the
+        cache warmed by pass 1, inflating the hit rate).
+        """
+        if not self.is_ncu:
+            return []
+
+        kernel = self.ncu_kernel_name or "regex:bmm.*E2m1.*u2"
+        metrics = self.ncu_metrics or "lts__t_sector_hit_rate.pct,dram__bytes_read.sum,gpu__time_duration.sum"
+
+        cmd = [
+            "ncu",
+            "--target-processes",
+            "all",
+            "--profile-from-start",
+            "off",
+            "--graph-profiling",
+            "node",
+            "--cache-control",
+            "none",
+            "--replay-mode",
+            "kernel",
+            "--kernel-name",
+            kernel,
+            "--launch-count",
+            str(self.ncu_launch_count),
+            "--metrics",
+            metrics,
+            "--csv",
+            "--log-file",
+            output_file + ".ncu.csv",
+            "-f",
+        ]
+
+        if self.extra_ncu_args:
+            cmd.extend(self.extra_ncu_args)
 
         return cmd
 

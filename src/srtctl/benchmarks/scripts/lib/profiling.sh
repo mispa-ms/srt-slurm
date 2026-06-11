@@ -188,8 +188,8 @@ start_all_profiling() {
         return 0
     fi
 
-    if [[ "${PROFILE_TYPE}" != "nsys" && "${PROFILE_TYPE}" != "torch" ]]; then
-        profiling__warn "Unsupported PROFILE_TYPE='${PROFILE_TYPE}'. Expected 'nsys' or 'torch'. Skipping profiling."
+    if [[ "${PROFILE_TYPE}" != "nsys" && "${PROFILE_TYPE}" != "torch" && "${PROFILE_TYPE}" != "ncu" ]]; then
+        profiling__warn "Unsupported PROFILE_TYPE='${PROFILE_TYPE}'. Expected 'nsys', 'ncu', or 'torch'. Skipping profiling."
         return 0
     fi
 
