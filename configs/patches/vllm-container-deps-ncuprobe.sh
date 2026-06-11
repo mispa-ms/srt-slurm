@@ -48,12 +48,12 @@ cat > /tmp/moe_l2_probe.py <<'PROBE'
 import torch
 from flashinfer import fp4_quantize
 from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
-from flashinfer.fused_moe.core import RoutingMethodType
 try:
-    from flashinfer.fused_moe.core import ActivationType
-    SWIGLU = ActivationType.Swiglu.value
+    from flashinfer import RoutingMethodType, ActivationType
+    SWIGLU = ActivationType.Swiglu.value          # 3
+    RENORM = RoutingMethodType.Renormalize.value  # 1
 except Exception:
-    SWIGLU = 1
+    SWIGLU, RENORM = 3, 1
 try:
     from flashinfer.autotuner import autotune
 except Exception:
@@ -95,7 +95,7 @@ kw = dict(
     output1_scale_scalar=o1, output1_scale_gate_scalar=o1, output2_scale_scalar=o2,
     num_experts=E, top_k=TOPK, n_group=None, topk_group=None,
     intermediate_size=I, local_expert_offset=0, local_num_experts=E,
-    routed_scaling_factor=None, routing_method_type=RoutingMethodType.Renormalize.value,
+    routed_scaling_factor=None, routing_method_type=RENORM,
     do_finalize=True, activation_type=SWIGLU, tune_max_num_tokens=8192,
 )
 
