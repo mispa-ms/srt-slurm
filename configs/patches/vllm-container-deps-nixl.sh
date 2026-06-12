@@ -19,8 +19,10 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
-# NIXL (CUDA-13 wheel ships the native nixl_ep_cpp.so + UCX bits)
-python3 -m pip install nixl-cu13
+# NIXL: base `nixl` provides the python module; `nixl-cu13` force-reinstalls
+# the matching CUDA-13 native nixl_ep_cpp.so (mirrors the Dockerfile order).
+python3 -m pip install nixl
+python3 -m pip install --force-reinstall --no-deps nixl-cu13
 python3 -c "import nixl._api; print('nixl OK:', nixl._api.__file__)"
 
 echo "vllm-container-deps-nixl: base deps + nixl-cu13 installed"
