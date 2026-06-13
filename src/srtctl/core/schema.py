@@ -757,7 +757,8 @@ class ProfilingConfig:
     # so it reuses the per-phase start_step/stop_step + profiling.sh flow.
     extra_ncu_args: list[str] | None = None
     ncu_kernel_name: str | None = None  # --kernel-name regex (default targets trtllm-gen MoE GEMM)
-    ncu_launch_count: int = 8  # --launch-count (kernels to profile after cudaProfilerStart)
+    ncu_launch_count: int = 1  # --launch-count: profile a SINGLE kernel to minimize perturbation
+    # (profiling more kernels desyncs the TP ranks and kills the engine; 1 is the survival-first default)
     ncu_metrics: str | None = None  # --metrics (default: L2 hit-rate + DRAM bytes + duration)
 
     # Phase-specific profiling step configs (not used for nsys-time)
