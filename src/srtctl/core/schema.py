@@ -969,7 +969,10 @@ class ProfilingConfig:
         if not self.is_ncu:
             return []
 
-        kernel = self.ncu_kernel_name or "regex:bmm.*E2m1.*u2"
+        # Loose match: only the MoE fused-GEMM uses `bmm` (dense q/k/v/o use nvjet),
+        # so `regex:bmm` still targets the MoE GEMM but is far likelier to match the
+        # cudagraph-node name than the over-specific `bmm.*E2m1.*u2` (which captured 0).
+        kernel = self.ncu_kernel_name or "regex:bmm"
         # Single metric -> single pass -> no kernel replay -> no collective deadlock.
         metrics = self.ncu_metrics or "lts__t_sector_hit_rate.pct"
 
