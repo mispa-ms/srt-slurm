@@ -955,16 +955,22 @@ class ProfilingConfig:
         - --cache-control none   : do NOT flush L2 between passes, so the kernel
           sees the real serving-pipeline cache state (default flushes L2, which
           would erase the warm-vs-cold residency signal we want to measure)
-        CRITICAL for TP / collective-coupled kernels: keep --metrics to a
-        SINGLE pass. With multi-pass metric sets, ncu kernel-replay re-runs the
-        kernel with device state save/restore between passes, which pauses one
-        rank while the others proceed to the NCCL all-reduce -> desync ->
-        UnknownError (this killed the first in-situ attempt, 3/4 ranks failed).
-        A single-pass metric set runs ONE normal graph replay with counters,
-        so the collective executes normally and nothing deadlocks. The default
-        is therefore just the L2 hit-rate (one derived metric from the LTS unit
-        = one pass). `--replay-mode application` (the usual collective fix) is
-        not usable here because it would re-launch the whole server per pass.
+        CRITICAL for this model: use --replay-mode APPLICATION with a
+        SINGLE-pass metric. `--replay-mode kernel` (the default) save/restores
+        the kernel's accessible device memory between/around passes; this MoE
+        GEMM touches GB-scale FP4 expert weights plus multicast/NVLS fabric
+        memory, which ncu cannot back up -> `==ERROR== Failed to save memory
+        for replay / ContextSaveFailed` (this is what actually killed the
+        in-situ runs, surfaced once --csv was dropped for verbose text; the
+        earlier "UnknownError" was the csv-mode masking of the same failure).
+        ncu's own error message recommends --replay-mode application. With a
+        single-pass metric (one LTS-unit derived ratio = one pass) application
+        replay does NOT re-launch the server: it profiles the kernel during the
+        ONE natural execution of the cudaProfilerStart/Stop window, with no
+        memory save/restore. Keep the metric single-pass so no relaunch is ever
+        triggered. Pair with VLLM_NCU_SINGLE_RANK so only one rank arms ncu (a
+        4-rank profile serializes the collective -> 300 s sample_tokens RPC
+        deadlock).
         """
         if not self.is_ncu:
             return []
@@ -987,7 +993,7 @@ class ProfilingConfig:
             "--cache-control",
             "none",
             "--replay-mode",
-            "kernel",
+            "application",
             "--kernel-name",
             kernel,
             "--launch-count",
