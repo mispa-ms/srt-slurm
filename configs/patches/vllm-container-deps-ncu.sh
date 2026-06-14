@@ -603,7 +603,19 @@ new_block = """    @override
         # VLLM_NCU_SINGLE_RANK is set (see _vlnsys_ncu_should_toggle) so ncu
         # arms on one rank and the collective-coupled MoE GEMM doesn't deadlock.
         _vlnsys_dp_barrier()
-        if _vlnsys_ncu_should_toggle():
+        _vlnsys_toggle = _vlnsys_ncu_should_toggle()
+        try:
+            import torch.distributed as _vlnsys_dist
+
+            _vlnsys_rank = _vlnsys_dist.get_rank() if _vlnsys_dist.is_initialized() else -1
+        except Exception:
+            _vlnsys_rank = -1
+        logger.info(
+            "[vllm-ncu-gate] _start: rank=%s toggle=%s (VLLM_NCU_SINGLE_RANK gate)",
+            _vlnsys_rank,
+            _vlnsys_toggle,
+        )
+        if _vlnsys_toggle:
             self._cuda_profiler.start()
         _vlnsys_dp_barrier()
 

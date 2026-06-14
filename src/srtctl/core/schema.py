@@ -994,9 +994,17 @@ class ProfilingConfig:
             str(self.ncu_launch_count),
             "--metrics",
             metrics,
-            "--csv",
+            # Verbose TEXT output (NOT --csv): --csv collapses a profiling
+            # failure to a bare "==ERROR== UnknownError", which is useless for
+            # debugging. The default text page prints the full ==WARNING==/
+            # ==ERROR== context (metric pass count, unsupported-feature reason,
+            # cluster/graph-node diagnostics) AND, on success, the metric table
+            # (grep-parseable). Also emit a per-kernel summary so partial
+            # results still print. Switch back to --csv once capture works.
+            "--print-summary",
+            "per-kernel",
             "--log-file",
-            output_file + ".ncu.csv",
+            output_file + ".ncu.txt",
             "-f",
         ]
 
