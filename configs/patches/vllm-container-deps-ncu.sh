@@ -104,9 +104,18 @@ fi
 # registered, so a direct `apt install` works. ncu installs under
 # /opt/nvidia/nsight-compute/<ver>/ and apt usually symlinks it to
 # /usr/local/bin/ncu; if not on PATH we add the install dir.
+# Pin the NEWEST concrete nsight-compute: graph-node profiling of SM100
+# (Blackwell) thread-block-cluster + TMA-multicast kernels — exactly our
+# trtllm-gen FP4 MoE GEMM — matured a lot from 2025.3 -> 2026.x. 2025.3.0
+# returns `UnknownError / Failed to profile bmm_E2m1...` on the (pure-compute)
+# fc1 GEMM graph node in-situ; newer ncu is the most credible fix. Fall back
+# down the chain if a version isn't in the repo. (`nsight-compute` alone is a
+# virtual package and can't be apt-installed directly.)
 if ! command -v ncu >/dev/null 2>&1; then
     apt-get -y update
-    apt-get install -y --no-install-recommends nsight-compute || \
+    apt-get install -y --no-install-recommends nsight-compute-2026.2.0 || \
+        apt-get install -y --no-install-recommends nsight-compute-2026.1.1 || \
+        apt-get install -y --no-install-recommends nsight-compute-2025.4.1 || \
         apt-get install -y --no-install-recommends nsight-compute-2025.3.0 || \
         apt-get install -y --no-install-recommends nsight-compute-2025.1.1
 fi
