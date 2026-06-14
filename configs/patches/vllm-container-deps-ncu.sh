@@ -526,7 +526,48 @@ def _vlnsys_dp_barrier() -> None:
             return
         dist.barrier(group=cpu_group)
     except Exception as exc:  # never let the barrier kill the run
-        logger.warning("[vllm-stop-fence-patch] DP barrier skipped: %s", exc)'''
+        logger.warning("[vllm-stop-fence-patch] DP barrier skipped: %s", exc)
+
+
+def _vlnsys_ncu_should_toggle() -> bool:
+    # [PATCHED by vllm-container-deps-ncu.sh] Gate the cudaProfilerStart/Stop
+    # CUPTI toggle to a SINGLE rank when profiling in-situ with ncu.
+    #
+    # Why: ncu is launched with --target-processes all, so it attaches to every
+    # TP worker. cudaProfilerStart (--profile-from-start off keys on it) then
+    # arms ncu on ALL ranks at once. ncu serializes the profiled kernel per
+    # process, but the MoE GEMM is collective-coupled (NCCL all-reduce on the
+    # tp/ep groups) — N independently-serializing ncu instances lose lockstep
+    # and the collective never completes -> every rank blocks -> the engine's
+    # sample_tokens RPC hits VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS and the worker
+    # is declared dead (observed: death exactly 300 s after profiler start).
+    #
+    # Fix: only ONE rank calls cudaProfilerStart, so only that rank's ncu arms.
+    # The other ranks run the kernel at full speed and reach the all-reduce
+    # normally; the profiled rank arrives late (a STALL, not a deadlock), and
+    # the collective completes. Pair with a raised VLLM_EXECUTE_MODEL_TIMEOUT_
+    # SECONDS so that one slow step doesn't trip the RPC timeout. One rank's HW
+    # counters are sufficient for the L2/DRAM question (all ranks run the same
+    # shape). Gated by VLLM_NCU_SINGLE_RANK=1 so the nsys path (which wants all
+    # ranks in the timeline) is unaffected. Rank selectable via
+    # VLLM_NCU_PROFILE_RANK (default 0).
+    import os
+
+    if os.environ.get("VLLM_NCU_SINGLE_RANK", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+    try:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            return True
+        want = int(os.environ.get("VLLM_NCU_PROFILE_RANK", "0"))
+        return dist.get_rank() == want
+    except Exception:  # if rank can't be resolved, don't suppress the toggle
+        return True'''
 
 if "_vlnsys_dp_barrier" not in content:
     if helper_anchor not in content:
@@ -546,11 +587,15 @@ old_block = """    @override
 
 new_block = """    @override
     def _start(self) -> None:
-        # [PATCHED] cross-rank barrier so all DP ranks open the CUPTI capture
+        # [PATCHED] cross-rank barrier so all DP ranks reach the CUPTI capture
         # window together (uncoordinated cudaProfilerStart under collective
-        # load desyncs NVLS/NVSHMEM -> drain-tail deadlock).
+        # load desyncs NVLS/NVSHMEM -> drain-tail deadlock). All ranks still
+        # hit the barrier; only the selected rank toggles the profiler when
+        # VLLM_NCU_SINGLE_RANK is set (see _vlnsys_ncu_should_toggle) so ncu
+        # arms on one rank and the collective-coupled MoE GEMM doesn't deadlock.
         _vlnsys_dp_barrier()
-        self._cuda_profiler.start()
+        if _vlnsys_ncu_should_toggle():
+            self._cuda_profiler.start()
         _vlnsys_dp_barrier()
 
     @override
@@ -560,7 +605,8 @@ new_block = """    @override
         # torch.distributed.barrier(dp_tp_cpu_group) around the profiler stop.
         _vlnsys_dp_barrier()
         torch.cuda.synchronize()
-        self._cuda_profiler.stop()
+        if _vlnsys_ncu_should_toggle():
+            self._cuda_profiler.stop()
         torch.cuda.synchronize()
         _vlnsys_dp_barrier()"""
 
