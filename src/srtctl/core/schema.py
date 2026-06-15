@@ -979,8 +979,15 @@ class ProfilingConfig:
         # so `regex:bmm` still targets the MoE GEMM but is far likelier to match the
         # cudagraph-node name than the over-specific `bmm.*E2m1.*u2` (which captured 0).
         kernel = self.ncu_kernel_name or "regex:bmm"
-        # Single metric -> single pass -> no kernel replay -> no collective deadlock.
-        metrics = self.ncu_metrics or "lts__t_sector_hit_rate.pct"
+        # ONE raw counter -> guaranteed SINGLE pass. lts__t_sector_hit_rate.pct
+        # is a multi-pass metric: under --replay-mode application that makes ncu
+        # want a 2nd pass it can't get (the server never relaunches), so it
+        # stalls at "Application replay pass 1" and never writes a report.
+        # dram__bytes_read.sum is a single base counter (1 pass) AND directly
+        # tests the open hypothesis — does cold stream more DRAM than warm for
+        # the identical MoE GEMM (nsys hinted cold read 51 vs warm 32). A single
+        # pass finalizes the app-replay range without a relaunch.
+        metrics = self.ncu_metrics or "dram__bytes_read.sum"
 
         cmd = [
             "ncu",
