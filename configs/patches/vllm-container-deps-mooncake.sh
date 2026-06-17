@@ -15,12 +15,18 @@ set -euo pipefail
 # Base container deps first (numactl, msgpack, numa-bind fix).
 bash /configs/patches/vllm-container-deps.sh
 
-# ---- TCP transport tuning (mooncake docs: "Cannot assign requested address") --
-# The real fix is the connection pool (MC_TCP_ENABLE_CONNECTION_POOL=1, set in the
-# recipe env) so sockets are reused instead of opened per transfer. These sysctls
-# are belt-and-suspenders for ephemeral-port pressure; best-effort (need a writable
-# net ns / privilege — ignore failure since the pool is the primary fix).
-sysctl -w net.ipv4.ip_local_port_range="1024 65535" 2>/dev/null && echo "[mooncake] widened ip_local_port_range" || echo "[mooncake] (could not set ip_local_port_range — relying on connection pool)"
+# ---- Transport + kernel tuning (best-effort; we have container priv on bia) -----
+# Protocol is env-driven: rdma (Wei's InfX B300 path, scales — no per-transfer
+# sockets) vs tcp (no RDMA MR-registration, but exhausts ephemeral ports at high
+# transfer volume). Default rdma.
+MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-rdma}"
+# RDMA registration fixes (mooncake troubleshooting docs): ibv_reg_mr of the large
+# host offload buffer EFAULTed on bia. vm.max_map_count default (65530) is too small
+# for many MRs; memlock cap blocks pinning. Both best-effort.
+sysctl -w vm.max_map_count=16777216 2>/dev/null && echo "[mooncake] raised vm.max_map_count" || echo "[mooncake] (could not set vm.max_map_count)"
+ulimit -l unlimited 2>/dev/null && echo "[mooncake] memlock unlimited" || echo "[mooncake] (could not raise memlock — relies on cluster default)"
+# TCP ephemeral-port fixes (only relevant when MOONCAKE_PROTOCOL=tcp).
+sysctl -w net.ipv4.ip_local_port_range="1024 65535" 2>/dev/null && echo "[mooncake] widened ip_local_port_range" || true
 sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null && echo "[mooncake] enabled tcp_tw_reuse" || true
 
 # ---- Mooncake store install (cu13 wheel for B300/GB300) ----------------------
@@ -88,7 +94,7 @@ cat > "$MOONCAKE_CONFIG_PATH" <<EOF
   "master_server_address": "127.0.0.1:${MOONCAKE_MASTER_PORT}",
   "global_segment_size": "${PER_RANK_GB}GB",
   "local_buffer_size": "4GB",
-  "protocol": "tcp",
+  "protocol": "${MOONCAKE_PROTOCOL}",
   "device_name": "",
   "enable_offload": false
 }
