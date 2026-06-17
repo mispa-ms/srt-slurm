@@ -49,12 +49,13 @@ echo "[mooncake] wrote $MOONCAKE_CONFIG_PATH (per-rank ${PER_RANK_GB}GB x TP${TP
 
 # ---- Launch local mooncake_master (detached so it survives this script) -------
 echo "[mooncake] starting master on 127.0.0.1:${MOONCAKE_MASTER_PORT}"
-# NOTE: the master's admin/metrics HTTP server fails to bind even on a free high port
-# (29003) in this env -> "Failed to start master admin server" -> exit 11. It's not a
-# port conflict (the bind itself fails); we don't need master metrics for the benchmark,
-# so DISABLE it. RPC service (client connects here, --port) starts fine independently.
+# The admin/metrics server can't be disabled (mandatory in non-HA; master exits if it
+# fails). Its bind failure was the STOCK vllm image, not a port conflict — Cam's custom
+# image (cquil/vllm-openai, set in the recipe) is what makes it start. Keep metrics on a
+# free high port to also dodge any 9003 conflict. Matches InferenceX dsv4 'cpu' case.
+MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-29003}"
 setsid nohup mooncake_master --port "${MOONCAKE_MASTER_PORT}" \
-    --enable_metric_reporting=false \
+    --metrics_port="${MOONCAKE_METRICS_PORT}" \
     --eviction_high_watermark_ratio=0.80 \
     --eviction_ratio=0.10 \
     > "${MOONCAKE_MASTER_LOG}" 2>&1 &
