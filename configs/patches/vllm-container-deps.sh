@@ -11,3 +11,23 @@ pip install msgpack
 if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
+
+# ---- host-mem poller (KV-offload pool sizing visibility) ----------------------
+# Background logger: every 30s prints total/used/avail + a RUNNING PEAK to stdout
+# (inherited by the worker log, so it lands in the run artifact). Lets us confirm
+# whether the pinned CPU KV-offload pool actually fills and how close we run to
+# the node RAM ceiling — the runtime high-water-mark the agentx bench doesn't log.
+(
+  set +e
+  peak=0
+  while :; do
+    tot=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    used=$(( (tot - avail) / 1048576 ))            # GiB
+    [ "$used" -gt "$peak" ] && peak=$used
+    echo "[hostmem] $(date -u +%H:%M:%S) used=${used}GiB avail=$(( avail / 1048576 ))GiB peak=${peak}GiB total=$(( tot / 1048576 ))GiB"
+    sleep 30
+  done
+) &
+disown $! 2>/dev/null || true
+echo "[hostmem] poller started (pid $!), logging every 30s to the worker stdout"
