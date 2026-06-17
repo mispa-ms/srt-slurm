@@ -29,9 +29,49 @@ echo "[mooncake] installed ${MOONCAKE_VERSION}"
 TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-1500}"
 TP="${MOONCAKE_TP:-8}"
 PER_RANK_GB=$(( TOTAL_CPU_DRAM_GB / TP ))
-MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-20888}"   # high free port; 8700 collides with srt-slurm's reserved mooncake port (admin server bind fails)
 MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-/tmp/mooncake_config.json}"
 MOONCAKE_MASTER_LOG="${MOONCAKE_MASTER_LOG:-/tmp/mooncake_master.log}"
+
+# ---- Port selection (ROOT CAUSE of prior failures) ----------------------------
+# mooncake_master starts TWO servers: a coro_rpc server on --port and a MANDATORY
+# cinatra admin/metrics HTTP server on --metrics_port (master.cpp:1100-1105 →
+# `return 1` if it can't bind; rpc_service.cpp:228-234; not gated by
+# enable_metric_reporting). Both bind 0.0.0.0 via identical code. On bia the RPC
+# port (20888) was free but the metrics port (default 9003 AND a hard-coded 29003)
+# was already LISTENing in the node's network namespace, so RPC came up and the
+# admin bind failed fatally. The InferenceX dsv4 reference omits --metrics_port
+# (uses 9003) and only works because its cluster has 9003 free. Fix: probe a
+# genuinely-free port for each server instead of guessing, and log what holds the
+# old ports so the occupancy is provable in the run log.
+_dump_listeners() {
+    python3 - <<'PY' || true
+import glob
+def ports(path):
+    out=set()
+    try:
+        for ln in open(path).read().splitlines()[1:]:
+            f=ln.split()
+            if len(f)>3 and f[3]=='0A':  # 0A = TCP LISTEN
+                out.add(int(f[1].rsplit(':',1)[1],16))
+    except FileNotFoundError:
+        pass
+    return out
+listening=ports('/proc/net/tcp')|ports('/proc/net/tcp6')
+for p in (9003,20888,29003):
+    print(f"[mooncake]   port {p}: {'IN USE' if p in listening else 'free'}")
+print(f"[mooncake]   ({len(listening)} TCP listeners in this netns)")
+PY
+}
+_free_port() {
+    # Ask the kernel for an ephemeral free port, bound to 0.0.0.0 exactly like
+    # mooncake_master does, so the result is representative.
+    python3 -c 'import socket;s=socket.socket();s.bind(("0.0.0.0",0));print(s.getsockname()[1]);s.close()'
+}
+echo "[mooncake] listener check before port selection:"
+_dump_listeners
+MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-$(_free_port)}"     # coro_rpc server
+MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-$(_free_port)}"   # mandatory cinatra admin/metrics server
+echo "[mooncake] selected rpc=${MOONCAKE_MASTER_PORT} metrics=${MOONCAKE_METRICS_PORT}"
 
 cat > "$MOONCAKE_CONFIG_PATH" <<EOF
 {
@@ -48,12 +88,10 @@ EOF
 echo "[mooncake] wrote $MOONCAKE_CONFIG_PATH (per-rank ${PER_RANK_GB}GB x TP${TP})"
 
 # ---- Launch local mooncake_master (detached so it survives this script) -------
-echo "[mooncake] starting master on 127.0.0.1:${MOONCAKE_MASTER_PORT}"
-# The admin/metrics server can't be disabled (mandatory in non-HA; master exits if it
-# fails). Its bind failure was the STOCK vllm image, not a port conflict — Cam's custom
-# image (cquil/vllm-openai, set in the recipe) is what makes it start. Keep metrics on a
-# free high port to also dodge any 9003 conflict. Matches InferenceX dsv4 'cpu' case.
-MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-29003}"
+echo "[mooncake] starting master rpc=127.0.0.1:${MOONCAKE_MASTER_PORT} metrics=${MOONCAKE_METRICS_PORT}"
+# The admin/metrics HTTP server is mandatory (master.cpp:1100-1105 → exit on bind
+# failure) and cannot be disabled by any flag; enable_metric_reporting only gates
+# the logging thread. So both ports must be genuinely free — see the probe above.
 setsid nohup mooncake_master --port "${MOONCAKE_MASTER_PORT}" \
     --metrics_port="${MOONCAKE_METRICS_PORT}" \
     --eviction_high_watermark_ratio=0.80 \
