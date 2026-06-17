@@ -49,7 +49,12 @@ echo "[mooncake] wrote $MOONCAKE_CONFIG_PATH (per-rank ${PER_RANK_GB}GB x TP${TP
 
 # ---- Launch local mooncake_master (detached so it survives this script) -------
 echo "[mooncake] starting master on 127.0.0.1:${MOONCAKE_MASTER_PORT}"
+# NOTE: master also starts an admin/metrics HTTP server (default port 9003), which
+# is OCCUPIED in this dynamo/BTK env -> "Failed to start master admin server on port
+# 9003" -> exit 11. Move it to a high free port. (rpc on --port ${MOONCAKE_MASTER_PORT}.)
+MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-29003}"
 setsid nohup mooncake_master --port "${MOONCAKE_MASTER_PORT}" \
+    --metrics_port="${MOONCAKE_METRICS_PORT}" \
     --eviction_high_watermark_ratio=0.80 \
     --eviction_ratio=0.10 \
     > "${MOONCAKE_MASTER_LOG}" 2>&1 &
