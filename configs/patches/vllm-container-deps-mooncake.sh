@@ -29,7 +29,7 @@ echo "[mooncake] installed ${MOONCAKE_VERSION}"
 TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-1500}"
 TP="${MOONCAKE_TP:-8}"
 PER_RANK_GB=$(( TOTAL_CPU_DRAM_GB / TP ))
-MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-8700}"
+MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-20888}"   # high free port; 8700 collides with srt-slurm's reserved mooncake port (admin server bind fails)
 MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-/tmp/mooncake_config.json}"
 MOONCAKE_MASTER_LOG="${MOONCAKE_MASTER_LOG:-/tmp/mooncake_master.log}"
 
