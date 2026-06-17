@@ -15,6 +15,14 @@ set -euo pipefail
 # Base container deps first (numactl, msgpack, numa-bind fix).
 bash /configs/patches/vllm-container-deps.sh
 
+# ---- TCP transport tuning (mooncake docs: "Cannot assign requested address") --
+# The real fix is the connection pool (MC_TCP_ENABLE_CONNECTION_POOL=1, set in the
+# recipe env) so sockets are reused instead of opened per transfer. These sysctls
+# are belt-and-suspenders for ephemeral-port pressure; best-effort (need a writable
+# net ns / privilege — ignore failure since the pool is the primary fix).
+sysctl -w net.ipv4.ip_local_port_range="1024 65535" 2>/dev/null && echo "[mooncake] widened ip_local_port_range" || echo "[mooncake] (could not set ip_local_port_range — relying on connection pool)"
+sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null && echo "[mooncake] enabled tcp_tw_reuse" || true
+
 # ---- Mooncake store install (cu13 wheel for B300/GB300) ----------------------
 MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
 pip install --quiet --no-cache-dir --no-deps --force-reinstall \
