@@ -53,6 +53,17 @@ pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
 python3 -c "from mooncake.store import MooncakeDistributedStore" >/dev/null
 echo "[mooncake] installed ${MOONCAKE_PKG}"
 
+# Bound MooncakeStoreConnector transfer batches (InferenceX patch). Mooncake's TCP
+# connection pool grows without a ceiling, so big agentic per-layer transfers
+# exhaust the node's TCP ports ("connect: Cannot assign requested address"). The
+# patch splits batch_put/get into INFERENCEX_MOONCAKE_MAX_TRANSFER_BATCH_KEYS-sized
+# chunks. Idempotent; auto-finds vllm's mooncake store worker.py.
+if [ -f /configs/patches/patch_vllm_mooncake_transfer_batches.py ]; then
+    python3 /configs/patches/patch_vllm_mooncake_transfer_batches.py \
+        && echo "[mooncake] transfer-batching patch applied" \
+        || echo "[mooncake] WARN: transfer-batching patch failed (worker.py anchors may differ from this vLLM)"
+fi
+
 # ---- Mooncake config -----------------------------------------------------------
 # bia B300 host RAM = 2014 GiB; use a 1500 GB aggregate CPU pool (~500 GiB headroom).
 # Mooncake embedded mode: each of TP ranks contributes one global segment to the
