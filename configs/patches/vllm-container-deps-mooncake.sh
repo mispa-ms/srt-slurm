@@ -31,10 +31,19 @@ sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null && echo "[mooncake] enabled tcp_tw
 
 # ---- Mooncake store install (cu13 wheel for B300/GB300) ----------------------
 MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
-pip install --quiet --no-cache-dir --no-deps --force-reinstall \
-    "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+# Arch-aware: the cuda13 aarch64 wheel is built manylinux_2_39 (needs glibc 2.39),
+# but the vllm arm64 container is Ubuntu 22.04 (glibc 2.35) -> pip can't install it
+# on GB300. The non-cuda13 'mooncake-transfer-engine' ships a manylinux_2_35
+# aarch64 wheel that matches. (x86/bia keeps the cuda13 build, glibc 2.35 ok.)
+if [ "$(uname -m)" = "aarch64" ]; then
+    MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
+else
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+fi
+echo "[mooncake] installing ${MOONCAKE_PKG} ($(uname -m))"
+pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
 python3 -c "from mooncake.store import MooncakeDistributedStore" >/dev/null
-echo "[mooncake] installed ${MOONCAKE_VERSION}"
+echo "[mooncake] installed ${MOONCAKE_PKG}"
 
 # ---- Mooncake config -----------------------------------------------------------
 # bia B300 host RAM = 2014 GiB; use a 1500 GB aggregate CPU pool (~500 GiB headroom).
