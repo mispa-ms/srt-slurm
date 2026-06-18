@@ -35,12 +35,20 @@ MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
 # but the vllm arm64 container is Ubuntu 22.04 (glibc 2.35) -> pip can't install it
 # on GB300. The non-cuda13 'mooncake-transfer-engine' ships a manylinux_2_35
 # aarch64 wheel that matches. (x86/bia keeps the cuda13 build, glibc 2.35 ok.)
-if [ "$(uname -m)" = "aarch64" ]; then
+# Pick the wheel by (arch, CUDA major) so it both INSTALLS (glibc) and IMPORTS
+# (libcudart.so.<major>):
+#   - x86: cuda13 wheel (manylinux_2_35, glibc 2.35 ok on bia 22.04).
+#   - aarch64 + cu13 container (24.04, glibc 2.39): cuda13 wheel (manylinux_2_39).
+#   - aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35 + needs libcudart.so.12).
+# The cu13 aarch64 wheel needs glibc 2.39, so it ONLY works on a 24.04 cu13 image.
+CU_MAJOR=$(ldconfig -p 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | grep -oE '[0-9]+$' | sort -un | tail -1)
+echo "[mooncake] arch=$(uname -m) cuda_major=${CU_MAJOR:-unknown}"
+if [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "12" ]; then
     MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
 else
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
 fi
-echo "[mooncake] installing ${MOONCAKE_PKG} ($(uname -m))"
+echo "[mooncake] installing ${MOONCAKE_PKG}"
 pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
 python3 -c "from mooncake.store import MooncakeDistributedStore" >/dev/null
 echo "[mooncake] installed ${MOONCAKE_PKG}"
