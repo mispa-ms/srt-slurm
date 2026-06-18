@@ -25,3 +25,12 @@ else
 fi
 python3 -c "import lmcache; print('[lmcache] installed', getattr(lmcache,'__version__','?'))" \
     || { echo "[lmcache] ERROR: import failed after install" >&2; exit 1; }
+
+# save_only_first_rank fix: lmcache 0.4.5..0.4.7 assert lmcache_engine!=None in the
+# request_finished abort branch, but non-first ranks have no engine -> AssertionError
+# on request abort. Patch in an early-return guard (what the turbo "lmcachefix" image
+# carries). Idempotent; non-fatal so a config not using save_only_first_rank still runs.
+if [ -f /configs/patches/patch_lmcache_save_first_rank.py ]; then
+    python3 /configs/patches/patch_lmcache_save_first_rank.py \
+        || echo "[lmcache] WARN: save_only_first_rank patch failed (adapter anchors may differ)"
+fi
