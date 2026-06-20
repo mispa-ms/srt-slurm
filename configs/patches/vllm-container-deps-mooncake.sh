@@ -20,6 +20,20 @@ bash /configs/patches/vllm-container-deps.sh
 # sockets) vs tcp (no RDMA MR-registration, but exhausts ephemeral ports at high
 # transfer volume). Default rdma.
 MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-rdma}"
+# RDMA device pin (root cause of bia EFAULT per Cyrus Chang / InferenceX): empty
+# device_name lets mooncake auto-discover, which on a multi-NIC host grabs the wrong
+# (limited-connection) RNIC -> ibv_reg_mr EFAULT. Pin the primary RNIC explicitly.
+# bia RNICs are mlx5_* (see srt-slurm CLAUDE.md SGLang path); "1st NIC" = mlx5_0.
+# Comma-list allowed (e.g. "mlx5_0,mlx5_1"). Empty = legacy auto-discover.
+MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-}"
+# Dump the node's RDMA topology so we can SEE which RNICs exist + GPU affinity
+# (ground truth for picking device_name; reusable on GB200/GB300).
+echo "[mooncake] ---- RDMA topology (for device_name selection) ----"
+ibv_devices 2>/dev/null || echo "[mooncake]   (ibv_devices unavailable)"
+ibstat -l 2>/dev/null | sed 's/^/[mooncake]   ibstat: /' || true
+nvidia-smi topo -m 2>/dev/null | sed 's/^/[mooncake]   topo: /' || true
+echo "[mooncake] MOONCAKE_DEVICE=${MOONCAKE_DEVICE:-<auto/empty>} protocol=${MOONCAKE_PROTOCOL}"
+echo "[mooncake] ----------------------------------------------------"
 # RDMA registration fixes (mooncake troubleshooting docs): ibv_reg_mr of the large
 # host offload buffer EFAULTed on bia. vm.max_map_count default (65530) is too small
 # for many MRs; memlock cap blocks pinning. Both best-effort.
@@ -123,7 +137,7 @@ cat > "$MOONCAKE_CONFIG_PATH" <<EOF
   "global_segment_size": "${PER_RANK_GB}GB",
   "local_buffer_size": "4GB",
   "protocol": "${MOONCAKE_PROTOCOL}",
-  "device_name": "",
+  "device_name": "${MOONCAKE_DEVICE}",
   "enable_offload": false
 }
 EOF
