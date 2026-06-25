@@ -143,16 +143,22 @@ cmd=(
     --benchmark-duration "${DURATION}"
     --random-seed "${AIPERF_RANDOM_SEED:-42}"
     --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}"
-    --trajectory-start-min-ratio 0.25
-    --trajectory-start-max-ratio 0.75
     --use-server-token-count
-    --no-gpu-telemetry
     --num-dataset-entries "${NUM_DATASET_ENTRIES}"
     --slice-duration 1.0
     --output-artifact-dir "${ARTIFACT_DIR}"
     --public-dataset "${PUBLIC_DATASET}"
     "${SERVER_METRICS_ARGS[@]}"
 )
+
+# Legacy AIPerf (<= cjq/agentx-v0.4 @ 71311eb) drove warmup via explicit trajectory-start
+# ratios and disabled gpu-telemetry. The subagents-rewrite AIPerf (>= e3920297) removed the
+# trajectory-start mechanism (replaced by an automatic ~60s ramp) and rejects those flags.
+# Default = legacy so existing 061526 configs are unchanged; new configs set
+# AGENTX_AIPERF_RECIPE=v2 (in benchmark.env) to use the rewrite's flag shape.
+if [ "${AGENTX_AIPERF_RECIPE:-legacy}" = "legacy" ]; then
+    cmd+=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 --no-gpu-telemetry)
+fi
 
 if [ "${MAX_CONTEXT_LENGTH}" != "0" ] && [ -n "${MAX_CONTEXT_LENGTH}" ]; then
     cmd+=(--max-context-length "${MAX_CONTEXT_LENGTH}")
