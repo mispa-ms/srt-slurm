@@ -150,6 +150,7 @@ echo "[mooncake] starting master rpc=127.0.0.1:${MOONCAKE_MASTER_PORT} metrics=$
 # the logging thread. So both ports must be genuinely free — see the probe above.
 setsid nohup mooncake_master --port "${MOONCAKE_MASTER_PORT}" \
     --metrics_port="${MOONCAKE_METRICS_PORT}" \
+    --default_kv_lease_ttl="${MOONCAKE_KV_LEASE_TTL:-1h}" \
     --eviction_high_watermark_ratio=0.80 \
     --eviction_ratio=0.10 \
     > "${MOONCAKE_MASTER_LOG}" 2>&1 &
