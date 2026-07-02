@@ -56,11 +56,48 @@ MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
 #   - aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35 + needs libcudart.so.12).
 # The cu13 aarch64 wheel needs glibc 2.39, so it ONLY works on a 24.04 cu13 image.
 CU_MAJOR=$(ldconfig -p 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | grep -oE '[0-9]+$' | sort -un | tail -1)
-echo "[mooncake] arch=$(uname -m) cuda_major=${CU_MAJOR:-unknown}"
+# glibc minor (e.g. 35 for 2.35). The cuda13 aarch64 wheels are manylinux_2_39
+# (glibc>=2.39, Ubuntu 24.04); older cu13 images (22.04, glibc 2.35) can't install them.
+GLIBC_MINOR=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+$')
+echo "[mooncake] arch=$(uname -m) cuda_major=${CU_MAJOR:-unknown} glibc=2.${GLIBC_MINOR:-?}"
+NEED_CUDART12_SHIM=0
 if [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "12" ]; then
+    # aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35, links libcudart.so.12).
     MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
+elif [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "13" ] && [ -n "${GLIBC_MINOR}" ] && [ "${GLIBC_MINOR}" -lt 39 ]; then
+    # aarch64 + cu13 container but glibc<2.39 (e.g. vLLM nightly arm64 on 22.04): the
+    # cuda13 wheel (manylinux_2_39) won't install. Fall back to the non-cuda13 2.35 wheel
+    # (0.3.9 satisfies vLLM's kv_connectors floor >=0.3.8) and provide libcudart.so.12 via
+    # the cu12 runtime pip pkg so it IMPORTS on the cu13 container.
+    MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
+    NEED_CUDART12_SHIM=1
 else
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+fi
+if [ "${NEED_CUDART12_SHIM}" = "1" ]; then
+    echo "[mooncake] cu13 image + glibc<2.39 -> installing cu12 runtime shim (libcudart.so.12)"
+    pip install --quiet --no-cache-dir "nvidia-cuda-runtime-cu12"
+    CUDART12_SO=$(python3 - <<'PY'
+import glob, os
+try:
+    import nvidia.cuda_runtime as m
+    d = os.path.join(os.path.dirname(m.__file__), "lib")
+    hits = sorted(glob.glob(os.path.join(d, "libcudart.so.12*")))
+    print(hits[0] if hits else "")
+except Exception:
+    print("")
+PY
+)
+    if [ -n "${CUDART12_SO}" ] && [ -f "${CUDART12_SO}" ]; then
+        # cp into a default loader-path dir + ldconfig so mooncake's .so finds it at
+        # dlopen time in the WORKER process (LD_LIBRARY_PATH set here would not survive
+        # into the separate worker srun; the ld.so cache does).
+        cp -f "${CUDART12_SO}" /usr/local/lib/ 2>/dev/null || cp -f "${CUDART12_SO}" /usr/lib/
+        ldconfig 2>/dev/null || true
+        echo "[mooncake] installed libcudart.so.12 shim: $(basename "${CUDART12_SO}") -> ld cache"
+    else
+        echo "[mooncake] WARN: could not locate cu12 libcudart.so.12 — mooncake import may fail"
+    fi
 fi
 echo "[mooncake] installing ${MOONCAKE_PKG}"
 pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
