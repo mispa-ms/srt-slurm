@@ -77,17 +77,16 @@ fi
 if [ "${NEED_CUDART12_SHIM}" = "1" ]; then
     echo "[mooncake] cu13 image + glibc<2.39 -> installing cu12 runtime shim (libcudart.so.12)"
     pip install --quiet --no-cache-dir "nvidia-cuda-runtime-cu12"
-    CUDART12_SO=$(python3 - <<'PY'
-import glob, os
-try:
-    import nvidia.cuda_runtime as m
-    d = os.path.join(os.path.dirname(m.__file__), "lib")
-    hits = sorted(glob.glob(os.path.join(d, "libcudart.so.12*")))
-    print(hits[0] if hits else "")
-except Exception:
-    print("")
-PY
-)
+    # Locate libcudart.so.12 via pip's install Location (importing the `nvidia` namespace
+    # package is unreliable — it has no importable __init__), then a filesystem fallback.
+    CUDART12_SO=""
+    LOC=$(pip show nvidia-cuda-runtime-cu12 2>/dev/null | awk -F': ' '/^Location:/{print $2}')
+    if [ -n "${LOC}" ]; then
+        CUDART12_SO=$(ls "${LOC}"/nvidia/cuda_runtime/lib/libcudart.so.12* 2>/dev/null | head -1)
+    fi
+    if [ -z "${CUDART12_SO}" ]; then
+        CUDART12_SO=$(find / -maxdepth 9 -path '*cuda_runtime*' -name 'libcudart.so.12*' 2>/dev/null | head -1)
+    fi
     if [ -n "${CUDART12_SO}" ] && [ -f "${CUDART12_SO}" ]; then
         # cp into a default loader-path dir + ldconfig so mooncake's .so finds it at
         # dlopen time in the WORKER process (LD_LIBRARY_PATH set here would not survive
