@@ -181,12 +181,24 @@ echo "[mooncake] wrote $MOONCAKE_CONFIG_PATH (per-rank ${PER_RANK_GB}GB x TP${TP
 
 # ---- Launch local mooncake_master (detached so it survives this script) -------
 echo "[mooncake] starting master rpc=127.0.0.1:${MOONCAKE_MASTER_PORT} metrics=${MOONCAKE_METRICS_PORT}"
+# --default_kv_lease_ttl is a uint64 (SECONDS) in mooncake 0.3.9 (the aarch64/cu13 wheel);
+# 0.3.11 (bia x86) accepts a "1h" duration string. Normalize to seconds so both work — and
+# because the backend env (MOONCAKE_KV_LEASE_TTL) does NOT reach this master-launch shell,
+# so a "1h" default here would fail 0.3.9 with "illegal value '1h' for uint64 flag".
+_ttl_raw="${MOONCAKE_KV_LEASE_TTL:-3600}"
+case "${_ttl_raw}" in
+    *h) MOONCAKE_TTL_SECS=$(( ${_ttl_raw%h} * 3600 ));;
+    *m) MOONCAKE_TTL_SECS=$(( ${_ttl_raw%m} * 60 ));;
+    *s) MOONCAKE_TTL_SECS="${_ttl_raw%s}";;
+    *)  MOONCAKE_TTL_SECS="${_ttl_raw}";;
+esac
+echo "[mooncake] default_kv_lease_ttl=${MOONCAKE_TTL_SECS}s (from '${_ttl_raw}')"
 # The admin/metrics HTTP server is mandatory (master.cpp:1100-1105 → exit on bind
 # failure) and cannot be disabled by any flag; enable_metric_reporting only gates
 # the logging thread. So both ports must be genuinely free — see the probe above.
 setsid nohup mooncake_master --port "${MOONCAKE_MASTER_PORT}" \
     --metrics_port="${MOONCAKE_METRICS_PORT}" \
-    --default_kv_lease_ttl="${MOONCAKE_KV_LEASE_TTL:-1h}" \
+    --default_kv_lease_ttl="${MOONCAKE_TTL_SECS}" \
     --eviction_high_watermark_ratio=0.80 \
     --eviction_ratio=0.10 \
     > "${MOONCAKE_MASTER_LOG}" 2>&1 &
