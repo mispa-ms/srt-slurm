@@ -12,6 +12,15 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
+# ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
+# Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
+# a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
+# memory (stale/zombie process on a dirty node vs a clean GPU). Non-fatal.
+echo "[gpu-diag] nvidia-smi at setup on $(hostname) (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}):"
+nvidia-smi --query-gpu=index,memory.used,memory.total,memory.free --format=csv 2>&1 || true
+echo "[gpu-diag] resident compute processes (who holds GPU memory):"
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv 2>&1 || true
+
 # ---- host-mem poller (KV-offload pool sizing visibility) ----------------------
 # Background logger: every 30s prints total/used/avail + a RUNNING PEAK to stdout
 # (inherited by the worker log, so it lands in the run artifact). Lets us confirm
