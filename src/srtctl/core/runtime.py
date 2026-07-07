@@ -183,6 +183,7 @@ class RuntimeContext:
     # Fields with defaults must come after required fields
     # HuggingFace model support - True if model.path was "hf:model/name"
     is_hf_model: bool = False
+    gpu_type: str | None = None
 
     # Container mounts: host_path -> container_path
     container_mounts: dict[Path, Path] = field(default_factory=dict)
@@ -195,6 +196,9 @@ class RuntimeContext:
 
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
+
+    # Request plane for dynamo workers
+    request_plane: str = "nats"
 
     @classmethod
     def from_config(
@@ -340,11 +344,13 @@ class RuntimeContext:
             model_path=model_path,
             container_image=container_image,
             gpus_per_node=config.resources.gpus_per_node,
+            gpu_type=config.resources.gpu_type,
             network_interface=get_srtslurm_setting("network_interface", "eth0"),
             container_mounts={},
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            request_plane=config.dynamo.request_plane,
         )
 
         # Expand FormattablePath mounts
@@ -363,11 +369,13 @@ class RuntimeContext:
             model_path=model_path,
             container_image=container_image,
             gpus_per_node=config.resources.gpus_per_node,
+            gpu_type=config.resources.gpu_type,
             network_interface=get_srtslurm_setting("network_interface", "eth0"),
             container_mounts=container_mounts,
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            request_plane=config.dynamo.request_plane,
         )
 
     def format_string(self, template: str, **extra_kwargs) -> str:
