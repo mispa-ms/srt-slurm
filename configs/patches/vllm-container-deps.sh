@@ -12,6 +12,18 @@ if [ -f /configs/patches/vllm_numa_bind_hash_fix.py ]; then
     python3 /configs/patches/vllm_numa_bind_hash_fix.py
 fi
 
+# ---- PR #38433 (nixl DCP for PD-disagg, unequal dcp) runtime patch — gated on APPLY_PR38433 ----
+# Python-only 10-file patch, cherry-picked onto cbe9c40f. Fixes tp-only KV block mapping
+# (DEP4->DCP correctness). Requires cp_kv_cache_interleave_size == block_size in the vLLM config.
+if [ "${APPLY_PR38433:-0}" = "1" ] && [ -f /configs/patches/pr38433-on-cbe9c40f.patch ]; then
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[pr38433] applying nixl-DCP patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/pr38433-on-cbe9c40f.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/pr38433-on-cbe9c40f.patch ) \
+      || { echo "[pr38433] PATCH FAILED"; exit 1; }
+    echo "[pr38433] patch applied OK"
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
