@@ -38,6 +38,20 @@ if [ "${APPLY_PR45340:-0}" = "1" ] && [ -f /configs/patches/pr45340-on-cbe9c40f.
     echo "[pr45340] patch applied OK"
 fi
 
+# ---- PR #48180 (DCP + Eagle for Tokenspeed_MLA / FlashInfer) runtime patch — gated on APPLY_PR48180 ----
+# 4-file python patch on top of the latest nightly + tokenspeed-mla 0.1.2->0.1.8. Enables DCP4 + eagle3
+# spec-decode with TOKENSPEED_MLA attention (Pavani #48180, GSM8k cudagraph-verified). Unmerged/open.
+if [ "${APPLY_PR48180:-0}" = "1" ] && [ -f /configs/patches/pr48180-on-latest.patch ]; then
+    echo "[pr48180] installing tokenspeed-mla==0.1.8"
+    pip install "tokenspeed-mla==0.1.8" || { echo "[pr48180] tokenspeed-mla install FAILED"; exit 1; }
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[pr48180] applying DCP+Eagle Tokenspeed patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/pr48180-on-latest.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/pr48180-on-latest.patch ) \
+      || { echo "[pr48180] PATCH FAILED"; exit 1; }
+    echo "[pr48180] patch applied OK"
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
