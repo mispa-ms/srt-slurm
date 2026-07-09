@@ -1,0 +1,87 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+index 34f99b7cfa..4de8b3bd6c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -48,6 +48,7 @@ from vllm.logger import init_logger
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+ from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
+@@ -620,7 +621,11 @@ class MooncakeConnectorScheduler:
+         kv_cache_config: "KVCacheConfig",
+     ):
+         self.vllm_config = vllm_config
+-        self.block_size = vllm_config.cache_config.block_size
++        self.block_size, _ = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
++        cp_world_size = (
++            vllm_config.parallel_config.decode_context_parallel_size
++            * vllm_config.parallel_config.prefill_context_parallel_size
++        )
+ 
+         assert vllm_config.kv_transfer_config
+         self.is_kv_producer: bool = (
+@@ -653,7 +658,7 @@ class MooncakeConnectorScheduler:
+ 
+         # Compute sliding window block counts per KV cache group.
+         sw_sizes_tokens: list[tuple[int, int]] = [
+-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
++            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size * cp_world_size)
+             if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+             else (0, self.block_size)
+             for g in kv_cache_config.kv_cache_groups
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+index e506850bd7..fc72ee5009 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+@@ -31,6 +31,7 @@ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.network_utils import make_zmq_path
++from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+@@ -58,7 +59,7 @@ class NixlBaseConnectorScheduler:
+         kv_cache_config: "KVCacheConfig",
+     ):
+         self.vllm_config = vllm_config
+-        self.block_size = vllm_config.cache_config.block_size
++        self.block_size, _ = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+         self.engine_id: EngineId = engine_id
+         self.kv_cache_config = kv_cache_config
+         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
+@@ -122,8 +123,15 @@ class NixlBaseConnectorScheduler:
+ 
+         # Gather Sliding Window sizes for each kv cache group (if any) in number of
+         # blocks per KV cache group. This is used to clip the local attention window.
++        cp_world_size = (
++            vllm_config.parallel_config.decode_context_parallel_size
++            * vllm_config.parallel_config.prefill_context_parallel_size
++        )
+         sw_sizes_tokens: list[tuple[int, int]] = [
+-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
++            (
++                g.kv_cache_spec.sliding_window,
++                g.kv_cache_spec.block_size * cp_world_size,
++            )
+             if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+             else (0, self.block_size)
+             for g in kv_cache_config.kv_cache_groups
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+index c120f939af..4045fd8a2d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+@@ -123,6 +123,10 @@ def compute_nixl_compatibility_hash(
+         "cache_dtype": str(cache_config.cache_dtype),
+         "cross_layers_blocks": cross_layers_blocks,
+         "is_hma_enabled": is_hma_enabled,
++        # KV is interleaved across context-parallel ranks; layouts only pair
++        # up rank-to-rank when P and D use identical CP sizes.
++        "dcp_size": vllm_config.parallel_config.decode_context_parallel_size,
++        "pcp_size": vllm_config.parallel_config.prefill_context_parallel_size,
+     }
+ 
+     compat_hash = hash_factors(factors)

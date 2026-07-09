@@ -24,6 +24,20 @@ if [ "${APPLY_PR38433:-0}" = "1" ] && [ -f /configs/patches/pr38433-on-cbe9c40f.
     echo "[pr38433] patch applied OK"
 fi
 
+# ---- PR #45340 (CP-scaled scheduler block accounting, aligned DCP) — gated on APPLY_PR45340 ----
+# Python-only 3-file patch (nixl base_scheduler + metadata, mooncake connector), cherry-picked
+# onto cbe9c40f. Fixes aligned-DCP PD-disagg: connector schedulers must scale block_size by
+# dcp_size*pcp_size (each block covers that many interleaved tokens) — raw block_size over-counts
+# and hangs long-context prefill KV transfer. Needed for 1P1D dcp4-dcp4 with NIXL/Mooncake.
+if [ "${APPLY_PR45340:-0}" = "1" ] && [ -f /configs/patches/pr45340-on-cbe9c40f.patch ]; then
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[pr45340] applying aligned-DCP block-accounting patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/pr45340-on-cbe9c40f.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/pr45340-on-cbe9c40f.patch ) \
+      || { echo "[pr45340] PATCH FAILED"; exit 1; }
+    echo "[pr45340] patch applied OK"
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
