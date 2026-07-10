@@ -164,6 +164,14 @@ if [ "${MAX_CONTEXT_LENGTH}" != "0" ] && [ -n "${MAX_CONTEXT_LENGTH}" ]; then
     cmd+=(--max-context-length "${MAX_CONTEXT_LENGTH}")
 fi
 
+# Conversation-aware routing (Dynamo session_control): emit nvext.session_control so Dynamo
+# binds all turns of a replayed conversation to the same backend worker. Gated on
+# AGENTX_DYNAMO_CONV_AWARE=1 (set in benchmark.env for conv-aware arms only) so plain/mooncake
+# arms stay unchanged. Needs a Dynamo frontend with router-mode:kv + >=1.3.0-dev ('bind' action).
+if [ "${AGENTX_DYNAMO_CONV_AWARE:-0}" = "1" ]; then
+    cmd+=(--use-dynamo-conv-aware-routing --dynamo-session-timeout-seconds "${AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS:-3600}")
+fi
+
 if [ "${DURATION}" -lt 900 ] || [ "${AIPERF_UNSAFE_OVERRIDE:-false}" = "true" ]; then
     cmd+=(--unsafe-override)
 fi
