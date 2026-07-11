@@ -164,12 +164,22 @@ if [ "${MAX_CONTEXT_LENGTH}" != "0" ] && [ -n "${MAX_CONTEXT_LENGTH}" ]; then
     cmd+=(--max-context-length "${MAX_CONTEXT_LENGTH}")
 fi
 
-# Conversation-aware routing (Dynamo session_control): emit nvext.session_control so Dynamo
-# binds all turns of a replayed conversation to the same backend worker. Gated on
+# Conversation-aware routing: bind all turns of a replayed conversation to the same backend
+# worker so Dynamo's KV router can reuse the conversation's cached prefix. Gated on
 # AGENTX_DYNAMO_CONV_AWARE=1 (set in benchmark.env for conv-aware arms only) so plain/mooncake
-# arms stay unchanged. Needs a Dynamo frontend with router-mode:kv + >=1.3.0-dev ('bind' action).
+# arms stay unchanged.
+#
+# Mechanism = HTTP header, NOT nvext.session_control. Dynamo removed the nvext.session_control
+# body field in the 2026-06-22/06-24 header-only refactor (#10808 "trajectory identity
+# header-only", #10875 "header-based session affinity"); every wheel after that (incl.
+# 1.3.0.dev20260707/08) rejects aiperf's --use-dynamo-conv-aware-routing body with HTTP 400
+# ("unknown field session_control"), which aborts the run at warmup. Instead we set
+# AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=1 so aiperf emits the stable per-conversation
+# X-Session-ID header (== X-Correlation-ID). Dynamo maps x-session-id -> AgentContext.session_id
+# (agents.rs AGENT_HEADER_MAPPINGS, read by agent_context_from_headers in http/service/openai.rs)
+# and routes on it. Version-agnostic: works on any header-refactor Dynamo (707/708/main).
 if [ "${AGENTX_DYNAMO_CONV_AWARE:-0}" = "1" ]; then
-    cmd+=(--use-dynamo-conv-aware-routing --dynamo-session-timeout-seconds "${AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS:-3600}")
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=1
 fi
 
 if [ "${DURATION}" -lt 900 ] || [ "${AIPERF_UNSAFE_OVERRIDE:-false}" = "true" ]; then
