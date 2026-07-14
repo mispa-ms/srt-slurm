@@ -1,0 +1,464 @@
+diff --git a/vllm/distributed/dcp_alltoall_flashinfer.py b/vllm/distributed/dcp_alltoall_flashinfer.py
+new file mode 100644
+index 000000000000..2ab8fcab32d4
+--- /dev/null
++++ b/vllm/distributed/dcp_alltoall_flashinfer.py
+@@ -0,0 +1,260 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++Workspace manager for FlashInfer's DCP all-to-all kernel.
++
++This module wraps FlashInfer's ``decode_cp_a2a_*`` API (added in
++flashinfer-ai/flashinfer#2951) so that vLLM's DCP A2A path can use it as
++an alternative to ``dist.all_to_all_single``.
++
++Lifecycle (per CP group, done once):
++  1. Allocate the MNNVL-backed workspace.
++  2. ``decode_cp_a2a_init_workspace`` to reset the FIFO.
++  3. CPU barrier across the CP group so every rank's init has completed
++     before any rank issues the first all-to-all (otherwise a peer can
++     start writing into a not-yet-initialized FIFO).
++
++Per-call:
++  ``run(partial_o, softmax_stats)`` invokes ``decode_cp_a2a_alltoall``.
++  The kernel is a single fused LL128 exchange — no extra Python
++  overhead beyond the call.
++
++Workspaces are cached by ``(cp_rank, cp_size)`` so the allocate+init
++cost is paid exactly once per process.
++
++Note on ``enable_pdl=False``
++============================
++We pass ``enable_pdl=False`` to match TensorRT-LLM's binding
++(``cpp/tensorrt_llm/thop/alltoallOp.cpp``), which uses the 3-arg
++``launchHelixAllToAll`` overload (no PDL). FlashInfer 0.6.9's Python
++binding defaults to PDL on SM90+, but TRT-LLM has shipped without it
++for production helix CP — so we follow that conservative choice.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING, Any
++
++import torch
++import torch.distributed as dist
++
++if TYPE_CHECKING:
++    from torch.distributed import ProcessGroup
++
++logger = logging.getLogger(__name__)
++
++
++def _to_torch(t: Any) -> torch.Tensor:
++    """Convert a tvm-ffi tensor (or any DLPack object) to ``torch.Tensor``."""
++    if isinstance(t, torch.Tensor):
++        return t
++    return torch.from_dlpack(t)
++
++
++class DCPAllToAllFlashInfer:
++    """Manages FlashInfer DCP workspace and executes the all-to-all kernel.
++
++    Usage::
++
++        mgr = DCPAllToAllFlashInfer.get(
++            cp_rank=cp_group.rank_in_group,
++            cp_size=cp_group.world_size,
++            cp_cpu_group=cp_group.cpu_group,
++        )
++        recv_o, recv_stats = mgr.run(partial_o, softmax_stats)
++    """
++
++    _cache: dict[tuple[int, int], DCPAllToAllFlashInfer] = {}
++
++    def __init__(
++        self,
++        cp_rank: int,
++        cp_size: int,
++        workspace: torch.Tensor,
++        *,
++        use_mnnvl: bool,
++        cp_cpu_group: ProcessGroup | None = None,
++    ) -> None:
++        self.cp_rank = cp_rank
++        self.cp_size = cp_size
++        self.workspace = workspace
++        self._use_mnnvl = use_mnnvl
++        self._cp_cpu_group = cp_cpu_group
++
++    @staticmethod
++    def get(
++        cp_rank: int,
++        cp_size: int,
++        cp_cpu_group: ProcessGroup | None = None,
++    ) -> DCPAllToAllFlashInfer:
++        """Return a ready-to-use manager for the given ``(cp_rank, cp_size)``.
++
++        Allocates and initializes the workspace on first call; subsequent
++        calls return the cached instance.
++
++        Args:
++            cp_rank: This rank's position in the CP group.
++            cp_size: CP group size.
++            cp_cpu_group: CPU ``ProcessGroup`` for the CP ranks. Required
++                for the post-init barrier and (when present) drives the
++                MNNVL communicator. Pass the ``cpu_group`` from the DCP
++                ``GroupCoordinator``.
++        """
++        key = (cp_rank, cp_size)
++        cached = DCPAllToAllFlashInfer._cache.get(key)
++        if cached is not None:
++            return cached
++
++        workspace, used_mnnvl = DCPAllToAllFlashInfer._allocate(
++            cp_rank, cp_size, cp_cpu_group
++        )
++
++        from flashinfer.comm import decode_cp_a2a_init_workspace
++
++        decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
++
++        # Cross-rank barrier so every rank's FIFO init is visible to peers
++        # before any of them starts writing to a peer's slot.
++        if cp_cpu_group is not None:
++            dist.barrier(group=cp_cpu_group)
++        else:
++            torch.accelerator.synchronize()
++
++        mgr = DCPAllToAllFlashInfer(
++            cp_rank,
++            cp_size,
++            workspace,
++            use_mnnvl=used_mnnvl,
++            cp_cpu_group=cp_cpu_group,
++        )
++        DCPAllToAllFlashInfer._cache[key] = mgr
++        logger.info(
++            "Rank %d: FlashInfer DCP A2A workspace ready "
++            "(cp_size=%d, mnnvl=%s, shape=%s)",
++            cp_rank,
++            cp_size,
++            used_mnnvl,
++            list(workspace.shape),
++        )
++        return mgr
++
++    @staticmethod
++    def _allocate(
++        cp_rank: int,
++        cp_size: int,
++        cp_cpu_group: ProcessGroup | None,
++    ) -> tuple[torch.Tensor, bool]:
++        """Allocate the MNNVL workspace; non-MNNVL is unsupported.
++
++        FlashInfer's ``decode_cp_a2a_alltoall`` kernel addresses peer FIFOs
++        through a single ``params.workspace + peer_rank * stride`` base
++        pointer. That only resolves correctly when the workspace is a
++        unified VA backed by MNNVL fabric memory. The plain ``torch.zeros``
++        fallback in PR #2951 hangs the kernel — see
++        ``project_dcp_a2a_h200_unsupported.md`` for a full diagnosis.
++        """
++        if cp_cpu_group is None:
++            raise RuntimeError(
++                "DCPAllToAllFlashInfer requires a Gloo CPU group for MNNVL "
++                "communicator setup; got cp_cpu_group=None."
++            )
++        workspace = DCPAllToAllFlashInfer._allocate_mnnvl(
++            cp_rank, cp_size, cp_cpu_group
++        )
++        return workspace, True
++
++    @staticmethod
++    def _allocate_mnnvl(
++        cp_rank: int,
++        cp_size: int,
++        cp_cpu_group: ProcessGroup | None,
++    ) -> torch.Tensor:
++        """Allocate an MNNVL-backed workspace visible across nodes.
++
++        We bypass FlashInfer's ``set_comm_from_config`` because its split
++        formula (``pp_rank * cp_size + cp_rank``) is meant for MoE A2A,
++        which groups TP peers together. For DCP A2A we want CP peers
++        grouped, which is exactly what ``cp_cpu_group`` already
++        represents — so we set ``MnnvlMemory.comm`` directly and skip
++        the split.
++        """
++        from flashinfer.comm import (
++            Mapping,
++            decode_cp_a2a_allocate_mnnvl_workspace,
++        )
++        from flashinfer.comm.mnnvl import MnnvlMemory, TorchDistBackend
++
++        MnnvlMemory.initialize()
++        MnnvlMemory.comm = TorchDistBackend(group=cp_cpu_group)
++
++        # Mapping is consumed by ``MnnvlMemory.__init__`` for segment
++        # layout; the comm is already correct so ``mnnvl_config`` is
++        # intentionally not passed (which suppresses the broken split).
++        mapping = Mapping(
++            world_size=cp_size,
++            rank=cp_rank,
++            cp_size=cp_size,
++            tp_size=1,
++            pp_size=1,
++        )
++        # New FlashInfer signature (post-#3210) takes mapping only;
++        # cp_size and cp_rank come from the mapping fields above.
++        return decode_cp_a2a_allocate_mnnvl_workspace(mapping)
++
++    def run(
++        self,
++        partial_o: torch.Tensor,
++        softmax_stats: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Run the FlashInfer all-to-all and return ``(recv_o, recv_stats)``.
++
++        Args:
++            partial_o: ``[..., cp_size, D]``, half/bfloat16, contiguous.
++            softmax_stats: ``[..., cp_size, S]``, float32, contiguous,
++                ``S >= 2`` and even.
++
++        Returns:
++            ``(recv_o, recv_stats)`` with the same shapes/dtypes as the
++            inputs. Transpose property along the cp dimension:
++            ``recv_o[rank][..., peer, :] == send_o[peer][..., rank, :]``.
++        """
++        from flashinfer.comm import decode_cp_a2a_alltoall
++
++        # DEBUG (Phase 3 multinode validation): write one-shot per-rank
++        # marker the first time run() is invoked, to confirm FlashInfer
++        # is actually being routed to (not silently NCCL fallback).
++        # Cheap: one open()+write per process for life of the process.
++        if not getattr(self, "_first_call_logged", False):
++            try:
++                with open(f"/tmp/a2a_first_call.{self.cp_rank}", "w") as f:
++                    f.write(
++                        f"cp_rank={self.cp_rank} cp_size={self.cp_size} "
++                        f"po_shape={tuple(partial_o.shape)} "
++                        f"po_dtype={partial_o.dtype}\n"
++                    )
++            except Exception:
++                pass
++            self._first_call_logged = True
++
++        recv_o, recv_stats = decode_cp_a2a_alltoall(
++            partial_o,
++            softmax_stats,
++            self.workspace,
++            self.cp_rank,
++            self.cp_size,
++            enable_pdl=False,
++        )
++        return _to_torch(recv_o), _to_torch(recv_stats)
++
++    @staticmethod
++    def clear_cache() -> None:
++        """Drop all cached managers. For tests / shutdown only."""
++        DCPAllToAllFlashInfer._cache.clear()
++
++    def __repr__(self) -> str:
++        return (
++            f"DCPAllToAllFlashInfer(cp_rank={self.cp_rank}, "
++            f"cp_size={self.cp_size}, mnnvl={self._use_mnnvl}, "
++            f"workspace={tuple(self.workspace.shape)})"
++        )
+diff --git a/vllm/v1/attention/ops/dcp_alltoall.py b/vllm/v1/attention/ops/dcp_alltoall.py
+index e100dbc79ee2..2c1ff7286f07 100644
+--- a/vllm/v1/attention/ops/dcp_alltoall.py
++++ b/vllm/v1/attention/ops/dcp_alltoall.py
+@@ -32,6 +32,33 @@
+     from vllm.v1.attention.ops.common import CPTritonContext
+ 
+ 
++# Module-level cache of the DCP A2A backend choice. Set by
++# ``gpu_worker.py`` at workspace pre-init (where vllm_config is reliably
++# available). The dispatcher reads from cache during forward, avoiding
++# a dependency on ``get_current_vllm_config()`` that raises in V1's
++# async scheduling path.
++_DCP_A2A_BACKEND: str | None = None
++
++
++def set_dcp_a2a_backend(backend: str) -> None:
++    """Cache the DCP A2A backend on this worker process."""
++    global _DCP_A2A_BACKEND
++    _DCP_A2A_BACKEND = backend
++
++
++def _get_dcp_a2a_backend() -> str:
++    """Return the resolved DCP A2A kernel (``"nccl"`` or ``"flashinfer"``).
++
++    There is no user-facing flag: the choice is made automatically at worker
++    init (``gpu_worker._init_dcp_a2a_flashinfer_workspace``) — FlashInfer on
++    Blackwell (sm_100+, where its fused LL128 kernel is CUDA-graph captured and
++    wins), NCCL packed everywhere else — and cached here.
++    """
++    if _DCP_A2A_BACKEND is not None:
++        return _DCP_A2A_BACKEND
++    return "nccl"
++
++
+ def _lse_weighted_combine(
+     outputs: torch.Tensor,
+     lses: torch.Tensor,
+@@ -432,8 +459,22 @@ def dcp_a2a_lse_reduce(
+         cp_attn_lse = cp_attn_lse.to(torch.float32)
+     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
+ 
++    use_fi = _get_dcp_a2a_backend() == "flashinfer"
++    if use_fi:
++        # FlashInfer's LL128 kernel requires partial_o last-dim × elem_size
++        # to be 16-byte aligned. Pad ``D + lse_pack_dim`` up to the next
++        # 16-byte multiple. Pack writes only the first ``D + lse_pack_dim``
++        # slots; the padding is unread by unpack_combine (which loads via
++        # explicit offsets HEAD_DIM and HEAD_DIM+1).
++        elem_size = cp_attn_out.element_size()
++        elems_per_16B = 16 // elem_size
++        D_prime_raw = D + lse_pack_dim
++        D_prime = ((D_prime_raw + elems_per_16B - 1) // elems_per_16B) * elems_per_16B
++    else:
++        D_prime = D + lse_pack_dim
++
+     send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+-        (world_size, B, H_per_rank, D + lse_pack_dim),
++        (world_size, B, H_per_rank, D_prime),
+         device=cp_attn_out.device,
+         dtype=cp_attn_out.dtype,
+     )
+@@ -448,13 +489,47 @@ def dcp_a2a_lse_reduce(
+         lse_pack_dim,
+     )
+ 
+-    work = dist.all_to_all_single(
+-        recv_buffer.view(-1),
+-        send_buffer.view(-1),
+-        group=cp_group.device_group,
+-        async_op=True,
+-    )
+-    work.wait()
++    if use_fi:
++        from vllm.distributed.dcp_alltoall_flashinfer import (
++            DCPAllToAllFlashInfer,
++        )
++
++        # send_buffer is [N, B, H_per_rank, D_prime]; permute to
++        # FlashInfer's convention [B*H_per_rank, N, D_prime] (cp_size
++        # is the second-to-last dim).
++        send_for_fi = (
++            send_buffer.permute(1, 2, 0, 3)
++            .reshape(B * H_per_rank, world_size, D_prime)
++            .contiguous()
++        )
++        # FlashInfer takes a softmax_stats arg as well. LSE is already
++        # bit-packed inside send_for_fi; pass a small placeholder.
++        placeholder = torch.zeros(
++            B * H_per_rank,
++            world_size,
++            2,
++            dtype=torch.float32,
++            device=send_buffer.device,
++        )
++        mgr = DCPAllToAllFlashInfer.get(
++            cp_rank=cp_group.rank_in_group,
++            cp_size=world_size,
++            cp_cpu_group=cp_group.cpu_group,
++        )
++        recv_fi, _ = mgr.run(send_for_fi, placeholder)
++        recv_buffer.copy_(
++            recv_fi.reshape(B, H_per_rank, world_size, D_prime)
++            .permute(2, 0, 1, 3)
++            .contiguous()
++        )
++    else:
++        work = dist.all_to_all_single(
++            recv_buffer.view(-1),
++            send_buffer.view(-1),
++            group=cp_group.device_group,
++            async_op=True,
++        )
++        work.wait()
+ 
+     return _dcp_a2a_unpack_combine(
+         recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 327ba6195f5b..e0d4d6bfa992 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -384,6 +384,12 @@ def init_device(self):
+         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+         init_workspace_manager(self.device, num_ubatches)
+ 
++        # Pre-allocate FlashInfer DCP A2A workspace (when requested) and
++        # cache the backend choice so the dispatcher reads it directly
++        # during V1 async forward (where get_current_vllm_config() may
++        # raise from outside set_current_vllm_config() contexts).
++        self._init_dcp_a2a_flashinfer_workspace()
++
+         # Construct the model runner
+         if self.use_v2_model_runner:
+             from vllm.v1.worker.gpu.model_runner import (
+@@ -405,6 +411,63 @@ def init_device(self):
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+ 
++    def _init_dcp_a2a_flashinfer_workspace(self) -> None:
++        """Pre-allocate the FlashInfer DCP A2A workspace and cache the
++        backend choice so the dispatcher routes correctly during forward.
++
++        Caching the backend in a module-level variable avoids depending on
++        ``get_current_vllm_config()`` from V1's async forward path (where
++        ``set_current_vllm_config()`` is not active for every caller).
++        """
++        pc = self.parallel_config
++        if pc.dcp_comm_backend != "a2a":
++            return
++        if pc.decode_context_parallel_size <= 1:
++            return
++
++        from vllm.v1.attention.ops.dcp_alltoall import set_dcp_a2a_backend
++
++        # Auto-select the DCP A2A kernel (no user-facing flag): FlashInfer's fused
++        # LL128 A2A wins on Blackwell (sm_100+), where it is captured under CUDA
++        # graph; NCCL packed is used everywhere else (eager / non-Blackwell, where
++        # its per-call overhead makes it slower).
++        cap = current_platform.get_device_capability()
++        use_fi = cap is not None and cap.major >= 10  # Blackwell sm_100+
++
++        if not use_fi:
++            set_dcp_a2a_backend("nccl")
++            return
++        set_dcp_a2a_backend("flashinfer")
++
++        from vllm.distributed.dcp_alltoall_flashinfer import (
++            DCPAllToAllFlashInfer,
++        )
++        from vllm.distributed.parallel_state import get_dcp_group
++
++        g = get_dcp_group()
++        try:
++            DCPAllToAllFlashInfer.get(
++                cp_rank=g.rank_in_group,
++                cp_size=g.world_size,
++                cp_cpu_group=g.cpu_group,
++            )
++            logger.info("FlashInfer DCP A2A workspace pre-initialized.")
++        except Exception as e:
++            # FlashInfer A2A needs an MNNVL fabric workspace shared across the CP
++            # group. That works intra-node, and cross-node only on NVL72-class
++            # systems with IMEX/fabric handle exchange. On other setups the
++            # cross-node handle exchange (pidfd_open) or cuMemCreate(FABRIC) fails
++            # here. Rather than crash the engine, fall back to the NCCL all_to_all
++            # DCP path (the default; correct and portable).
++            logger.warning(
++                "FlashInfer DCP A2A workspace init failed (%s); falling back to "
++                "the NCCL all_to_all DCP path. FlashInfer A2A requires an MNNVL "
++                "fabric workspace across the CP group (GB200-NVL72-class for "
++                "cross-node); this configuration does not support it.",
++                repr(e),
++            )
++            set_dcp_a2a_backend("nccl")
++
+     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
+     # to hijack tensor allocation.
+     def load_model(self, *, load_dummy_weights: bool = False) -> None:

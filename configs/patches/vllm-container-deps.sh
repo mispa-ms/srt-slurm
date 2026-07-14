@@ -52,6 +52,18 @@ if [ "${APPLY_PR48180:-0}" = "1" ] && [ -f /configs/patches/pr48180-on-latest.pa
     echo "[pr48180] patch applied OK"
 fi
 
+# ---- PR #48248 (FlashInfer fused MNNVL A2A for DCP a2a-reduce, Blackwell auto-select) — gated on APPLY_PR48248 ----
+# Adds vllm/distributed/dcp_alltoall_flashinfer.py + wires it into dcp_alltoall.py / gpu_worker.py. On sm_100+
+# (GB300) the fused LL128 decode_cp_a2a_alltoall replaces NCCL pack->all_to_all->unpack under CUDA graph. Unmerged/open.
+if [ "${APPLY_PR48248:-0}" = "1" ] && [ -f /configs/patches/pr48248-on-latest.patch ]; then
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[pr48248] applying FlashInfer fused DCP-A2A patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/pr48248-on-latest.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/pr48248-on-latest.patch ) \
+      || { echo "[pr48248] PATCH FAILED"; exit 1; }
+    echo "[pr48248] patch applied OK"
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
