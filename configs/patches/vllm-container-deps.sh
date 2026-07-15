@@ -64,6 +64,19 @@ if [ "${APPLY_PR48248:-0}" = "1" ] && [ -f /configs/patches/pr48248-on-latest.pa
     echo "[pr48248] patch applied OK"
 fi
 
+# ---- NIXL decode-only draft-layer exclusion (EAGLE3/Kimi decode-only P/D) — gated on APPLY_NIXL_DECODE_ONLY ----
+# Excludes decode-local draft (eagle3/spec) KV layers from the NIXL P/D transfer set, so spec can be enabled
+# DECODE-ONLY without the "Number of KV layers must match" handshake assert. Covers V1(EAGLE3/Kimi) + V2(DSpark)
+# + MultiConnector. Pure-Python (7 files), applies clean on nightly-2c17d33f. Branch misunp/nixl-eagle-decode-only-pd.
+if [ "${APPLY_NIXL_DECODE_ONLY:-0}" = "1" ] && [ -f /configs/patches/nixl-decode-only-pd.patch ]; then
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[nixl-dco] applying NIXL decode-only draft-layer exclusion patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/nixl-decode-only-pd.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/nixl-decode-only-pd.patch ) \
+      || { echo "[nixl-dco] PATCH FAILED"; exit 1; }
+    echo "[nixl-dco] patch applied OK"
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the

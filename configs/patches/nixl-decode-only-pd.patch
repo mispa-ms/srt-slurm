@@ -1,0 +1,187 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index c0eb247297..9d896d1d6d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -258,6 +258,20 @@ class KVConnectorBase_V1(ABC):
+         """
+         return
+ 
++    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
++        """
++        Report decode-local speculative-draft (EAGLE/MTP) KV layer names.
++
++        These layers exist only on decode workers and are never transferred
++        cross-instance. Connectors that register per layer (e.g. NIXL) should
++        exclude them so decode advertises the same KV regions as prefill,
++        allowing speculation to be enabled on decode only. Default: no-op.
++
++        Args:
++            layer_names: names of decode-local draft attention KV layers
++        """
++        return
++
+     def register_cross_layers_kv_cache(
+         self, kv_cache: torch.Tensor, attn_backend: type["AttentionBackend"]
+     ):
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index f3e89f6623..ea3e3acab3 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -242,6 +242,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         for c in self._connectors:
+             c.register_cross_layers_kv_cache(kv_cache, attn_backend)
+ 
++    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
++        for c in self._connectors:
++            c.set_decode_local_draft_layers(layer_names)
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         for c in self._connectors:
+             c.register_kv_caches(kv_caches)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index d48cb2a5ff..2a0cd8e343 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -285,6 +285,13 @@ class NixlBaseConnectorWorker:
+             for group in kv_cache_config.kv_cache_groups
+             for layer in group.layer_names
+         }
++        # Decode-local speculative-draft (EAGLE/MTP) KV layer names. Populated
++        # by the model runner via `set_decode_local_draft_layers` before
++        # `register_kv_caches`. These layers are allocated only on decode
++        # workers and must not be NIXL-registered or transferred; otherwise
++        # decode advertises more KV regions than prefill and the P/D handshake
++        # layer-count check fails when speculation is enabled on decode only.
++        self._decode_local_draft_layers: set[str] = set()
+         self.hma_group_size = len(kv_cache_config.kv_cache_tensors)
+ 
+         # ---- Model state (derived from model config) ----
+@@ -1020,9 +1027,36 @@ class NixlBaseConnectorWorker:
+             agent_metadata_bytes=encoder.encode(agent_metadata),
+         )
+ 
++    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
++        """Record decode-local speculative-draft (EAGLE/MTP) KV layer names.
++
++        These layers are allocated only on decode workers and are excluded
++        from NIXL registration and transfer so decode advertises the same KV
++        regions as prefill (issue #48221).
++        """
++        self._decode_local_draft_layers = set(layer_names)
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         """Register the KV Cache data in nixl."""
+ 
++        # Drop decode-local speculative-draft (EAGLE/MTP) KV layers before any
++        # registration path. They are decode-only and never transferred, so
++        # decode must advertise the same KV regions as prefill for the P/D
++        # handshake layer-count check to pass (issue #48221).
++        if self._decode_local_draft_layers:
++            skipped = self._decode_local_draft_layers & kv_caches.keys()
++            if skipped:
++                logger.info_once(
++                    "Skipping decode-local draft KV layers for NIXL "
++                    "registration: %s",
++                    ", ".join(sorted(skipped)),
++                )
++                kv_caches = {
++                    name: cache
++                    for name, cache in kv_caches.items()
++                    if name not in self._decode_local_draft_layers
++                }
++
+         # Detect packed allocation: all tensors are strided views into the
+         # same backing storage (different data_ptr but same storage).
+         # This happens with DSv4-style contiguous per-block packing.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+index 7d9a34406b..698241cbf5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+@@ -223,6 +223,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
+     ############################################################
+     # Worker Side Methods
+     ############################################################
++    def set_decode_local_draft_layers(self, layer_names: set[str]) -> None:
++        assert self.connector_worker is not None
++        self.connector_worker.set_decode_local_draft_layers(layer_names)
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         assert self.connector_worker is not None
+         self.connector_worker.register_kv_caches(kv_caches)
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index cdacb36e58..b67eb129c6 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -46,10 +46,18 @@ class KVConnector:
+ 
+ class ActiveKVConnector(KVConnector):
+     def __init__(
+-        self, vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
++        self,
++        vllm_config: VllmConfig,
++        kv_caches_dict: dict[str, torch.Tensor],
++        decode_local_draft_layers: set[str] | None = None,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_connector = get_kv_transfer_group()
++        # Exclude decode-local speculative-draft (EAGLE/MTP) KV layers from the
++        # transfer so decode advertises the same KV regions as prefill; must be
++        # set before register_kv_caches (issue #48221).
++        if decode_local_draft_layers:
++            self.kv_connector.set_decode_local_draft_layers(decode_local_draft_layers)
+         # Register kv caches with KV Connector if applicable.
+         # TODO: support cross_layers_kv_cache
+         # (see https://github.com/vllm-project/vllm/pull/27743)
+@@ -114,10 +122,12 @@ NO_OP_KV_CONNECTOR = KVConnector()
+ 
+ 
+ def get_kv_connector(
+-    vllm_config: VllmConfig, kv_caches_dict: dict[str, torch.Tensor]
++    vllm_config: VllmConfig,
++    kv_caches_dict: dict[str, torch.Tensor],
++    decode_local_draft_layers: set[str] | None = None,
+ ) -> KVConnector:
+     if not has_kv_transfer_group():
+         # No-op connector.
+         return NO_OP_KV_CONNECTOR
+ 
+-    return ActiveKVConnector(vllm_config, kv_caches_dict)
++    return ActiveKVConnector(vllm_config, kv_caches_dict, decode_local_draft_layers)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2bb52e2fd8..ca8cd53fbb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -498,7 +498,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.kernel_block_sizes,
+             self.vllm_config,
+         )
+-        self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
++        # Decode-local speculative-draft (EAGLE/MTP) KV layers are never
++        # transferred cross-instance; exclude them so speculation can run on
++        # decode only (issue #48221).
++        draft_layers = getattr(self.speculator, "draft_attn_layer_names", None)
++        self.kv_connector = get_kv_connector(
++            self.vllm_config, kv_caches_dict, draft_layers
++        )
+ 
+     def _init_kv_zero_meta(self) -> None:
+         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b104e4c5ca..8a39567cba 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -7539,6 +7539,14 @@ class GPUModelRunner(
+ 
+         if has_kv_transfer_group() and not is_profiling:
+             kv_transfer_group = get_kv_transfer_group()
++            # Decode-local speculative-draft (EAGLE/MTP) KV layers are never
++            # transferred cross-instance. Tell the connector to exclude them so
++            # speculation can be enabled on decode only without tripping the P/D
++            # handshake layer-count check (issue #48221).
++            drafter = getattr(self, "drafter", None)
++            draft_layers = getattr(drafter, "_draft_attn_layer_names", None)
++            if draft_layers:
++                kv_transfer_group.set_decode_local_draft_layers(draft_layers)
+             if self.cross_layers_kv_cache is not None:
+                 assert self.cross_layers_attn_backend is not None
+                 kv_transfer_group.register_cross_layers_kv_cache(
