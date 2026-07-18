@@ -723,6 +723,11 @@ class BenchmarkConfig:
     aiperf_package: str | None = None
     # Extra aiperf CLI flags passed through to bench.sh (e.g., benchmark-duration: 600, workers-max: 200)
     aiperf_args: dict[str, Any] = field(default_factory=dict)
+    # AgentX benchmark fields (see benchmarks/agentx.py)
+    agentx_dataset: str | None = None  # AIPerf --public-dataset alias
+    benchmark_duration: int | None = None  # AIPerf --benchmark-duration in seconds (default: 1800)
+    num_dataset_entries: int | None = None  # AIPerf --num-dataset-entries (default: 472)
+    failed_request_threshold: float | None = None  # AIPerf --failed-request-threshold (default: 0.10)
     # Post-process: export analysis/srtlog per-node batch CSVs + gen_throughput.csv (see postprocess_stage)
     export_node_metrics: bool = False
     # SA-Bench: optional SGLang /slow_down on decode workers (sglang frontend only; see benchmark_stage)
