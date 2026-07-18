@@ -18,7 +18,7 @@ DURATION=${4:-1800}
 MAX_CONTEXT_LENGTH=${5:-0}
 TOKENIZER_PATH=${6:-/model}
 PUBLIC_DATASET=${7:-semianalysis_cc_traces_weka_with_subagents}
-NUM_DATASET_ENTRIES=${8:-472}
+NUM_DATASET_ENTRIES=${8:-}   # empty = use all traces (see conditional below)
 FAILED_REQUEST_THRESHOLD=${9:-0.10}
 shift 9 2>/dev/null || true
 EXTRA_ARGS=("$@")
@@ -144,7 +144,6 @@ cmd=(
     --random-seed "${AIPERF_RANDOM_SEED:-42}"
     --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}"
     --use-server-token-count
-    --num-dataset-entries "${NUM_DATASET_ENTRIES}"
     --slice-duration 1.0
     --output-artifact-dir "${ARTIFACT_DIR}"
     --public-dataset "${PUBLIC_DATASET}"
@@ -158,6 +157,12 @@ cmd=(
 # AGENTX_AIPERF_RECIPE=v2 (in benchmark.env) to use the rewrite's flag shape.
 if [ "${AGENTX_AIPERF_RECIPE:-legacy}" = "legacy" ]; then
     cmd+=(--trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 --no-gpu-telemetry)
+fi
+
+# Cap trace count only when explicitly set. Unset -> omit the flag so aiperf's weka
+# loader uses ALL traces in the corpus (corpus-agnostic; matches "use all traces").
+if [ -n "${NUM_DATASET_ENTRIES}" ]; then
+    cmd+=(--num-dataset-entries "${NUM_DATASET_ENTRIES}")
 fi
 
 if [ "${MAX_CONTEXT_LENGTH}" != "0" ] && [ -n "${MAX_CONTEXT_LENGTH}" ]; then
