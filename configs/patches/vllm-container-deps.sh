@@ -77,6 +77,21 @@ if [ "${APPLY_NIXL_DECODE_ONLY:-0}" = "1" ] && [ -f /configs/patches/nixl-decode
     echo "[nixl-dco] patch applied OK"
 fi
 
+# ---- DCP profiling-assert fix (PR #40996 regression) — always applied ----------
+# PR #40996 added prepare_dcp_dummy_context_metadata() which asserts
+# kv_cache_config.num_blocks >= 2, but determine_available_memory profiles the
+# cudagraph with a MINIMAL placeholder KV config (num_blocks <= 1). On disagg
+# decode-only workers (uniform_decode) this fires and crashes cudagraph capture
+# ("assert max_valid_block_id > 0"). AGG workers are mixed prefill+decode so
+# get_dcp_dummy_context_len() returns 0 there and never hits the assert — which
+# is why AGG DCP4 works and disagg DCP4 dies. Patch skips the dummy-context fill
+# when num_blocks <= 1 (matches pre-#40996 behavior). Idempotent; non-fatal on
+# pre-#40996 images (anchor absent). Run AFTER the git-apply PR patches so it
+# operates on the final cp_utils.py.
+if [ -f /configs/patches/vllm_dcp_profiling_assert_fix.py ]; then
+    python3 /configs/patches/vllm_dcp_profiling_assert_fix.py
+fi
+
 # ---- GPU state at container setup (diagnose startup free-memory OOM) ----------
 # Dump per-GPU memory + any resident compute processes BEFORE vLLM allocates, so
 # a "free memory < gpu-memory-utilization" startup failure reveals WHO holds the
