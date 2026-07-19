@@ -33,18 +33,22 @@ if [[ -f /configs/patches/vllm-container-deps.sh ]]; then
     bash /configs/patches/vllm-container-deps.sh
 fi
 
+# Robust persistent poller: dynamo creates >1 mdc tokenizer cache dir (each with its own
+# tiktoken.model + config.json); a single early patch missed the 2nd dir and registration
+# re-failed. So: patch the config.json next to EVERY tiktoken.model under the whole dynamo
+# cache root, every 3s for the whole run, and echo to stdout (frontend log) for visibility.
 (
-    MDC=/root/.cache/dynamo/mdc/by-slug
-    for _ in $(seq 1 180); do        # ~15 min window (dynamo boots well within this)
-        while IFS= read -r cfg; do
-            if grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
-                sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/' "$cfg"
+    for _ in $(seq 1 1200); do       # ~60 min, covers late-appearing cache dirs
+        while IFS= read -r tk; do
+            cfg="$(dirname "$tk")/config.json"
+            if [ -f "$cfg" ] && grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
+                sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/g' "$cfg"
                 echo "[dynamo-tokfix] patched $cfg (model_type kimi_linear -> kimi_k2)"
             fi
-        done < <(find "$MDC" -name config.json 2>/dev/null)
-        sleep 5
+        done < <(find /root/.cache/dynamo -name tiktoken.model 2>/dev/null)
+        sleep 3
     done
-) </dev/null >/tmp/dynamo_tokfix.log 2>&1 &
+) </dev/null 2>&1 &
 disown 2>/dev/null || true
 
-echo "=== dynamo-tokfix poller backgrounded (log: /tmp/dynamo_tokfix.log) ==="
+echo "=== dynamo-tokfix poller backgrounded (patches config.json by every tiktoken.model) ==="
