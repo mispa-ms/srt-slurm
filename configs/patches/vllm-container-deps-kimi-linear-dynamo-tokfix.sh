@@ -37,16 +37,26 @@ fi
 # tiktoken.model + config.json); a single early patch missed the 2nd dir and registration
 # re-failed. So: patch the config.json next to EVERY tiktoken.model under the whole dynamo
 # cache root, every 3s for the whole run, and echo to stdout (frontend log) for visibility.
+# The poll-and-sed alone loses a race: dynamo re-writes config.json (kimi_linear) and reads
+# model_type atomically each ~30s retry, faster than a 3s poll. So after patching we chattr +i
+# (immutable) to BLOCK dynamo's re-write; the patched kimi_k2 config then persists and the next
+# retry reads kimi_k2 -> registration succeeds. If the fs (overlay) rejects chattr +i we fall back
+# to fast re-patching. Once a config is immutable+kimi_k2, grep no longer matches -> left alone.
 (
-    for _ in $(seq 1 1200); do       # ~60 min, covers late-appearing cache dirs
+    for _ in $(seq 1 1800); do       # ~60 min, covers late-appearing cache dirs
         while IFS= read -r tk; do
             cfg="$(dirname "$tk")/config.json"
             if [ -f "$cfg" ] && grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
+                chattr -i "$cfg" 2>/dev/null || true
                 sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/g' "$cfg"
-                echo "[dynamo-tokfix] patched $cfg (model_type kimi_linear -> kimi_k2)"
+                if chattr +i "$cfg" 2>/dev/null; then
+                    echo "[dynamo-tokfix] patched + immutable (chattr +i): $cfg (kimi_linear -> kimi_k2)"
+                else
+                    echo "[dynamo-tokfix] patched (chattr +i unsupported, re-patching): $cfg"
+                fi
             fi
         done < <(find /root/.cache/dynamo -name tiktoken.model 2>/dev/null)
-        sleep 3
+        sleep 2
     done
 ) </dev/null 2>&1 &
 disown 2>/dev/null || true
