@@ -4,7 +4,8 @@
 vLLM backend configuration.
 
 Implements BackendProtocol for vLLM inference serving with prefill/decode disaggregation.
-Uses dynamo.vllm integration module.
+Supports either Dynamo's vLLM integration module or direct `vllm serve` for
+aggregate jobs.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import builtins
 import json
 from collections.abc import Sequence
-from dataclasses import field
+from dataclasses import field, replace
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -26,6 +27,7 @@ from marshmallow_dataclass import dataclass
 
 from srtctl.ports import (
     DYN_SYSTEM_PORT_BASE,
+    FRONTEND_PUBLIC_PORT,
     MOONCAKE_HTTP_METADATA_PORT,
     MOONCAKE_MASTER_PORT,
     VLLM_DATA_PARALLEL_RPC_PORT,
@@ -428,13 +430,24 @@ class VLLMProtocol:
         endpoints: list[Endpoint],
         base_sys_port: int = DYN_SYSTEM_PORT_BASE,
         port_allocator: NodePortAllocator | None = None,
+        frontend_type: str = "dynamo",
     ) -> list[Process]:
         """Convert endpoints to processes.
 
-        For DP+EP mode (data-parallel-size set), creates one process per GPU.
+        For Dynamo DP+EP mode (data-parallel-size set), creates one process per GPU.
+        For direct vLLM aggregate jobs, `vllm serve` manages local DP ranks from
+        one process, so keep the standard one-process-per-node topology.
         For standard TP mode, creates one process per node.
         """
         from srtctl.core.topology import NodePortAllocator, Process, endpoints_to_processes
+
+        if frontend_type == "vllm":
+            processes = endpoints_to_processes(
+                endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator
+            )
+            if len(processes) != 1 or processes[0].endpoint_mode != "agg":
+                raise ValueError("frontend.type: vllm requires exactly one aggregate server process")
+            return [replace(processes[0], http_port=FRONTEND_PUBLIC_PORT)]
 
         # Check if any endpoint uses DP mode
         has_dp_mode = any(self._is_dp_mode(ep.mode) for ep in endpoints)
@@ -536,7 +549,7 @@ class VLLMProtocol:
             process: The process to start
             endpoint_processes: All processes for this endpoint (for multi-node)
             runtime: Runtime context with paths and settings
-            frontend_type: Frontend type (currently only "dynamo" supported for vLLM)
+            frontend_type: Frontend type ("dynamo" or direct "vllm")
             nsys_prefix: Optional nsys profiling command prefix
             dump_config_path: Path to dump config JSON
             profiling: Profiling config; drives --profiler-config for iteration-based nsys
@@ -563,6 +576,46 @@ class VLLMProtocol:
 
         # Start with nsys prefix if provided
         cmd: list[str] = list(nsys_prefix) if nsys_prefix else []
+
+        if profiling is not None and profiling.is_nsys and not profiling.is_nsys_time:
+            phase = profiling._get_phase_config(mode)
+            if phase is not None and phase.start_step is not None and phase.stop_step is not None:
+                config["profiler-config"] = json.dumps(
+                    {
+                        "profiler": "cuda",
+                        "delay_iterations": phase.vllm_nsys_delay_iterations,
+                        "max_iterations": phase.vllm_nsys_max_iterations,
+                    }
+                )
+
+        if frontend_type == "vllm":
+            if mode != "agg":
+                raise ValueError("frontend.type: vllm supports aggregate vLLM jobs only")
+            if is_multi_node:
+                raise ValueError("frontend.type: vllm currently supports single-node aggregate jobs only")
+
+            config.pop("host", None)
+            config.pop("port", None)
+            config.pop("connector", None)
+            config.setdefault("served-model-name", served_model_name)
+
+            cmd.extend(
+                [
+                    "vllm",
+                    "serve",
+                    model_arg,
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    str(runtime.frontend_port),
+                ]
+            )
+            if not self.set_cuda_visible_devices:
+                device_ids = ",".join(str(i) for i in sorted(process.gpu_indices))
+                if device_ids:
+                    cmd.extend(["--device-ids", device_ids])
+            cmd.extend(_config_to_cli_args(config))
+            return cmd
 
         # Base command - use dynamo.vllm module
         cmd.extend(
@@ -654,19 +707,16 @@ class VLLMProtocol:
             kv_cfg["endpoint"] = f"tcp://*:{process.kv_events_port}"
             cmd.extend(["--kv-events-config", json.dumps(kv_cfg)])
 
-        if profiling is not None and profiling.is_nsys and not profiling.is_nsys_time:
-            phase = profiling._get_phase_config(mode)
-            if phase is not None and phase.start_step is not None and phase.stop_step is not None:
-                config["profiler-config"] = json.dumps(
-                    {
-                        "profiler": "cuda",
-                        "delay_iterations": phase.vllm_nsys_delay_iterations,
-                        "max_iterations": phase.vllm_nsys_max_iterations,
-                    }
-                )
-
         # Add all config flags from vllm_config
         cmd.extend(_config_to_cli_args(config))
+
+        if is_multi_node and not is_dp_mode:
+            # Avoid letting an inherited/container VLLM_PORT seed vLLM's
+            # internal cross-node message-queue port allocator. All local TP
+            # worker subprocesses inherit that same fixed base and can race
+            # when binding their ZMQ sockets; leaving it unset lets the kernel
+            # choose free ports for those internal queues.
+            cmd = ["env", "-u", "VLLM_PORT"] + cmd
 
         return cmd
 
