@@ -33,19 +33,55 @@ if [[ -f /configs/patches/vllm-container-deps.sh ]]; then
     bash /configs/patches/vllm-container-deps.sh
 fi
 
-# PRIMARY fix (no race): inject a valid Kimi tokenizer.json so dynamo's
-# ModelDeploymentCard::from_disk picks TokenizerKind::HfTokenizerJson, which returns BEFORE the
-# tiktoken path -> the kimi_linear model_type check is skipped entirely. The MDC is built by the
-# BACKEND via load_from_disk(<model dir>) (local_model.rs), so we inject into the HF snapshot; we
-# also seed dynamo's mdc cache. dynamo doesn't manage/delete a tokenizer.json we add (unlike
-# config.json which it re-writes), so it persists -> no race. The bundled tokenizer.json is
-# generated from Kimi's tiktoken.model + KIMI_PATTERN and byte-verified 11/11 vs the reference
-# (identical token ids incl. specials). We keep the config model_type spoof as a fallback.
+# FIX: give dynamo a valid Kimi tokenizer.json so ModelDeploymentCard::from_disk picks
+# TokenizerKind::HfTokenizerJson (which returns BEFORE the tiktoken path) -> the kimi_linear
+# model_type check is skipped entirely. The bundled tokenizer.json is generated from Kimi's
+# tiktoken.model + KIMI_PATTERN and byte-verified 11/11 vs the reference (identical token ids
+# incl. specials). Root fix would be a 1-line dynamo whitelist add (tiktoken.rs:192).
 TOKJSON=/tmp/kimi-linear-tokenizer.json
 if [[ -f /configs/patches/kimi-linear-tokenizer.json.gz ]]; then
     gunzip -c /configs/patches/kimi-linear-tokenizer.json.gz > "$TOKJSON" 2>/dev/null \
       && echo "[dynamo-tokfix] staged tokenizer.json ($(wc -c <"$TOKJSON") B)"
 fi
+
+# SYNCHRONOUS pre-stage (wins the MDC race): the earlier background poller LOST — the backend
+# content-hashes + registers the MDC the instant the engine is ready (tiktoken card 6f101c94),
+# and the HF snapshot only materializes ~ms before that, so a 2s poller injected too late and
+# into a different mdcsum dir. dynamo's tokenizer resolution is entirely container-local
+# (/root/.cache/huggingface + /root/.cache/dynamo), NOT the shared HF_HOME=/lustre weights cache.
+# So here, BEFORE the backend process starts, we synchronously pre-download the model's small
+# (non-weight) files into the container-local HF cache and drop tokenizer.json into that snapshot.
+# Then when the backend builds the MDC it reads tokenizer.json first -> HfTokenizerJson card ->
+# frontend materializes HfTokenizerJson -> no tiktoken model_type check. No shared-cache pollution.
+REPO="moonshotai/Kimi-Linear-48B-A3B-Instruct"
+if [[ -s "$TOKJSON" ]]; then
+    python3 - "$REPO" "$TOKJSON" <<'PYEOF' || echo "[dynamo-tokfix] pre-stage failed (poller fallback remains)"
+import os, sys, shutil
+repo, tokjson = sys.argv[1], sys.argv[2]
+try:
+    from huggingface_hub import snapshot_download
+except Exception as e:
+    print(f"[dynamo-tokfix] huggingface_hub unavailable: {e}", flush=True); sys.exit(0)
+# container-local dynamo cache is where the MDC tokenizer is resolved (per frontend logs)
+caches = ["/root/.cache/huggingface/hub"]
+tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+for cache in caches:
+    try:
+        p = snapshot_download(
+            repo, cache_dir=cache, token=tok,
+            allow_patterns=["config.json", "tokenizer_config.json", "tiktoken.model",
+                            "generation_config.json", "special_tokens_map.json", "*.py"],
+        )
+        dst = os.path.join(p, "tokenizer.json")
+        if not os.path.exists(dst):
+            shutil.copy(tokjson, dst)
+        print(f"[dynamo-tokfix] PRE-STAGED tokenizer.json -> {dst} (before backend MDC build)", flush=True)
+    except Exception as e:
+        print(f"[dynamo-tokfix] pre-stage skip {cache}: {e}", flush=True)
+PYEOF
+fi
+
+# Fallback poller (belt-and-suspenders for late/other cache dirs; the sync pre-stage above is primary).
 (
     for _ in $(seq 1 1800); do       # ~60 min, covers late-appearing cache/snapshot dirs
         while IFS= read -r tk; do
