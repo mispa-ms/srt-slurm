@@ -67,9 +67,13 @@ caches = ["/root/.cache/huggingface/hub"]
 tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 for cache in caches:
     try:
+        # NOTE: deliberately NOT fetching config.json — dynamo blake3-checksums it against the
+        # registered MDC, so any config.json we write (even the identical HF copy, if it differs
+        # from the backend's registered revision) risks a "checksum mismatch" (observed #58792797).
+        # dynamo downloads config.json itself; we only add tokenizer.json into the same snapshot.
         p = snapshot_download(
             repo, cache_dir=cache, token=tok,
-            allow_patterns=["config.json", "tokenizer_config.json", "tiktoken.model",
+            allow_patterns=["tokenizer_config.json", "tiktoken.model",
                             "generation_config.json", "special_tokens_map.json", "*.py"],
         )
         dst = os.path.join(p, "tokenizer.json")
@@ -82,6 +86,11 @@ PYEOF
 fi
 
 # Fallback poller (belt-and-suspenders for late/other cache dirs; the sync pre-stage above is primary).
+# IMPORTANT: tokenizer.json ONLY — do NOT touch config.json. dynamo blake3-checksums config.json
+# against the registered MDC, so any config.json mutation (the old model_type sed spoof) triggers
+# "checksum mismatch for …/config.json" and re-fails registration (observed #58792797). tokenizer.json
+# alone removes the tiktoken model_type check, and adding a file dynamo didn't register doesn't break
+# the config.json checksum.
 (
     for _ in $(seq 1 1800); do       # ~60 min, covers late-appearing cache/snapshot dirs
         while IFS= read -r tk; do
@@ -90,14 +99,10 @@ fi
                 cp "$TOKJSON" "$d/tokenizer.json" 2>/dev/null \
                   && echo "[dynamo-tokfix] injected tokenizer.json -> $d (HfTokenizerJson wins over tiktoken)"
             fi
-            cfg="$d/config.json"      # fallback: spoof model_type (racy, belt-and-suspenders)
-            if [ -f "$cfg" ] && grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
-                sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/g' "$cfg" 2>/dev/null
-            fi
         done < <(find /root/.cache/huggingface /root/.cache/dynamo -name tiktoken.model 2>/dev/null)
         sleep 2
     done
 ) </dev/null 2>&1 &
 disown 2>/dev/null || true
 
-echo "=== dynamo-tokfix poller backgrounded (inject tokenizer.json + config spoof fallback) ==="
+echo "=== dynamo-tokfix poller backgrounded (inject tokenizer.json only; no config.json mutation) ==="
