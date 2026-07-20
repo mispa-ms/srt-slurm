@@ -33,32 +33,35 @@ if [[ -f /configs/patches/vllm-container-deps.sh ]]; then
     bash /configs/patches/vllm-container-deps.sh
 fi
 
-# Robust persistent poller: dynamo creates >1 mdc tokenizer cache dir (each with its own
-# tiktoken.model + config.json); a single early patch missed the 2nd dir and registration
-# re-failed. So: patch the config.json next to EVERY tiktoken.model under the whole dynamo
-# cache root, every 3s for the whole run, and echo to stdout (frontend log) for visibility.
-# The poll-and-sed alone loses a race: dynamo re-writes config.json (kimi_linear) and reads
-# model_type atomically each ~30s retry, faster than a 3s poll. So after patching we chattr +i
-# (immutable) to BLOCK dynamo's re-write; the patched kimi_k2 config then persists and the next
-# retry reads kimi_k2 -> registration succeeds. If the fs (overlay) rejects chattr +i we fall back
-# to fast re-patching. Once a config is immutable+kimi_k2, grep no longer matches -> left alone.
+# PRIMARY fix (no race): inject a valid Kimi tokenizer.json so dynamo's
+# ModelDeploymentCard::from_disk picks TokenizerKind::HfTokenizerJson, which returns BEFORE the
+# tiktoken path -> the kimi_linear model_type check is skipped entirely. The MDC is built by the
+# BACKEND via load_from_disk(<model dir>) (local_model.rs), so we inject into the HF snapshot; we
+# also seed dynamo's mdc cache. dynamo doesn't manage/delete a tokenizer.json we add (unlike
+# config.json which it re-writes), so it persists -> no race. The bundled tokenizer.json is
+# generated from Kimi's tiktoken.model + KIMI_PATTERN and byte-verified 11/11 vs the reference
+# (identical token ids incl. specials). We keep the config model_type spoof as a fallback.
+TOKJSON=/tmp/kimi-linear-tokenizer.json
+if [[ -f /configs/patches/kimi-linear-tokenizer.json.gz ]]; then
+    gunzip -c /configs/patches/kimi-linear-tokenizer.json.gz > "$TOKJSON" 2>/dev/null \
+      && echo "[dynamo-tokfix] staged tokenizer.json ($(wc -c <"$TOKJSON") B)"
+fi
 (
-    for _ in $(seq 1 1800); do       # ~60 min, covers late-appearing cache dirs
+    for _ in $(seq 1 1800); do       # ~60 min, covers late-appearing cache/snapshot dirs
         while IFS= read -r tk; do
-            cfg="$(dirname "$tk")/config.json"
-            if [ -f "$cfg" ] && grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
-                chattr -i "$cfg" 2>/dev/null || true
-                sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/g' "$cfg"
-                if chattr +i "$cfg" 2>/dev/null; then
-                    echo "[dynamo-tokfix] patched + immutable (chattr +i): $cfg (kimi_linear -> kimi_k2)"
-                else
-                    echo "[dynamo-tokfix] patched (chattr +i unsupported, re-patching): $cfg"
-                fi
+            d="$(dirname "$tk")"
+            if [ -f "$TOKJSON" ] && [ ! -f "$d/tokenizer.json" ]; then
+                cp "$TOKJSON" "$d/tokenizer.json" 2>/dev/null \
+                  && echo "[dynamo-tokfix] injected tokenizer.json -> $d (HfTokenizerJson wins over tiktoken)"
             fi
-        done < <(find /root/.cache/dynamo -name tiktoken.model 2>/dev/null)
+            cfg="$d/config.json"      # fallback: spoof model_type (racy, belt-and-suspenders)
+            if [ -f "$cfg" ] && grep -q '"kimi_linear"' "$cfg" 2>/dev/null; then
+                sed -i 's/"model_type"[[:space:]]*:[[:space:]]*"kimi_linear"/"model_type": "kimi_k2"/g' "$cfg" 2>/dev/null
+            fi
+        done < <(find /root/.cache/huggingface /root/.cache/dynamo -name tiktoken.model 2>/dev/null)
         sleep 2
     done
 ) </dev/null 2>&1 &
 disown 2>/dev/null || true
 
-echo "=== dynamo-tokfix poller backgrounded (patches config.json by every tiktoken.model) ==="
+echo "=== dynamo-tokfix poller backgrounded (inject tokenizer.json + config spoof fallback) ==="
