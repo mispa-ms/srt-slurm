@@ -52,6 +52,22 @@ if [ "${APPLY_PR48180:-0}" = "1" ] && [ -f /configs/patches/pr48180-on-latest.pa
     echo "[pr48180] patch applied OK"
 fi
 
+# ---- PR #48180 re-based onto nightly-94c0ef30 (07-14) — gated on APPLY_PR48180_94C0 ----
+# 94c0ef30 already carries almost all of #48180 natively (refined form); the ONLY missing
+# piece is the FlashInferMLAMetadataBuilder __init__ that passes supports_dcp_with_varlen=True
+# (matches the sibling TokenspeedMLA builder). Without it the EAGLE3 drafter (which selects
+# FLASHINFER_MLA) crashes under DCP+spec at `assert max_query_len <= reorder_batch_threshold`.
+# tokenspeed-mla is already bundled in 94c0ef30, so no pip install needed — just git-apply.
+# Use INSTEAD of APPLY_PR48180 (the on-latest patch does NOT apply on 94c0ef30 due to drift).
+if [ "${APPLY_PR48180_94C0:-0}" = "1" ] && [ -f /configs/patches/pr48180-on-94c0ef30.patch ]; then
+    VLLM_SITE=$(python3 -c "import os,vllm; print(os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__))))")
+    echo "[pr48180-94c0] applying FlashInferMLA DCP-builder patch to $VLLM_SITE"
+    ( cd "$VLLM_SITE" && git apply -p1 -v /configs/patches/pr48180-on-94c0ef30.patch ) \
+      || ( cd "$VLLM_SITE" && patch -p1 --forward --batch < /configs/patches/pr48180-on-94c0ef30.patch ) \
+      || { echo "[pr48180-94c0] PATCH FAILED"; exit 1; }
+    echo "[pr48180-94c0] patch applied OK"
+fi
+
 # ---- PR #48248 (FlashInfer fused MNNVL A2A for DCP a2a-reduce, Blackwell auto-select) — gated on APPLY_PR48248 ----
 # Adds vllm/distributed/dcp_alltoall_flashinfer.py + wires it into dcp_alltoall.py / gpu_worker.py. On sm_100+
 # (GB300) the fused LL128 decode_cp_a2a_alltoall replaces NCCL pack->all_to_all->unpack under CUDA graph. Unmerged/open.
