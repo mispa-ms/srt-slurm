@@ -282,12 +282,23 @@ class TestDynamoConfig:
         assert "/configs/dynamo-wheels/abc123-patch-" in cmd
         assert "/configs/dynamo-wheels/abc123/.complete" not in cmd
 
+        # The patched crate's exact version pin is relaxed to "*" across the tree so the
+        # git [patch] (whatever version the branch declares) is accepted, not dropped.
+        assert 'version = "*"' in cmd
+        assert "find . -name Cargo.toml -exec sed -i -E" in cmd
+
         # The [patch.crates-io] block is appended to lib/bindings/python/Cargo.toml
         # (its own workspace root, where maturin builds) — i.e. AFTER the cd, not the
-        # repo-root Cargo.toml (which the bindings build ignores).
+        # repo-root Cargo.toml (which the bindings build ignores). Relaxation runs before
+        # the cd (from the tree root); the patch append after it.
         assert "[patch.crates-io]" in cmd
         assert patch in cmd
-        assert cmd.index("git checkout abc123") < cmd.index("cd lib/bindings/python/") < cmd.index("[patch.crates-io]")
+        assert (
+            cmd.index("git checkout abc123")
+            < cmd.index('version = "*"')
+            < cmd.index("cd lib/bindings/python/")
+            < cmd.index("[patch.crates-io]")
+        )
 
     def test_cargo_patches_require_hash(self):
         """cargo_patches without a source build (hash) is rejected."""
