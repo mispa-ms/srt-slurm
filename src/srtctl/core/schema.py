@@ -1134,10 +1134,14 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
     cache_key = dynamo_hash
     patch_cmd = ""
     if cargo_patches:
-        digest = hashlib.sha1("|".join(cargo_patches).encode()).hexdigest()[:8]
+        # The marker prefix versions the patch build-recipe (injection target etc.) so a
+        # recipe fix busts the cache even when the patch strings are unchanged.
+        digest = hashlib.sha1(("bindings-ws-v1\n" + "\n".join(cargo_patches)).encode()).hexdigest()[:8]
         cache_key = f"{dynamo_hash}-patch-{digest}"
-        # Append [patch.crates-io] to the workspace-root Cargo.toml (we are in the
-        # dynamo/ dir right after checkout, before cd into lib/bindings/python).
+        # Append [patch.crates-io] to lib/bindings/python/Cargo.toml. maturin builds from
+        # there, and that dir is its OWN cargo workspace root (separate from the repo-root
+        # workspace), so [patch] must live in it — a patch in the repo-root Cargo.toml is
+        # silently ignored by the bindings build. Injected after the cd (see below).
         patch_cmd = f"printf '%s' {shlex.quote(_cargo_patch_block(cargo_patches))} >> Cargo.toml && "
     cache = f"{_DYNAMO_CACHE_ROOT}/{cache_key}"
     lock = f"{_DYNAMO_CACHE_ROOT}/.{cache_key}.lock"
@@ -1162,8 +1166,8 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         f"DYN_BUILD_DIR=$(mktemp -d) && cd $DYN_BUILD_DIR && "
         f"git clone https://github.com/ai-dynamo/dynamo.git && "
         f"cd dynamo && git checkout {dynamo_hash} && "
-        f"{patch_cmd}"
         f"cd lib/bindings/python/ && "
+        f"{patch_cmd}"
         f'export RUSTFLAGS="${{RUSTFLAGS:-}} -C target-cpu=native --cfg tokio_unstable" && '
         f"rm -f /tmp/ai_dynamo_runtime*.whl && "
         f"maturin build --release -o /tmp && "
