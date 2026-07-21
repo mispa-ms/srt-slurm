@@ -1108,11 +1108,6 @@ def build_otel_env(observability: ObservabilityConfig, component: str) -> dict[s
 _DYNAMO_CACHE_ROOT = "/configs/dynamo-wheels"
 
 
-def _cargo_patch_block(cargo_patches: list[str]) -> str:
-    """Render ``cargo_patches`` as a ``[patch.crates-io]`` TOML block (with leading newline)."""
-    return "\n".join(["", "[patch.crates-io]", *cargo_patches, ""])
-
-
 def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
     """Bash for hash-pinned source install with a /configs/dynamo-wheels cache.
 
@@ -1122,43 +1117,40 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
     on a successful build. flock on the per-key lock file serializes the
     cold-cache build across multiple frontends starting in parallel.
 
-    ``cargo_patches`` (optional) are ``[patch.crates-io]`` entries appended to
-    the dynamo workspace ``Cargo.toml`` before ``maturin build`` — used to build
-    a crate (e.g. ``dynamo-tokenizers``) from an unmerged branch. When set, the
-    cache key is suffixed with a digest of the patches so patched and unpatched
-    builds of the same hash never collide.
+    ``cargo_patches`` (optional) are dependency-declaration overrides — each a full
+    ``<crate> = <spec>`` line that replaces that crate's declaration across every
+    ``Cargo.toml`` in the tree before ``maturin build`` (typically retargeting a crate
+    like ``dynamo-tokenizers`` at a git branch). When set, the cache key is suffixed with
+    a digest of the overrides so patched and unpatched builds of the same hash never collide.
 
     Uses FD 201 (not 200) so it nests cleanly inside the node-local
     ``flock -x 200`` from ``_serialize_node_install``.
     """
     cache_key = dynamo_hash
-    patch_cmd = ""
-    relax_cmd = ""
+    override_cmd = ""
     if cargo_patches:
-        # The marker prefix versions the patch build-recipe (injection target, pin
-        # relaxation, etc.) so a recipe fix busts the cache even when the patch strings
-        # are unchanged.
-        digest = hashlib.sha1(("relax-pin-v2\n" + "\n".join(cargo_patches)).encode()).hexdigest()[:8]
+        # The marker prefix versions the override build-recipe so a recipe fix busts the
+        # cache even when the override strings are unchanged.
+        digest = hashlib.sha1(("dep-override-v3\n" + "\n".join(cargo_patches)).encode()).hexdigest()[:8]
         cache_key = f"{dynamo_hash}-patch-{digest}"
-        # Relax each patched crate's exact version pin to "*" across the whole dynamo tree.
-        # A [patch.crates-io] git source is only USED if its version satisfies the graph's
-        # requirement; dynamo pins e.g. `dynamo-tokenizers = { version = "=1.5.0" }` while the
-        # branch may be 1.5.3, so the patch would be silently dropped ("patch ... was not used
-        # in the crate graph"). Relaxing the pin to "*" lets the branch version be accepted.
+        # Replace each crate's dependency DECLARATION (a full `<crate> = <spec>` line) across
+        # every Cargo.toml in the tree — retargeting the workspace dependency (and any direct
+        # decls, incl. `{ workspace = true }` members) at, typically, a git branch.
+        # Why source-replacement and not [patch.crates-io]: a patch is silently dropped when
+        # the branch version doesn't satisfy dynamo's exact pin (e.g. dynamo pins "=1.5.0" but
+        # the branch is 1.5.3 -> "patch ... was not used in the crate graph"), and relaxing the
+        # pin alone loses to the committed Cargo.lock. Changing the dependency SOURCE needs no
+        # version match and forces Cargo to re-resolve, so the branch is actually built.
         seds = []
         for entry in cargo_patches:
             crate = entry.split("=", 1)[0].strip()
             if not crate:
                 continue
-            script = f'/^{crate}[[:space:]]*=/ s/version[[:space:]]*=[[:space:]]*"[^"]*"/version = "*"/'
+            repl = entry.replace("&", r"\&")  # '&' is the sed replacement metachar
+            script = f"s|^{crate}[[:space:]]*=.*|{repl}|"
             seds.append(f"find . -name Cargo.toml -exec sed -i -E {shlex.quote(script)} {{}} +")
         if seds:
-            relax_cmd = " && ".join(seds) + " && "
-        # Append [patch.crates-io] to lib/bindings/python/Cargo.toml. maturin builds from
-        # there, and that dir is its OWN cargo workspace root (separate from the repo-root
-        # workspace), so [patch] must live in it — a patch in the repo-root Cargo.toml is
-        # silently ignored by the bindings build. Injected after the cd (see below).
-        patch_cmd = f"printf '%s' {shlex.quote(_cargo_patch_block(cargo_patches))} >> Cargo.toml && "
+            override_cmd = " && ".join(seds) + " && "
     cache = f"{_DYNAMO_CACHE_ROOT}/{cache_key}"
     lock = f"{_DYNAMO_CACHE_ROOT}/.{cache_key}.lock"
     return (
@@ -1182,9 +1174,8 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         f"DYN_BUILD_DIR=$(mktemp -d) && cd $DYN_BUILD_DIR && "
         f"git clone https://github.com/ai-dynamo/dynamo.git && "
         f"cd dynamo && git checkout {dynamo_hash} && "
-        f"{relax_cmd}"
+        f"{override_cmd}"
         f"cd lib/bindings/python/ && "
-        f"{patch_cmd}"
         f'export RUSTFLAGS="${{RUSTFLAGS:-}} -C target-cpu=native --cfg tokio_unstable" && '
         f"rm -f /tmp/ai_dynamo_runtime*.whl && "
         f"maturin build --release -o /tmp && "
@@ -1329,10 +1320,11 @@ class DynamoConfig:
     top_of_tree: bool = False
     wheel: str | None = None
     request_plane: str = "tcp"
-    # Optional [patch.crates-io] entries injected into the dynamo Cargo.toml before a
-    # source build (requires `hash`). Each entry is a full TOML line, e.g.
+    # Optional dependency-declaration overrides applied to the dynamo Cargo.toml tree before a
+    # source build (requires `hash`). Each entry is a full `<crate> = <spec>` TOML line, e.g.
     #   'dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates", branch = "..." }'
-    # Used to build a crate from an unmerged branch without waiting for a crates.io release.
+    # The crate's existing declaration is replaced tree-wide, letting a source build pull a crate
+    # from an unmerged branch without waiting for a crates.io release.
     cargo_patches: list[str] | None = None
 
     def __post_init__(self) -> None:
