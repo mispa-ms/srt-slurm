@@ -12,6 +12,7 @@ Backend configs are defined in srtctl.backends.configs/ for modularity.
 """
 
 import builtins
+import hashlib
 import itertools
 import logging
 import os
@@ -1107,20 +1108,39 @@ def build_otel_env(observability: ObservabilityConfig, component: str) -> dict[s
 _DYNAMO_CACHE_ROOT = "/configs/dynamo-wheels"
 
 
-def _hash_cached_source_install(dynamo_hash: str) -> str:
+def _cargo_patch_block(cargo_patches: list[str]) -> str:
+    """Render ``cargo_patches`` as a ``[patch.crates-io]`` TOML block (with leading newline)."""
+    return "\n".join(["", "[patch.crates-io]", *cargo_patches, ""])
+
+
+def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
     """Bash for hash-pinned source install with a /configs/dynamo-wheels cache.
 
-    Cache layout: ``{root}/<hash>/`` contains the maturin wheel
+    Cache layout: ``{root}/<key>/`` contains the maturin wheel
     (``ai_dynamo_runtime-*.whl``), a tarball of the dynamo source tree
     (``dynamo-src.tar.gz``), and a ``.complete`` sentinel that's only touched
-    on a successful build. flock on the per-hash lock file serializes the
+    on a successful build. flock on the per-key lock file serializes the
     cold-cache build across multiple frontends starting in parallel.
+
+    ``cargo_patches`` (optional) are ``[patch.crates-io]`` entries appended to
+    the dynamo workspace ``Cargo.toml`` before ``maturin build`` — used to build
+    a crate (e.g. ``dynamo-tokenizers``) from an unmerged branch. When set, the
+    cache key is suffixed with a digest of the patches so patched and unpatched
+    builds of the same hash never collide.
 
     Uses FD 201 (not 200) so it nests cleanly inside the node-local
     ``flock -x 200`` from ``_serialize_node_install``.
     """
-    cache = f"{_DYNAMO_CACHE_ROOT}/{dynamo_hash}"
-    lock = f"{_DYNAMO_CACHE_ROOT}/.{dynamo_hash}.lock"
+    cache_key = dynamo_hash
+    patch_cmd = ""
+    if cargo_patches:
+        digest = hashlib.sha1("|".join(cargo_patches).encode()).hexdigest()[:8]
+        cache_key = f"{dynamo_hash}-patch-{digest}"
+        # Append [patch.crates-io] to the workspace-root Cargo.toml (we are in the
+        # dynamo/ dir right after checkout, before cd into lib/bindings/python).
+        patch_cmd = f"printf '%s' {shlex.quote(_cargo_patch_block(cargo_patches))} >> Cargo.toml && "
+    cache = f"{_DYNAMO_CACHE_ROOT}/{cache_key}"
+    lock = f"{_DYNAMO_CACHE_ROOT}/.{cache_key}.lock"
     return (
         f"echo 'Installing dynamo from source ({dynamo_hash}, /configs cache)...' && "
         f"mkdir -p {_DYNAMO_CACHE_ROOT} && "
@@ -1142,6 +1162,7 @@ def _hash_cached_source_install(dynamo_hash: str) -> str:
         f"DYN_BUILD_DIR=$(mktemp -d) && cd $DYN_BUILD_DIR && "
         f"git clone https://github.com/ai-dynamo/dynamo.git && "
         f"cd dynamo && git checkout {dynamo_hash} && "
+        f"{patch_cmd}"
         f"cd lib/bindings/python/ && "
         f'export RUSTFLAGS="${{RUSTFLAGS:-}} -C target-cpu=native --cfg tokio_unstable" && '
         f"rm -f /tmp/ai_dynamo_runtime*.whl && "
@@ -1287,6 +1308,11 @@ class DynamoConfig:
     top_of_tree: bool = False
     wheel: str | None = None
     request_plane: str = "tcp"
+    # Optional [patch.crates-io] entries injected into the dynamo Cargo.toml before a
+    # source build (requires `hash`). Each entry is a full TOML line, e.g.
+    #   'dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates", branch = "..." }'
+    # Used to build a crate from an unmerged branch without waiting for a crates.io release.
+    cargo_patches: list[str] | None = None
 
     def __post_init__(self) -> None:
         install_sources = [
@@ -1309,6 +1335,9 @@ class DynamoConfig:
                 raise ValueError("dynamo.wheel must be a non-empty package version")
             if Path(self.wheel).name.endswith(".whl") or "/" in self.wheel:
                 raise ValueError("dynamo.wheel must be a package version like '1.2.0.dev20260426', not a filename")
+
+        if self.cargo_patches and self.hash is None:
+            raise ValueError("dynamo.cargo_patches requires a source build — set dynamo.hash to a commit")
 
         if self.request_plane not in self._VALID_REQUEST_PLANES:
             raise ValueError(
@@ -1387,7 +1416,7 @@ class DynamoConfig:
         # to ~10 sec lustre access for repeat hashes. top_of_tree skips the
         # cache (no stable key) and always live-builds.
         if self.hash is not None:
-            return _hash_cached_source_install(self.hash)
+            return _hash_cached_source_install(self.hash, self.cargo_patches)
 
         return _live_source_install_for_top_of_tree()
 

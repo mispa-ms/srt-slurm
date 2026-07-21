@@ -263,6 +263,38 @@ class TestDynamoConfig:
         assert "tar -xzf /configs/dynamo-wheels/abc123/dynamo-src.tar.gz" in cmd
         assert "pip install --break-system-packages -e /tmp/dynamo-src/dynamo" in cmd
 
+    def test_hash_with_cargo_patches(self):
+        """cargo_patches inject a [patch.crates-io] block and namespace the cache.
+
+        Used to build a crate (e.g. dynamo-tokenizers) from an unmerged branch:
+        the patch is appended to the workspace Cargo.toml after checkout and
+        before maturin build, and the cache key is suffixed with a digest so a
+        patched build never reuses/poisons the plain build of the same hash.
+        """
+        from srtctl.core.schema import DynamoConfig
+
+        patch = 'dynamo-tokenizers = { git = "https://github.com/ai-dynamo/frontend-crates", branch = "feat" }'
+        config = DynamoConfig(hash="abc123", cargo_patches=[patch])
+        assert config.needs_source_install
+        cmd = config.get_install_commands()
+
+        # Cache is namespaced so patched != plain build of the same hash.
+        assert "/configs/dynamo-wheels/abc123-patch-" in cmd
+        assert "/configs/dynamo-wheels/abc123/.complete" not in cmd
+
+        # The [patch.crates-io] block is appended to Cargo.toml after checkout,
+        # before cd into the maturin crate.
+        assert "[patch.crates-io]" in cmd
+        assert patch in cmd
+        assert cmd.index("git checkout abc123") < cmd.index("[patch.crates-io]") < cmd.index("cd lib/bindings/python/")
+
+    def test_cargo_patches_require_hash(self):
+        """cargo_patches without a source build (hash) is rejected."""
+        from srtctl.core.schema import DynamoConfig
+
+        with pytest.raises(ValueError, match="cargo_patches requires a source build"):
+            DynamoConfig(wheel="1.2.0.dev20260426", cargo_patches=["x = 1"])
+
     def test_top_of_tree_install_command(self):
         """Top-of-tree config generates source install without checkout."""
         from srtctl.core.schema import DynamoConfig
