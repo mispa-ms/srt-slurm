@@ -68,6 +68,16 @@ if [ "${APPLY_PR48180_94C0:-0}" = "1" ] && [ -f /configs/patches/pr48180-on-94c0
     echo "[pr48180-94c0] patch applied OK"
 fi
 
+# ---- DCP spec-decode wrong-mask fix — gated on APPLY_DCP_SPEC_PREFILL ----
+# Flips MLA builders' supports_dcp_with_varlen True->False so eagle spec queries
+# (q_len>1) route to the DCP-aware PREFILL path instead of the decode kernel whose
+# end-aligned mask is wrong for q_len>1 over DCP-interleaved KV (the target's spec
+# verification then rejects ~everything -> real AL~1.0). Runs AFTER pr48180-94c0
+# (which set flashinfer_mla True). Diagnostic for the dcp4 eagle AL~1.0 issue.
+if [ "${APPLY_DCP_SPEC_PREFILL:-0}" = "1" ] && [ -f /configs/patches/vllm_dcp_spec_prefill_route.py ]; then
+    python3 /configs/patches/vllm_dcp_spec_prefill_route.py
+fi
+
 # ---- PR #48248 (FlashInfer fused MNNVL A2A for DCP a2a-reduce, Blackwell auto-select) — gated on APPLY_PR48248 ----
 # Adds vllm/distributed/dcp_alltoall_flashinfer.py + wires it into dcp_alltoall.py / gpu_worker.py. On sm_100+
 # (GB300) the fused LL128 decode_cp_a2a_alltoall replaces NCCL pack->all_to_all->unpack under CUDA graph. Unmerged/open.
