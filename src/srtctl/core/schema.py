@@ -1638,8 +1638,6 @@ class SrtConfig:
             raise ValidationError("frontend.type: vllm supports aggregate jobs only, not disaggregated layouts")
         if self.resources.num_agg != 1:
             raise ValidationError("frontend.type: vllm requires resources.agg_workers: 1")
-        if (self.resources.agg_nodes or 1) != 1:
-            raise ValidationError("frontend.type: vllm currently supports single-node aggregate jobs only")
         if self.frontend.orchestrator_placement != "head":
             raise ValidationError("frontend.type: vllm requires frontend.orchestrator_placement: head")
         if self.frontend.args:

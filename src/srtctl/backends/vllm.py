@@ -506,12 +506,23 @@ class VLLMProtocol:
         from srtctl.core.topology import NodePortAllocator, Process, endpoints_to_processes
 
         if frontend_type == "vllm":
+            # Direct `vllm serve` spans nodes with --nnodes/--node-rank, so the TP
+            # one-process-per-node layout is what we want. Data-parallel layouts need
+            # a router in front and are not supported here.
+            if any(self._is_dp_mode(ep.mode) for ep in endpoints):
+                raise ValueError(
+                    "frontend.type: vllm does not support data-parallel layouts; use tensor/expert parallel"
+                )
             processes = endpoints_to_processes(
                 endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator
             )
-            if len(processes) != 1 or processes[0].endpoint_mode != "agg":
-                raise ValueError("frontend.type: vllm requires exactly one aggregate server process")
-            return [replace(processes[0], http_port=FRONTEND_PUBLIC_PORT)]
+            if not processes or any(p.endpoint_mode != "agg" for p in processes):
+                raise ValueError("frontend.type: vllm requires aggregate server processes only")
+            # Rank 0 binds the public OpenAI port; the remaining ranks run headless.
+            return [
+                replace(p, http_port=FRONTEND_PUBLIC_PORT if node_rank == 0 else 0)
+                for node_rank, p in enumerate(processes)
+            ]
 
         # Check if any endpoint uses DP mode
         has_dp_mode = any(self._is_dp_mode(ep.mode) for ep in endpoints)
@@ -723,8 +734,6 @@ class VLLMProtocol:
         if frontend_type == "vllm":
             if mode != "agg":
                 raise ValueError("frontend.type: vllm supports aggregate vLLM jobs only")
-            if is_multi_node:
-                raise ValueError("frontend.type: vllm currently supports single-node aggregate jobs only")
 
             config.pop("host", None)
             config.pop("port", None)
@@ -746,7 +755,28 @@ class VLLMProtocol:
                 device_ids = ",".join(str(i) for i in sorted(process.gpu_indices))
                 if device_ids:
                     cmd.extend(["--device-ids", device_ids])
+            if is_multi_node:
+                # `vllm serve` spans nodes itself: rank 0 serves the OpenAI API and the
+                # other ranks join headless. No router process is involved.
+                node_rank = endpoint_nodes.index(process.node)
+                cmd.extend(
+                    [
+                        "--master-addr",
+                        leader_ip,
+                        "--nnodes",
+                        str(len(endpoint_nodes)),
+                        "--node-rank",
+                        str(node_rank),
+                    ]
+                )
+                if node_rank > 0:
+                    cmd.append("--headless")
             cmd.extend(_config_to_cli_args(config))
+            if is_multi_node:
+                # Same reason as the dynamo multi-node path below: an inherited
+                # VLLM_PORT seeds vLLM's cross-node message-queue allocator, so every
+                # local TP worker starts from the same base and they race on bind.
+                cmd = ["env", "-u", "VLLM_PORT"] + cmd
             return cmd
 
         # Base command - use dynamo.vllm module
