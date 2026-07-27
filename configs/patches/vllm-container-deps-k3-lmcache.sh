@@ -27,10 +27,13 @@ LMCACHE_VERSION="${LMCACHE_VERSION:-0.5.1}"
 # Must match lmcache.mp.port in the vLLM --kv-transfer-config.
 LMCACHE_PORT="${LMCACHE_PORT:-5555}"
 LMCACHE_HTTP_PORT="${LMCACHE_HTTP_PORT:-8080}"
-# Recipe guidance: size the pool to ~75% of the host DRAM you can dedicate. bia
-# nodes are 2014 GiB and our verified ceiling for a pinned pool there is ~1500 GiB
-# (2500 GiB OOM'd), so 75% of 1500 = 1125. The pool grows lazily from l1-init-size-gb.
-LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-1125}"
+# Sized to match the SimpleCPUOffloadConnector leg (187 GiB/rank x 8 = 1496 GiB) so the
+# A/B isolates pool structure -- node-shared pool vs per-rank segments -- rather than
+# capacity. The recipe's 512 is an example; its actual guidance is "~75% of the host DRAM
+# you can dedicate", and on bia that is 2014 GiB total with a verified ~1500 GiB ceiling
+# for a pinned pool (2500 GiB OOM'd). The pool grows lazily from l1-init-size-gb.
+# Override per-experiment with LMCACHE_L1_SIZE_GB in the config's aggregated_environment.
+LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-1496}"
 LMCACHE_L1_INIT_SIZE_GB="${LMCACHE_L1_INIT_SIZE_GB:-20}"
 LMCACHE_READY_TIMEOUT="${LMCACHE_READY_TIMEOUT:-600}"
 
