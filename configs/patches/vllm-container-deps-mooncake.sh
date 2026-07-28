@@ -171,6 +171,16 @@ MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-$(_free_port)}"     # coro_rpc ser
 MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-$(_free_port)}"   # mandatory cinatra admin/metrics server
 echo "[mooncake] selected rpc=${MOONCAKE_MASTER_PORT} metrics=${MOONCAKE_METRICS_PORT}"
 
+# srt-slurm's native `mooncake_kv_store` block launches the master on the infra node
+# and writes its own store config into the log dir. In that mode this script must only
+# install the wheel and leave both alone, or the two masters race for ports and the
+# worker reads the wrong config. Set MOONCAKE_SKIP_MASTER=1 to stop here.
+if [ "${MOONCAKE_SKIP_MASTER:-0}" = "1" ]; then
+    echo "[mooncake] MOONCAKE_SKIP_MASTER=1: wheel installed; master and config"
+    echo "[mooncake] left to srt-slurm's mooncake_kv_store block"
+    exit 0
+fi
+
 cat > "$MOONCAKE_CONFIG_PATH" <<EOF
 {
   "mode": "embedded",
