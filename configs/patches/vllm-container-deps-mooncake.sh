@@ -122,6 +122,12 @@ TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-1500}"
 TP="${MOONCAKE_TP:-8}"
 PER_RANK_GB=$(( TOTAL_CPU_DRAM_GB / TP ))
 MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-/tmp/mooncake_config.json}"
+# Into /logs when the run has one: only that directory is harvested with the job, and
+# the master's periodic store stats (fill/keys/evictions) are the only record of what
+# the host-DRAM pool actually did. Earlier runs wrote to /tmp and lost them.
+if [[ -z "${MOONCAKE_MASTER_LOG:-}" && -d /logs ]]; then
+    MOONCAKE_MASTER_LOG=/logs/mooncake_master.log
+fi
 MOONCAKE_MASTER_LOG="${MOONCAKE_MASTER_LOG:-/tmp/mooncake_master.log}"
 
 # ---- Port selection (ROOT CAUSE of prior failures) ----------------------------
