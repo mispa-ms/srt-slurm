@@ -367,8 +367,12 @@ class BenchmarkStageMixin:
         if agg_endpoints:
             env["PROFILE_AGG_ENDPOINTS"] = ",".join(agg_endpoints)
 
-        # Set profile output directory and common env vars for benchmarks that support profiling
-        if runner.name in ("SA-Bench", "SGLang-Bench", "Trace-Replay-Bench"):
+        # Set profile output directory and common env vars for benchmarks that support profiling.
+        # AgentX is here because iteration-based nsys needs a POST to /start_profile: vLLM's
+        # CudaProfilerWrapper only *arms* on that call and starts counting delay_iterations from
+        # there, so without it cudaProfilerStart() never fires and nsys writes no trace at all
+        # (the sweep still passes -- only the profile is missing).
+        if runner.name in ("SA-Bench", "SGLang-Bench", "Trace-Replay-Bench", "AgentX"):
             env["PROFILE_OUTPUT_DIR"] = profiles_dir_in_container
             env["BENCH_MODEL_NAME"] = self.config.served_model_name
             env["HEAD_NODE"] = self.runtime.nodes.head

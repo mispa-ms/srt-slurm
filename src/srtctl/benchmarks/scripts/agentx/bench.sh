@@ -129,6 +129,28 @@ echo "=============================================="
 
 ensure_aiperf
 
+# Profiling shared helpers. Needed for iteration-based nsys (profiling.type: nsys):
+# vLLM's CudaProfilerWrapper only *arms* on POST /start_profile and counts
+# delay_iterations from there, so without this call cudaProfilerStart() never fires
+# and nsys produces no trace -- while the benchmark itself passes, so the failure is
+# silent. Time-based capture (profiling.type: nsys-time) does not go through here;
+# nsys drives that window itself with --delay/--duration.
+#
+# Fired before aiperf starts, unlike sa-bench where the equivalent call landing ahead
+# of its warmup loop put the capture in warmup (VLLM_NSYS_CAPTURE_NOTES Gotcha 15).
+# That is correct here: the engine only ticks a step when it has work, and AgentX's
+# own warmup traffic already counts -- on run 707425 the client logged
+# "Phase warmup started" at 20:50:47 and the engine logged Iteration(0) at 20:50:48.
+# So delay_iterations lines up with the Iteration(N) numbering in the worker log,
+# which is where the step range gets chosen in the first place.
+PROFILING_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/profiling.sh
+source "${PROFILING_SCRIPT_DIR}/../lib/profiling.sh"
+profiling_init_from_env
+profiling_cleanup() { stop_all_profiling; }
+trap profiling_cleanup EXIT
+start_all_profiling
+
 cmd=(
     aiperf profile
     --scenario inferencex-agentx-mvp
