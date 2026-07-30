@@ -1,0 +1,42 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -2289,11 +2289,32 @@ class NixlBaseConnectorWorker:
+                     and num_local_blocks < num_remote_blocks
+                 ):
+                     # NOTE (NickLucche): With prefix caching on SSM, (remote) blocks
+-                    # prior to the last one are placeholders (null blocks). Mind that
+-                    # this doesn't really impact transfer, as we only still care about
+-                    # the last "block", the full in-place state.
+-                    assert num_local_blocks == 1, "SSM can only have one local block"
+-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
++                    # before the state-slot suffix are placeholders (null blocks).
++                    # Speculative decoding reserves one committed/running state slot
++                    # followed by one scratch state slot per speculative token.
++                    #
++                    # This experiment requires matching speculative-token counts on
++                    # prefill and decode, so both suffixes have the same layout. Only
++                    # the committed state is needed by decode; the speculative scratch
++                    # slots are overwritten locally.
++                    group_spec = self.kv_cache_config.kv_cache_groups[
++                        i
++                    ].kv_cache_spec
++                    assert isinstance(group_spec, MambaSpec)
++                    num_state_slots = 1 + group_spec.num_speculative_blocks
++                    assert num_local_blocks == num_state_slots, (
++                        f"SSM expected {num_state_slots} local state slots "
++                        f"(1 committed + {group_spec.num_speculative_blocks} "
++                        f"speculative), got {num_local_blocks}"
++                    )
++                    assert num_remote_blocks >= num_state_slots, (
++                        f"SSM expected at least {num_state_slots} remote state "
++                        f"slots, got {num_remote_blocks}"
++                    )
++                    local_block_ids[i] = [
++                        local_block_ids[i][-num_state_slots]
++                    ]
++                    remote_block_ids[i] = [remote_group[-num_state_slots]]
+                 elif (
+                     self._physical_blocks_per_logical_kv_block
+                     == remote_physical_per_logical
+
