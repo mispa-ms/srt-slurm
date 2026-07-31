@@ -151,6 +151,16 @@ profiling_cleanup() { stop_all_profiling; }
 trap profiling_cleanup EXIT
 start_all_profiling
 
+# OSL source. Default on: aiperf takes ISL/OSL from the server's usage block, which
+# skips per-record tokenization. Set AGENTX_USE_SERVER_TOKEN_COUNT=0 to have aiperf
+# tokenize the text it actually received instead -- that is what makes
+# osl_mismatch_diff_pct a real comparison rather than a tautological 0.00, so it is
+# the switch to flip when auditing whether reported tokens match delivered text.
+SERVER_TOKEN_COUNT_ARGS=()
+if [[ "${AGENTX_USE_SERVER_TOKEN_COUNT:-1}" == "1" ]]; then
+    SERVER_TOKEN_COUNT_ARGS+=(--use-server-token-count)
+fi
+
 cmd=(
     aiperf profile
     --scenario inferencex-agentx-mvp
@@ -165,7 +175,7 @@ cmd=(
     --benchmark-duration "${DURATION}"
     --random-seed "${AIPERF_RANDOM_SEED:-42}"
     --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}"
-    --use-server-token-count
+    "${SERVER_TOKEN_COUNT_ARGS[@]}"
     --slice-duration 1.0
     --output-artifact-dir "${ARTIFACT_DIR}"
     --public-dataset "${PUBLIC_DATASET}"
