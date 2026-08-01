@@ -31,10 +31,19 @@
 #     ENGINEPROBE req=<id> steps=N tokens=N tok_per_step=...
 # and a rollup every 30 s:
 #     ENGINEPROBE_TOTAL engine_steps=N reqs_done=N steps_per_req=... tok_per_step=...
+#                       warmup_reqs=N real_reqs=N real_steps_per_req=...
 #
-# It also dumps the raw token ids of the first ENGINEPROBE_DUMP_REQS requests
-# (default 5), one line per step:
+# The warmup/real split matters: the replay's cache-warmup phase sends one-token
+# requests, 301 of 331 on one 900 s run, so an undivided steps_per_req average is
+# meaningless (57.2 mixed, 474 for real requests).
+#
+# It also dumps the raw token ids of ENGINEPROBE_DUMP_REQS requests (default 5),
+# one line per step:
 #     ENGINEPROBE_IDS req=<id> step=N ids=[...]
+# Only requests that reach ENGINEPROBE_DUMP_MIN_STEPS (default 4) are dumped, and
+# a slot is released when its request finishes. Without both, the slots fill with
+# the one-token cache-warmup requests the AgentX replay sends -- 301 of 331 on
+# the first attempt -- and no real request is ever dumped.
 # Decoding those offline reproduces exactly what the Rust decoder does with them
 # (incremental.rs push_token returns 0 bytes when the decoded string does not
 # grow or ends in U+FFFD), which is what decides whether a step sends an SSE
@@ -76,11 +85,18 @@ class _EngineProbe:
         self.per_req = {}
         self.dump_reqs = int(_ep_os.environ.get("ENGINEPROBE_DUMP_REQS", "5"))
         self.dump_steps = int(_ep_os.environ.get("ENGINEPROBE_DUMP_STEPS", "400"))
+        # Below this many steps a request is cache warmup (one-token outputs),
+        # not something worth dumping.
+        self.dump_min_steps = int(_ep_os.environ.get("ENGINEPROBE_DUMP_MIN_STEPS", "4"))
         self.dumping = {}
+        self.dumped = 0
         self.engine_steps = 0
         self.reqs_done = 0
         self.done_steps = 0
         self.done_tokens = 0
+        self.warmup_reqs = 0
+        self.real_reqs = 0
+        self.real_steps = 0
         self.last = _ep_time.time()
 
     def observe(self, outputs):
@@ -94,22 +110,37 @@ class _EngineProbe:
                     if n:
                         slot[0] += 1
                         slot[1] += n
-                        # Raw ids for the first few requests, decoded offline.
+                        # Raw ids, decoded offline. Warmup requests stop after one
+                        # step, so only take a slot once a request has proved it is
+                        # a real one, and give the slot back when it finishes.
                         if out.request_id in self.dumping:
-                            step_no = self.dumping[out.request_id] + 1
-                            if step_no <= self.dump_steps:
-                                self.dumping[out.request_id] = step_no
+                            if slot[0] <= self.dump_steps:
                                 lines.append(
                                     f"ENGINEPROBE_IDS req={out.request_id} "
-                                    f"step={step_no} ids={list(out.new_token_ids)}"
+                                    f"step={slot[0]} ids={list(out.new_token_ids)}"
                                 )
-                        elif len(self.dumping) < self.dump_reqs:
-                            self.dumping[out.request_id] = 0
+                        elif (
+                            slot[0] == self.dump_min_steps
+                            and len(self.dumping) < self.dump_reqs
+                            and self.dumped < self.dump_reqs
+                        ):
+                            self.dumping[out.request_id] = True
+                            self.dumped += 1
+                            lines.append(
+                                f"ENGINEPROBE_IDS req={out.request_id} "
+                                f"step={slot[0]} ids={list(out.new_token_ids)} (dump start)"
+                            )
                     if getattr(out, "finish_reason", None) is not None:
+                        self.dumping.pop(out.request_id, None)
                         steps, tokens = self.per_req.pop(out.request_id, (0, 0))
                         self.reqs_done += 1
                         self.done_steps += steps
                         self.done_tokens += tokens
+                        if steps <= 1:
+                            self.warmup_reqs += 1
+                        else:
+                            self.real_reqs += 1
+                            self.real_steps += steps
                         lines.append(
                             f"ENGINEPROBE req={out.request_id} steps={steps} "
                             f"tokens={tokens} "
@@ -123,6 +154,8 @@ class _EngineProbe:
                     f"reqs_done={self.reqs_done} "
                     f"steps_per_req={(self.done_steps / self.reqs_done) if self.reqs_done else 0:.1f} "
                     f"tok_per_step={(self.done_tokens / self.done_steps) if self.done_steps else 0:.2f} "
+                    f"warmup_reqs={self.warmup_reqs} real_reqs={self.real_reqs} "
+                    f"real_steps_per_req={(self.real_steps / self.real_reqs) if self.real_reqs else 0:.1f} "
                     f"in_flight={len(self.per_req)}"
                 )
         for line in lines:
