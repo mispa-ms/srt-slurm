@@ -197,4 +197,72 @@ print("ENGINEPROBE armed on EngineCore.step", flush=True)
 PROBE
 
 python3 -c 'import vllm.v1.engine.core'
+
+# ---- second hook: the Python detokenizer -----------------------------------
+# Only reached on the Python frontend. Under VLLM_USE_RUST_FRONTEND=1 the class
+# is never called and this is a no-op, so the patch is applied unconditionally
+# and the absence of DETOKPROBE lines is itself the signal.
+#
+# push_token's Rust twin returns 0 bytes when the decoded string does not grow;
+# this is the Python equivalent, and it separates "the step produced no text"
+# from "the step produced text that was not sent".
+DETOK="$(python3 -c 'import vllm.v1.engine.detokenizer as m; print(m.__file__)')"
+if grep -q "class BaseIncrementalDetokenizer" "$DETOK" && ! grep -q "DETOKPROBE" "$DETOK"; then
+cat >> "$DETOK" <<'DPROBE'
+
+
+# --- DETOKPROBE (diagnostic; appended by vllm-container-deps-k3-stepprobe.sh) ---
+import threading as _dp_threading
+import time as _dp_time
+
+
+class _DetokProbe:
+    def __init__(self):
+        self.lock = _dp_threading.Lock()
+        self.calls = self.tokens = self.chars = self.silent = 0
+        self.last = _dp_time.time()
+
+    def record(self, n_tokens, n_chars):
+        with self.lock:
+            self.calls += 1
+            self.tokens += n_tokens
+            self.chars += n_chars
+            if n_chars == 0:
+                self.silent += 1
+            due = (_dp_time.time() - self.last) >= 30.0
+            if due:
+                self.last = _dp_time.time()
+                line = (
+                    f"DETOKPROBE calls={self.calls} tokens={self.tokens} chars={self.chars} "
+                    f"silent_calls={self.silent} ({100.0 * self.silent / self.calls:.1f}%) "
+                    f"chars_per_token={(self.chars / self.tokens) if self.tokens else 0:.2f}"
+                )
+        if due:
+            print(line, flush=True)
+
+
+_DETOK_PROBE = _DetokProbe()
+_dp_orig_update = BaseIncrementalDetokenizer.update
+
+
+def _dp_update(self, new_token_ids, stop_terminated):
+    before = len(self.output_text)
+    result = _dp_orig_update(self, new_token_ids, stop_terminated)
+    try:
+        _DETOK_PROBE.record(len(new_token_ids), len(self.output_text) - before)
+    except Exception:
+        pass
+    return result
+
+
+BaseIncrementalDetokenizer.update = _dp_update
+print("DETOKPROBE armed on BaseIncrementalDetokenizer.update", flush=True)
+# --- end DETOKPROBE ---
+DPROBE
+    python3 -c 'import vllm.v1.engine.detokenizer'
+    echo "[stepprobe] DETOKPROBE applied to $DETOK"
+else
+    echo "[stepprobe] DETOKPROBE skipped (anchor missing or already applied)"
+fi
+
 echo "=== k3-stepprobe: done ==="
