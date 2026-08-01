@@ -32,6 +32,16 @@
 # and a rollup every 30 s:
 #     ENGINEPROBE_TOTAL engine_steps=N reqs_done=N steps_per_req=... tok_per_step=...
 #
+# It also dumps the raw token ids of the first ENGINEPROBE_DUMP_REQS requests
+# (default 5), one line per step:
+#     ENGINEPROBE_IDS req=<id> step=N ids=[...]
+# Decoding those offline reproduces exactly what the Rust decoder does with them
+# (incremental.rs push_token returns 0 bytes when the decoded string does not
+# grow or ends in U+FFFD), which is what decides whether a step sends an SSE
+# chunk at all. Doing it offline avoids loading a tokenizer in the engine process
+# and needs no Rust rebuild -- the image's vLLM commit is not published upstream,
+# so its Rust sources cannot be obtained.
+#
 # Read-only: outputs are returned untouched.
 # =============================================================================
 set -euo pipefail
@@ -55,6 +65,7 @@ cat >> "$TARGET" <<'PROBE'
 # count stops being inferred from OSL / acceptance_length. A step emits at most
 # one SSE chunk, so steps-per-request against the client's arrival count shows
 # directly whether chunks are being suppressed.
+import os as _ep_os
 import threading as _ep_threading
 import time as _ep_time
 
@@ -63,6 +74,9 @@ class _EngineProbe:
     def __init__(self):
         self.lock = _ep_threading.Lock()
         self.per_req = {}
+        self.dump_reqs = int(_ep_os.environ.get("ENGINEPROBE_DUMP_REQS", "5"))
+        self.dump_steps = int(_ep_os.environ.get("ENGINEPROBE_DUMP_STEPS", "400"))
+        self.dumping = {}
         self.engine_steps = 0
         self.reqs_done = 0
         self.done_steps = 0
@@ -80,6 +94,17 @@ class _EngineProbe:
                     if n:
                         slot[0] += 1
                         slot[1] += n
+                        # Raw ids for the first few requests, decoded offline.
+                        if out.request_id in self.dumping:
+                            step_no = self.dumping[out.request_id] + 1
+                            if step_no <= self.dump_steps:
+                                self.dumping[out.request_id] = step_no
+                                lines.append(
+                                    f"ENGINEPROBE_IDS req={out.request_id} "
+                                    f"step={step_no} ids={list(out.new_token_ids)}"
+                                )
+                        elif len(self.dumping) < self.dump_reqs:
+                            self.dumping[out.request_id] = 0
                     if getattr(out, "finish_reason", None) is not None:
                         steps, tokens = self.per_req.pop(out.request_id, (0, 0))
                         self.reqs_done += 1
