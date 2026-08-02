@@ -35,21 +35,32 @@
 #   is exactly the failure mode that hides in a benchmark.
 # =============================================================================
 
+# pp_aux_split is delivered by APPEND, not by the patch. It is a standalone
+# function that lands at the end of models/utils.py, so a context diff anchors on
+# whatever happens to be the last function in the container's copy — which drifts.
+# Pipeline 60696412 failed exactly there ("1 out of 1 hunk FAILED") while the other
+# five files applied at offset -19/-20. Appending is immune to that drift.
+
 set -euo pipefail
 
 dist_packages=/usr/local/lib/python3.12/dist-packages
 patch_file=/configs/patches/k3-dspark-pp-aux-relay.patch
+aux_split_file=/configs/patches/k3_pp_aux_split.py
 
 guard_target="${dist_packages}/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
 relay_target="${dist_packages}/vllm/models/kimi_k3/nvidia/model.py"
+utils_target="${dist_packages}/vllm/model_executor/models/utils.py"
 
 unpatched_marker="DSpark does not support pipeline parallelism."
 patched_marker="supports_pp_aux_hidden_states"
+aux_split_marker="def pp_aux_split("
 
-if [ ! -f "${guard_target}" ]; then
-    echo "ERROR: ${guard_target} not found; container layout changed" >&2
-    exit 1
-fi
+for f in "${guard_target}" "${relay_target}" "${utils_target}"; do
+    if [ ! -f "${f}" ]; then
+        echo "ERROR: ${f} not found; container layout changed" >&2
+        exit 1
+    fi
+done
 
 if grep -Fq "${unpatched_marker}" "${guard_target}"; then
     patch --batch --forward -p1 -d "${dist_packages}" < "${patch_file}"
@@ -58,6 +69,13 @@ elif grep -Fq "${patched_marker}" "${relay_target}"; then
 else
     echo "ERROR: unexpected dspark/utils.py; refusing to patch" >&2
     exit 1
+fi
+
+if grep -Fq "${aux_split_marker}" "${utils_target}"; then
+    echo "pp_aux_split already present"
+else
+    printf '\n\n' >> "${utils_target}"
+    cat "${aux_split_file}" >> "${utils_target}"
 fi
 
 # Verify both halves landed: the guard must be gone AND the relay present.
@@ -70,5 +88,16 @@ if ! grep -Fq "${patched_marker}" "${relay_target}"; then
     echo "ERROR: K3 aux relay missing after patch" >&2
     exit 1
 fi
+if ! grep -Fq "${aux_split_marker}" "${utils_target}"; then
+    echo "ERROR: pp_aux_split missing after append" >&2
+    exit 1
+fi
+
+# The relay imports pp_aux_split; a successful text edit that leaves an
+# unimportable module would surface as a server crash minutes later instead.
+python3 -c "from vllm.model_executor.models.utils import pp_aux_split" || {
+    echo "ERROR: pp_aux_split is not importable after patching" >&2
+    exit 1
+}
 
 echo "K3 DSpark PP aux-relay patch applied"
