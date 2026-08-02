@@ -1,3 +1,27 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 07bdcac68b..bb3d6ab1b1 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1255,10 +1255,17 @@ class SpeculativeConfig:
+     ) -> ParallelConfig:
+         """Create a parallel config for use by the draft worker.
+ 
+-        This is mostly a copy of the target parallel config, except the tp_size.
++        This is mostly a copy of the target parallel config, except the tp_size
++        and pipeline_parallel_size.
++
++        The drafter is constructed only on the last pipeline stage, so the draft
++        model never spans stages. Copying the target's pipeline_parallel_size
++        made ``draft_model_config.verify_with_parallel_config`` demand
++        ``SupportsPP`` from a model that is never sharded across stages, which
++        rejected every draft model under PP>1.
+         """
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            pipeline_parallel_size=1,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
 diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
 index 668c958cef..cd918fc27c 100644
 --- a/vllm/model_executor/models/interfaces.py
