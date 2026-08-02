@@ -1,7 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Make external KV-load failures non-fatal for hybrid models."""
+"""Make external KV-load failures non-fatal, and recoverable, for hybrid models.
+
+The first version of this patch only stopped the crash. It kept the upstream
+per-position truncation and assumed that with ``mamba-cache-mode: align`` every
+KV-cache group shares a logical block size, so a failure at logical index ``idx``
+could be truncated at ``idx * block_size``.
+
+That assumption is wrong. ``align`` equalises the *page size in bytes* -- the
+worker log says so directly:
+
+    Setting attention block size to 1536 tokens to ensure that attention page
+    size is >= mamba page size.
+    Padding mamba page size by 0.70% ...
+
+A Mamba group carries one fixed-size state per sequence, so "N tokens per block"
+does not mean the same thing there as in an attention group, and 18 padding
+layers sit in between. Index ``idx`` is not the same token position in both.
+
+Mooncake reports load failures as physical block IDs with no group attached, so
+there is no way to map the failure back to a common token boundary. Truncating
+at the wrong one produces a request that reloads the same blocks and fails
+identically: in pipeline 60586688 two requests were rescheduled 1,959 and 1,955
+times with `tokens affected` frozen at 694,272 and 677,376 -- the retry never
+advanced, the client saw errors=0 and in_flight=2, and the job burned 4.5 h.
+
+For the multi-group case this now does what SemiAnalysis's
+patch_kimi_k3_mooncake_hma_recompute.py does (InferenceX PR #2444): drop the
+whole prefix and recompute. It is expensive and it always converges. The
+single-group path keeps the per-position scan, which is correct there.
+"""
 
 import sys
 from pathlib import Path
@@ -9,7 +38,7 @@ from pathlib import Path
 TARGET = Path(
     "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py"
 )
-MARKER = "block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)"
+MARKER = "req_hybrid_block_ids = {"
 
 OLD = """            # TODO (davidb): add support for hybrid memory allocator
             (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
@@ -18,6 +47,25 @@ OLD = """            # TODO (davidb): add support for hybrid memory allocator
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+
+            if len(block_ids_per_group) != 1:
+                # Hybrid: no common token boundary exists across groups (see the
+                # module docstring). Recompute the entire prefix instead of
+                # truncating at a position that only makes sense for one group.
+                req_hybrid_block_ids = {
+                    block_id
+                    for group_block_ids in block_ids_per_group
+                    for block_id in group_block_ids
+                }
+                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
+                    continue
+                is_affected = True
+                marked_invalid_block_ids.update(req_hybrid_block_ids & invalid_block_ids)
+                request.num_computed_tokens = 0
+                total_affected_tokens += max(req_num_computed_tokens, 0)
+                if evict_blocks:
+                    blocks_to_evict.update(req_hybrid_block_ids)
+                continue
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
@@ -163,7 +211,7 @@ def main():
     print(
         "[vllm-hybrid-invalid-blocks-fix] Rewrote "
         "_update_requests_with_invalid_blocks to handle hybrid multi-group KV "
-        "(failed external KV loads now recompute instead of crashing).",
+        "(hybrid requests drop the whole prefix and recompute, which converges).",
         file=sys.stderr,
     )
 
