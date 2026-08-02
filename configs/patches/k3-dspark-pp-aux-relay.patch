@@ -20,43 +20,6 @@ index 668c958cef..cd918fc27c 100644
  
  @overload
  def supports_any_eagle(model: type[object]) -> TypeIs[type[SupportsEagleBase]]: ...
-diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 3798d22b6c..629e6f0f79 100644
---- a/vllm/model_executor/models/registry.py
-+++ b/vllm/model_executor/models/registry.py
-@@ -812,6 +812,7 @@ class _ModelInfo:
-     supports_transcription: bool
-     supports_transcription_only: bool
-     supported_video_pruning_methods: tuple[str, ...]
-+    supports_pp_aux_hidden_states: bool = False
- 
-     @staticmethod
-     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
-@@ -845,6 +846,9 @@ class _ModelInfo:
-             supported_video_pruning_methods=getattr(
-                 model, "supported_video_pruning_methods", ()
-             ),
-+            supports_pp_aux_hidden_states=getattr(
-+                model, "supports_pp_aux_hidden_states", False
-+            ),
-         )
- 
- 
-@@ -1387,6 +1391,14 @@ class _ModelRegistry:
-         model_info, _ = self.inspect_model_cls(architectures, model_config)
-         return model_info.supports_pp
- 
-+    def model_supports_pp_aux_hidden_states(
-+        self,
-+        architectures: str | list[str],
-+        model_config: ModelConfig,
-+    ) -> bool:
-+        model_info, _ = self.inspect_model_cls(architectures, model_config)
-+        return model_info.supports_pp_aux_hidden_states
-+
-     def model_has_inner_state(
-         self,
-         architectures: str | list[str],
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
 index 94178c9c73..63f06d96db 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py

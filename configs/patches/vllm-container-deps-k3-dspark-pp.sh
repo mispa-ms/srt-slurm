@@ -50,12 +50,13 @@ aux_split_file=/configs/patches/k3_pp_aux_split.py
 guard_target="${dist_packages}/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
 relay_target="${dist_packages}/vllm/models/kimi_k3/nvidia/model.py"
 utils_target="${dist_packages}/vllm/model_executor/models/utils.py"
+registry_target="${dist_packages}/vllm/model_executor/models/registry.py"
 
 unpatched_marker="DSpark does not support pipeline parallelism."
 patched_marker="supports_pp_aux_hidden_states"
 aux_split_marker="def pp_aux_split("
 
-for f in "${guard_target}" "${relay_target}" "${utils_target}"; do
+for f in "${guard_target}" "${relay_target}" "${utils_target}" "${registry_target}"; do
     if [ ! -f "${f}" ]; then
         echo "ERROR: ${f} not found; container layout changed" >&2
         exit 1
@@ -78,6 +79,11 @@ else
     cat "${aux_split_file}" >> "${utils_target}"
 fi
 
+# registry.py is edited by script for the same reason: its two structural inserts
+# (last field of a dataclass, a kwarg in a constructor call) have no stable diff
+# context, and both hunks failed in pipeline 60754095.
+python3 /configs/patches/k3_registry_pp_aux.py "${registry_target}"
+
 # Verify both halves landed: the guard must be gone AND the relay present.
 # Checking only one would let a partially-applied patch through.
 if grep -Fq "${unpatched_marker}" "${guard_target}"; then
@@ -92,12 +98,18 @@ if ! grep -Fq "${aux_split_marker}" "${utils_target}"; then
     echo "ERROR: pp_aux_split missing after append" >&2
     exit 1
 fi
+if ! grep -Fq "def model_supports_pp_aux_hidden_states(" "${registry_target}"; then
+    echo "ERROR: registry accessor missing after patch" >&2
+    exit 1
+fi
 
 # The relay imports pp_aux_split; a successful text edit that leaves an
 # unimportable module would surface as a server crash minutes later instead.
-python3 -c "from vllm.model_executor.models.utils import pp_aux_split" || {
-    echo "ERROR: pp_aux_split is not importable after patching" >&2
-    exit 1
-}
+python3 - <<'PYCHK' || { echo "ERROR: patched vLLM does not import cleanly" >&2; exit 1; }
+from vllm.model_executor.models.utils import pp_aux_split
+from vllm.model_executor.models.registry import _ModelInfo
+assert "supports_pp_aux_hidden_states" in _ModelInfo.__dataclass_fields__
+print("import check OK")
+PYCHK
 
 echo "K3 DSpark PP aux-relay patch applied"
