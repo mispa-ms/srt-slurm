@@ -1,0 +1,281 @@
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 668c958cef..cd918fc27c 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -1345,6 +1345,17 @@ class SupportsEagleBase(Protocol):
+     A flag that indicates this model has trained its own input embeddings.
+     """
+ 
++    supports_pp_aux_hidden_states: bool = False
++    """
++    A flag that indicates this model relays auxiliary hidden states across
++    pipeline-parallel stages, keeping EAGLE-3 style drafting correct when
++    ``pipeline_parallel_size > 1``.
++
++    Models leaving this ``False`` are rejected at startup under PP, because
++    aux states collected on earlier stages would otherwise be dropped and the
++    drafter would silently run on a partial feature set.
++    """
++
+ 
+ @overload
+ def supports_any_eagle(model: type[object]) -> TypeIs[type[SupportsEagleBase]]: ...
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 3798d22b6c..629e6f0f79 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -812,6 +812,7 @@ class _ModelInfo:
+     supports_transcription: bool
+     supports_transcription_only: bool
+     supported_video_pruning_methods: tuple[str, ...]
++    supports_pp_aux_hidden_states: bool = False
+ 
+     @staticmethod
+     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
+@@ -845,6 +846,9 @@ class _ModelInfo:
+             supported_video_pruning_methods=getattr(
+                 model, "supported_video_pruning_methods", ()
+             ),
++            supports_pp_aux_hidden_states=getattr(
++                model, "supports_pp_aux_hidden_states", False
++            ),
+         )
+ 
+ 
+@@ -1387,6 +1391,14 @@ class _ModelRegistry:
+         model_info, _ = self.inspect_model_cls(architectures, model_config)
+         return model_info.supports_pp
+ 
++    def model_supports_pp_aux_hidden_states(
++        self,
++        architectures: str | list[str],
++        model_config: ModelConfig,
++    ) -> bool:
++        model_info, _ = self.inspect_model_cls(architectures, model_config)
++        return model_info.supports_pp_aux_hidden_states
++
+     def model_has_inner_state(
+         self,
+         architectures: str | list[str],
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index f92aa4f086..f3efbc4128 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -1096,3 +1096,37 @@ def parse_diarized_speaker(speaker: str) -> str | None:
+     ):
+         return None
+     return speaker
++
++
++def pp_aux_split(
++    aux_layers: tuple[int, ...],
++    start_layer: int,
++    end_layer: int,
++    is_last_rank: bool,
++) -> tuple[int, tuple[int, ...]]:
++    """Split EAGLE-3 aux hidden state layers across one pipeline-parallel rank.
++
++    Aux index ``L`` denotes the input to layer ``L``, i.e. the output of layer
++    ``L - 1``. A rank owning layers ``[start_layer, end_layer)`` can therefore
++    produce aux for ``L in [start_layer, end_layer]``, which overlaps the next
++    rank at ``end_layer``. Non-last ranks drop that boundary entry; the next
++    rank reproduces the identical tensor from the hidden state it receives.
++
++    Args:
++        aux_layers: Aux hidden state layer indices for the whole model.
++        start_layer: First layer index owned by this rank, inclusive.
++        end_layer: Last layer index owned by this rank, exclusive.
++        is_last_rank: Whether this rank is the last pipeline stage.
++
++    Returns:
++        ``(recv_count, local_layers)``. ``recv_count`` is how many aux tensors
++        arrive from earlier stages; ``local_layers`` are the aux indices this
++        rank collects itself, in ascending order.
++    """
++    ordered = tuple(sorted(aux_layers))
++    recv_count = sum(1 for layer in ordered if layer < start_layer)
++    if is_last_rank:
++        local = tuple(x for x in ordered if start_layer <= x <= end_layer)
++    else:
++        local = tuple(x for x in ordered if start_layer <= x < end_layer)
++    return recv_count, local
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 94178c9c73..63f06d96db 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -86,6 +86,7 @@ from vllm.model_executor.models.utils import (
+     is_pp_missing_parameter,
+     make_layers,
+     maybe_prefix,
++    pp_aux_split,
+ )
+ from vllm.model_executor.models.vision import is_vit_use_data_parallel
+ from vllm.models.common.ops.sequence_parallel import (
+@@ -1047,14 +1048,23 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                 cdiv(self.start_layer, self.attn_res_block_size),
+                 self.config.hidden_size,
+             )
+-        return IntermediateTensors(
+-            {
+-                "hidden_states": torch.zeros(
+-                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+-                ),
+-                "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
+-            }
++        tensors = {
++            "hidden_states": torch.zeros(
++                (batch_size, self.config.hidden_size), dtype=dtype, device=device
++            ),
++            "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
++        }
++        recv_count, _ = pp_aux_split(
++            self.aux_hidden_state_layers,
++            self.start_layer,
++            self.end_layer,
++            get_pp_group().is_last_rank,
+         )
++        for i in range(recv_count):
++            tensors[f"aux_{i}"] = torch.zeros(
++                (batch_size, self.config.hidden_size), dtype=dtype, device=device
++            )
++        return IntermediateTensors(tensors)
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -1079,7 +1089,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             residual = intermediate_tensors["residual"]
+         assert hidden_states is not None
+ 
++        recv_count, local_aux = pp_aux_split(
++            self.aux_hidden_state_layers,
++            self.start_layer,
++            self.end_layer,
++            get_pp_group().is_last_rank,
++        )
+         aux_hidden_states: list[torch.Tensor] = []
++        if intermediate_tensors is not None:
++            for i in range(recv_count):
++                aux_hidden_states.append(intermediate_tensors[f"aux_{i}"])
+         if self.start_layer in self.aux_hidden_state_layers:
+             if self.use_attn_res or residual is None:
+                 aux_hidden_states.append(hidden_states)
+@@ -1119,7 +1138,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                 prefix_sum=prefix_sum,
+                 residual=residual,
+             )
+-            if (layer_idx + 1) in self.aux_hidden_state_layers:
++            # layer_idx + 1 ranges over (start_layer, end_layer], so the
++            # entry-aux appended above can never be matched again here.
++            if (layer_idx + 1) in local_aux:
+                 if self.use_attn_res:
+                     assert prefix_sum is not None
+                     aux_hidden_state = prefix_sum + hidden_states
+@@ -1142,9 +1163,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             )
+             if prefix_sum is not None:
+                 hidden_states = hidden_states + prefix_sum
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++            tensors = {"hidden_states": hidden_states, "residual": residual}
++            for i, aux in enumerate(aux_hidden_states):
++                tensors[f"aux_{i}"] = aux
++            return IntermediateTensors(tensors)
+ 
+         if self.use_attn_res:
+             assert prefix_sum is not None
+@@ -1170,6 +1192,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+ 
+         # NOTE: the final norm is applied in compute_logits instead of here, so
+         # the MTP draft model receives the pre-norm hidden states.
++        if self.aux_hidden_state_layers:
++            assert len(aux_hidden_states) == len(self.aux_hidden_state_layers), (
++                f"aux hidden state count mismatch: got {len(aux_hidden_states)}, "
++                f"expected {len(self.aux_hidden_state_layers)} for layers "
++                f"{self.aux_hidden_state_layers}"
++            )
+         if aux_hidden_states:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+@@ -1331,6 +1359,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+ class KimiLinearForCausalLM(
+     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+ ):
++    # Forward-looking: the PP aux relay lives in the KimiLinearModel this class
++    # owns, but this class does not implement the EAGLE-3 interface itself.
++    supports_pp_aux_hidden_states = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.model_config = vllm_config.model_config
+@@ -1471,6 +1503,7 @@ class KimiK3ForConditionalGeneration(
+     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
+ 
+     supports_encoder_tp_data = True
++    supports_pp_aux_hidden_states = True
+ 
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_prefix={
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index cea735c0e8..138ed766e6 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -209,10 +209,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
++                model_config = vllm_config.model_config
++                relays_aux = model_config.registry.model_supports_pp_aux_hidden_states(
++                    model_config.architectures, model_config
++                )
++                if self.use_pp and not relays_aux:
+                     raise ValueError(
+                         f"{self.speculative_config.method} with pipeline parallel "
+-                        "is not supported."
++                        f"is not supported for {model_config.architectures}. The "
++                        "model must relay auxiliary hidden states across pipeline "
++                        "stages and set supports_pp_aux_hidden_states = True."
+                     )
+ 
+         # Draft tokens propagation - for spec-dec + struct outputs.
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 13c7644315..b1826f62d4 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -46,9 +46,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             vllm_config=draft_vllm_config, model_config=draft_model_config
+         )
+ 
+-    if get_pp_group().world_size != 1:
+-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+-
+     target_language_model = (
+         target_model.get_language_model()
+         if hasattr(target_model, "get_language_model")
+@@ -57,14 +54,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     target_inner = target_language_model.model
+     draft_inner = draft_model.model
+ 
+-    target_embed = getattr(target_inner, "embed_tokens", None)
+-    draft_embed = getattr(draft_inner, "embed_tokens", None)
+-    if target_embed is not None and _should_share(
+-        draft_model, "has_own_embed_tokens", draft_embed, target_embed
+-    ):
+-        if draft_embed is not None:
+-            del draft_inner.embed_tokens
+-        draft_inner.embed_tokens = target_embed
++    # Skip embedding sharing under PP: the target embedding lives on the first
++    # stage while the drafter runs on the last one.
++    if get_pp_group().world_size == 1:
++        target_embed = getattr(target_inner, "embed_tokens", None)
++        draft_embed = getattr(draft_inner, "embed_tokens", None)
++        if target_embed is not None and _should_share(
++            draft_model, "has_own_embed_tokens", draft_embed, target_embed
++        ):
++            if draft_embed is not None:
++                del draft_inner.embed_tokens
++            draft_inner.embed_tokens = target_embed
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(draft_model, "lm_head", None)
