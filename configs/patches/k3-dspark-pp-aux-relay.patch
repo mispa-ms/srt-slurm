@@ -109,16 +109,6 @@ diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/mo
 index 94178c9c73..73cc69bc7a 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py
 +++ b/vllm/models/kimi_k3/nvidia/model.py
-@@ -957,6 +957,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
-         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
-         "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
-     }
-+    # Aux taps are carried across pipeline stages in the IntermediateTensors
-+    # payload, so EAGLE3-style drafting works under PP for this model.
-+    supports_aux_hidden_states_over_pp = True
- 
-     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-         super().__init__()
 @@ -1047,14 +1050,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                  cdiv(self.start_layer, self.attn_res_block_size),
                  self.config.hidden_size,

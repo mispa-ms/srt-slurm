@@ -57,6 +57,10 @@ else
     exit 1
 fi
 
+# The opt-in flag lives in a drifting class body, so it is delivered by anchor
+# script rather than by the diff (its hunk failed in pipeline 60921865).
+python3 /configs/patches/k3_optin_flag.py "${relay_target}"
+
 # Verify both halves landed: the guard must be gone AND the relay present.
 # Checking only one would let a partially-applied patch through.
 if grep -Fq "${unpatched_marker}" "${guard_target}"; then
