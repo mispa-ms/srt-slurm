@@ -1,84 +1,125 @@
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 07bdcac68b..bb3d6ab1b1 100644
+index 07bdcac68b..afa91b6785 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -1255,10 +1255,17 @@ class SpeculativeConfig:
-     ) -> ParallelConfig:
-         """Create a parallel config for use by the draft worker.
- 
--        This is mostly a copy of the target parallel config, except the tp_size.
-+        This is mostly a copy of the target parallel config, except the tp_size
-+        and pipeline_parallel_size.
-+
-+        The drafter is constructed only on the last pipeline stage, so the draft
-+        model never spans stages. Copying the target's pipeline_parallel_size
-+        made ``draft_model_config.verify_with_parallel_config`` demand
-+        ``SupportsPP`` from a model that is never sharded across stages, which
-+        rejected every draft model under PP>1.
+@@ -1258,7 +1258,12 @@ class SpeculativeConfig:
+         This is mostly a copy of the target parallel config, except the tp_size.
          """
          draft_parallel_config = ParallelConfig(
 -            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            # The drafter is instantiated only on the last pipeline stage and is
++            # never itself pipelined, so it must not inherit the target's PP
++            # size; doing so would require the draft architecture to implement
++            # SupportsPP. This is a no-op for previously working setups, since
++            # speculative decoding under PP > 1 was rejected outright before.
 +            pipeline_parallel_size=1,
              tensor_parallel_size=speculative_draft_tensor_parallel_size,
              distributed_executor_backend=target_parallel_config.distributed_executor_backend,
              max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
 diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
-index 668c958cef..cd918fc27c 100644
+index 668c958cef..dafef14172 100644
 --- a/vllm/model_executor/models/interfaces.py
 +++ b/vllm/model_executor/models/interfaces.py
-@@ -1345,6 +1345,17 @@ class SupportsEagleBase(Protocol):
-     A flag that indicates this model has trained its own input embeddings.
-     """
+@@ -1399,6 +1399,16 @@ class LocalArgmaxMixin:
+ class EagleModelMixin:
+     aux_hidden_state_layers: tuple[int, ...] = ()
  
-+    supports_pp_aux_hidden_states: bool = False
-+    """
-+    A flag that indicates this model relays auxiliary hidden states across
-+    pipeline-parallel stages, keeping EAGLE-3 style drafting correct when
-+    ``pipeline_parallel_size > 1``.
++    # Whether this model forwards auxiliary hidden states across pipeline
++    # stages. EAGLE3-style drafting runs on the last PP rank but taps layers
++    # that may live on earlier stages, so those tensors have to ride along with
++    # the IntermediateTensors payload. Models opt in by implementing the
++    # `aux_hidden_states_over_pp` protocol below and setting this to True.
++    supports_aux_hidden_states_over_pp: ClassVar[bool] = False
 +
-+    Models leaving this ``False`` are rejected at startup under PP, because
-+    aux states collected on earlier stages would otherwise be dropped and the
-+    drafter would silently run on a partial feature set.
-+    """
++    # Key prefix for aux tensors carried in the IntermediateTensors payload.
++    AUX_HIDDEN_STATE_KEY: ClassVar[str] = "aux_hidden_states_"
++
+     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+         self.aux_hidden_state_layers = layers
+ 
+@@ -1414,6 +1424,67 @@ class EagleModelMixin:
+             aux_hidden_states.append(value)
+         return aux_hidden_states
+ 
++    def num_upstream_aux_hidden_states(self) -> int:
++        """How many aux tensors arrive from earlier pipeline stages.
++
++        Tap ids count *layers computed*, so a tap `a` is produced by the stage
++        whose window satisfies `start_layer < a <= end_layer`. Everything with
++        `a <= start_layer` was therefore produced upstream. Both sides derive
++        the count from the same rule, so send and recv agree with no
++        negotiation.
++        """
++        from vllm.distributed.parallel_state import get_pp_group
++
++        if get_pp_group().is_first_rank:
++            return 0
++        start_layer = getattr(self, "start_layer", 0)
++        return sum(1 for a in self.aux_hidden_state_layers if a <= start_layer)
++
++    def unpack_aux_hidden_states(
++        self, intermediate_tensors: "IntermediateTensors | None"
++    ) -> list[torch.Tensor]:
++        """Recover the aux tensors produced by earlier pipeline stages."""
++        if intermediate_tensors is None:
++            return []
++        out: list[torch.Tensor] = []
++        # IntermediateTensors has no __contains__, so consult the dict directly.
++        payload = intermediate_tensors.tensors
++        for i in range(self.num_upstream_aux_hidden_states()):
++            key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
++            if key not in payload:
++                break
++            out.append(payload[key])
++        return out
++
++    def pack_aux_hidden_states(
++        self,
++        tensors: dict[str, torch.Tensor],
++        aux_hidden_states: list[torch.Tensor],
++    ) -> dict[str, torch.Tensor]:
++        """Add this stage's aux tensors (its own plus inherited) to the payload."""
++        for i, aux in enumerate(aux_hidden_states):
++            tensors[f"{self.AUX_HIDDEN_STATE_KEY}{i}"] = aux
++        return tensors
++
++    def make_empty_aux_hidden_states(
++        self,
++        tensors: dict[str, torch.Tensor],
++        batch_size: int,
++        hidden_size: int,
++        dtype: torch.dtype,
++        device: torch.device,
++    ) -> dict[str, torch.Tensor]:
++        """Pre-allocate recv buffers for the aux tensors arriving from upstream.
++
++        Must agree with `pack_aux_hidden_states` on the receiving stage, since
++        the PP transport sizes its buffers from this.
++        """
++        for i in range(self.num_upstream_aux_hidden_states()):
++            tensors[f"{self.AUX_HIDDEN_STATE_KEY}{i}"] = torch.zeros(
++                (batch_size, hidden_size), dtype=dtype, device=device
++            )
++        return tensors
 +
  
- @overload
- def supports_any_eagle(model: type[object]) -> TypeIs[type[SupportsEagleBase]]: ...
+ @runtime_checkable
+ class SupportsEagle(SupportsEagleBase, Protocol):
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
-index 94178c9c73..d09f0419ac 100644
+index 94178c9c73..73cc69bc7a 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py
 +++ b/vllm/models/kimi_k3/nvidia/model.py
-@@ -86,6 +86,7 @@ from vllm.model_executor.models.utils import (
-     is_pp_missing_parameter,
-     make_layers,
-     maybe_prefix,
-+    pp_aux_split,
- )
- from vllm.model_executor.models.vision import is_vit_use_data_parallel
- from vllm.models.common.ops.sequence_parallel import (
-@@ -976,7 +977,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+@@ -957,6 +957,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
+         "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+     }
++    # Aux taps are carried across pipeline stages in the IntermediateTensors
++    # payload, so EAGLE3-style drafting works under PP for this model.
++    supports_aux_hidden_states_over_pp = True
  
-         self.vocab_size = config.vocab_size
- 
--        if get_pp_group().is_first_rank:
-+        # The drafter is built only on the last pipeline stage and embeds its own
-+        # draft tokens, but it ships no embedding of its own (dspark_mla sets
-+        # has_own_embed_tokens = False and skips embed_tokens in the checkpoint) —
-+        # it borrows the target's. Under PP that table would otherwise live only on
-+        # stage 0, so materialize it on the last stage too when a drafter is
-+        # configured. The target's own forward still embeds on stage 0 only; this
-+        # copy exists solely for the drafter.
-+        pp_group = get_pp_group()
-+        drafter_needs_embedding = (
-+            vllm_config.speculative_config is not None
-+            and pp_group.is_last_rank
-+            and not pp_group.is_first_rank
-+        )
-+        if pp_group.is_first_rank or drafter_needs_embedding:
-             self.embed_tokens = VocabParallelEmbedding(
-                 config.vocab_size,
-                 config.hidden_size,
-@@ -1047,14 +1061,23 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -1047,14 +1050,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                  cdiv(self.start_layer, self.attn_res_block_size),
                  self.config.hidden_size,
              )
@@ -95,49 +136,31 @@ index 94178c9c73..d09f0419ac 100644
 +            ),
 +            "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
 +        }
-+        recv_count, _ = pp_aux_split(
-+            self.aux_hidden_state_layers,
-+            self.start_layer,
-+            self.end_layer,
-+            get_pp_group().is_last_rank,
++        # Recv buffers for aux taps produced by earlier stages. Must match what
++        # pack_aux_hidden_states puts on the wire, since the PP transport sizes
++        # its buffers from this.
++        self.make_empty_aux_hidden_states(
++            tensors, batch_size, self.config.hidden_size, dtype, device
          )
-+        for i in range(recv_count):
-+            tensors[f"aux_{i}"] = torch.zeros(
-+                (batch_size, self.config.hidden_size), dtype=dtype, device=device
-+            )
 +        return IntermediateTensors(tensors)
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
-@@ -1079,7 +1102,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
-             residual = intermediate_tensors["residual"]
+@@ -1080,7 +1088,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
          assert hidden_states is not None
  
-+        recv_count, local_aux = pp_aux_split(
-+            self.aux_hidden_state_layers,
-+            self.start_layer,
-+            self.end_layer,
-+            get_pp_group().is_last_rank,
-+        )
          aux_hidden_states: list[torch.Tensor] = []
-+        if intermediate_tensors is not None:
-+            for i in range(recv_count):
-+                aux_hidden_states.append(intermediate_tensors[f"aux_{i}"])
-         if self.start_layer in self.aux_hidden_state_layers:
+-        if self.start_layer in self.aux_hidden_state_layers:
++        if not get_pp_group().is_first_rank:
++            # A tap at exactly start_layer was computed by the previous stage
++            # and arrives with the intermediate tensors; recomputing it here
++            # would duplicate it.
++            aux_hidden_states = self.unpack_aux_hidden_states(intermediate_tensors)
++        elif self.start_layer in self.aux_hidden_state_layers:
              if self.use_attn_res or residual is None:
                  aux_hidden_states.append(hidden_states)
-@@ -1119,7 +1151,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
-                 prefix_sum=prefix_sum,
-                 residual=residual,
-             )
--            if (layer_idx + 1) in self.aux_hidden_state_layers:
-+            # layer_idx + 1 ranges over (start_layer, end_layer], so the
-+            # entry-aux appended above can never be matched again here.
-+            if (layer_idx + 1) in local_aux:
-                 if self.use_attn_res:
-                     assert prefix_sum is not None
-                     aux_hidden_state = prefix_sum + hidden_states
-@@ -1142,9 +1176,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             else:
+@@ -1142,9 +1155,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
              )
              if prefix_sum is not None:
                  hidden_states = hidden_states + prefix_sum
@@ -145,173 +168,314 @@ index 94178c9c73..d09f0419ac 100644
 -                {"hidden_states": hidden_states, "residual": residual}
 -            )
 +            tensors = {"hidden_states": hidden_states, "residual": residual}
-+            for i, aux in enumerate(aux_hidden_states):
-+                tensors[f"aux_{i}"] = aux
++            # Forward the aux taps (this stage's plus any inherited from
++            # upstream) instead of dropping them, which is what made
++            # EAGLE3-style drafting impossible under pipeline parallelism.
++            self.pack_aux_hidden_states(tensors, aux_hidden_states)
 +            return IntermediateTensors(tensors)
  
          if self.use_attn_res:
              assert prefix_sum is not None
-@@ -1170,6 +1205,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
- 
-         # NOTE: the final norm is applied in compute_logits instead of here, so
-         # the MTP draft model receives the pre-norm hidden states.
-+        if self.aux_hidden_state_layers:
-+            assert len(aux_hidden_states) == len(self.aux_hidden_state_layers), (
-+                f"aux hidden state count mismatch: got {len(aux_hidden_states)}, "
-+                f"expected {len(self.aux_hidden_state_layers)} for layers "
-+                f"{self.aux_hidden_state_layers}"
-+            )
-         if aux_hidden_states:
-             return hidden_states, aux_hidden_states
-         return hidden_states
-@@ -1331,6 +1372,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
- class KimiLinearForCausalLM(
-     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
- ):
-+    # Forward-looking: the PP aux relay lives in the KimiLinearModel this class
-+    # owns, but this class does not implement the EAGLE-3 interface itself.
-+    supports_pp_aux_hidden_states = True
-+
-     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-         super().__init__()
-         self.model_config = vllm_config.model_config
-@@ -1471,6 +1516,7 @@ class KimiK3ForConditionalGeneration(
-     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
- 
-     supports_encoder_tp_data = True
-+    supports_pp_aux_hidden_states = True
- 
-     hf_to_vllm_mapper = WeightsMapper(
-         orig_to_new_prefix={
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index cea735c0e8..138ed766e6 100644
+index cea735c0e8..12629a317b 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -209,10 +209,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -112,6 +112,7 @@ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
++    supports_aux_hidden_states_over_pp,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+@@ -209,11 +210,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                  # Drafting may require auxiliary hidden states from target model outputs
                  self.use_aux_hidden_state_outputs = True
 -                if self.use_pp:
-+                model_config = vllm_config.model_config
-+                relays_aux = model_config.registry.model_supports_pp_aux_hidden_states(
-+                    model_config.architectures, model_config
-+                )
-+                if self.use_pp and not relays_aux:
-                     raise ValueError(
-                         f"{self.speculative_config.method} with pipeline parallel "
+-                    raise ValueError(
+-                        f"{self.speculative_config.method} with pipeline parallel "
 -                        "is not supported."
-+                        f"is not supported for {model_config.architectures}. The "
-+                        "model must relay auxiliary hidden states across pipeline "
-+                        "stages and set supports_pp_aux_hidden_states = True."
-                     )
+-                    )
  
          # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+@@ -318,6 +314,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.use_aux_hidden_state_outputs:
+                 assert self.speculative_config is not None
+                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
++                if self.use_pp and not supports_aux_hidden_states_over_pp(self.model):
++                    # The drafter runs on the last PP rank but taps layers that
++                    # may live on earlier stages, so the target must forward
++                    # those tensors along with its IntermediateTensors.
++                    raise ValueError(
++                        f"{self.speculative_config.method} with pipeline parallel "
++                        f"is not supported by {type(self.model).__name__}: it does "
++                        "not forward auxiliary hidden states across pipeline stages."
++                    )
++                pp_size = self.parallel_config.pipeline_parallel_size
++                if pp_size > 2:
++                    # The aux forwarding itself is size-agnostic: every stage
++                    # derives what it owes downstream from the same rule, and
++                    # the accounting is unit-tested up to pp=8. What has not
++                    # been exercised on hardware is a *middle* stage, which
++                    # pp>2 introduces and which must both adopt upstream taps
++                    # and contribute its own to the same payload. Given that
++                    # the failure mode of this feature is silently degraded
++                    # acceptance rather than a crash, refuse rather than let it
++                    # run unvalidated. Lifting this needs an end-to-end
++                    # acceptance-rate comparison at pp>2, not just a boot test.
++                    raise NotImplementedError(
++                        f"{self.speculative_config.method} with pipeline parallel "
++                        f"is currently supported only up to pipeline_parallel_size=2, "
++                        f"got {pp_size}."
++                    )
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 self.speculator.load_model(self.model)
+                 eplb_models_added = self.eplb.maybe_register_speculator(
+@@ -835,6 +857,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # Land the proposals on the same step as the matching sampled
++                # tokens, so the next _prepare_inputs splices real draft ids
++                # into input_ids instead of placeholders.
++                draft_update = outputs.pop("draft_update", None)
++                if draft_update is not None:
++                    draft_tokens, draft_idx_mapping = draft_update
++                    self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+                 self.postprocess_sampled(**outputs)
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+@@ -1475,6 +1504,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+             all_decode_next = self.pp_handler.receive(input_batch)
++            # Pair the last rank's post-propose draft send.
++            if self.num_speculative_steps > 0:
++                self.pp_handler.receive_drafts(input_batch)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -1592,6 +1624,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
++            # The other PP ranks have no drafter, so hand them the proposals
++            # they must feed the target on the next step.
++            if self.pp_handler is not None:
++                self.pp_handler.broadcast_drafts(
++                    self.req_states.draft_tokens[input_batch.idx_mapping],
++                    input_batch,
++                )
+ 
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index d7487afaaa..5d6b42aef9 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -303,9 +303,12 @@ class MambaHybridModelState(DefaultModelState):
+                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
+                 )
+         else:
+-            # Fill with single value.
++            # Fill with single value. index_fill_ only accepts int64 indices,
++            # while idx_mapping is int32. This branch is reached only from the
++            # non-last PP rank, which passes a dense mapping with no -1
++            # sentinels, so the cast is safe.
+             self.num_accepted_tokens_gpu.index_fill_(
+-                0, idx_mapping, max(num_sampled, 1)
++                0, idx_mapping.long(), max(num_sampled, 1)
+             )
+ 
+         # Align: save the running state to the block-aligned position when
 diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
-index 9b1786cbe4..8059803c14 100644
+index 9b1786cbe4..2bd52f838f 100644
 --- a/vllm/v1/worker/gpu/pp_utils.py
 +++ b/vllm/v1/worker/gpu/pp_utils.py
-@@ -65,6 +65,16 @@ class PPHandler:
+@@ -30,6 +30,8 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Draft proposals for the step this slot feeds, when spec decoding is on.
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -44,7 +46,18 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+     # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
++    # The scheduler advances num_computed_tokens by the full scheduled width
++    # (bonus + drafts) up front and only rolls the rejected part back in
++    # update_from_output, which under PP runs after the next batch has already
++    # been scheduled. Comparing the inflated count against max_seq_len would
++    # mark a request as finishing up to num_draft tokens early, after which the
++    # last rank stops broadcasting and the other ranks' last_sampled_tokens
++    # freeze, silently repeating a stale token. Discount the drafts: a
++    # redundant broadcast costs one small collective, a skipped one corrupts.
++    finish_computed = old_computed
++    if input_batch.num_draft_tokens_per_req is not None:
++        finish_computed = old_computed - input_batch.num_draft_tokens_per_req
++    not_finishing = np.maximum(finish_computed, prefill_len) + 1 < max_seq_len
+     need_sampled_mask = produces_sample & not_finishing
+     return need_sampled_mask if need_sampled_mask.any() else None
+ 
+@@ -65,6 +78,7 @@ class PPHandler:
          self.is_last_rank = get_pp_group().is_last_rank
          self.last_rank = get_pp_group().last_rank
          self.max_sample_len = num_speculative_steps + 1
-+        # Both stages decide independently whether to join the sampled-token
-+        # broadcast, from compute_need_sampled_mask over their own
-+        # num_computed_tokens. Without spec decoding every step advances
-+        # exactly one token, so the non-last rank's optimistic update always
-+        # matches and the two agree. Under spec decoding rejections make that
-+        # update provisional, the masks can disagree, and one rank enters the
-+        # collective alone — the ranks then hang until NCCL times out. Keep the
-+        # collective unconditional in that case; the cost is one small
-+        # broadcast per step on the rare steps that need nothing.
-+        self.always_broadcast = num_speculative_steps > 0
++        self.num_speculative_steps = num_speculative_steps
          self.device = device
          self.main_stream = torch.cuda.current_stream(device)
          self.broadcast_stream = torch.cuda.Stream(device)
-@@ -123,13 +133,40 @@ class PPHandler:
+@@ -90,7 +104,9 @@ class PPHandler:
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
++    def get_prev_sampled_outputs(
++        self,
++    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+         """
+@@ -116,12 +132,74 @@ class PPHandler:
+             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+ 
+         self.main_stream.wait_event(slot.event)
+-        return dict(
++        outputs = dict(
+             sampled_tokens=slot.sampled_tokens,
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
              idx_mapping=idx_mapping,
          )
- 
-+    def _recv_and_discard(self, num_reqs: int) -> None:
-+        """Join the broadcast without keeping the result.
++        if slot.draft_tokens is not None:
++            # Scatter with the unfiltered mapping. A row whose request has since
++            # been freed writes to a slot nobody reads, and add_requests zeroes
++            # the row before any reuse, whereas the -1 sentinels in the filtered
++            # `idx_mapping` would alias the last row.
++            outputs["draft_update"] = (slot.draft_tokens, slot.idx_mapping)
++        return outputs
 +
-+        Shapes match `broadcast` so the collective stays symmetric even when
-+        this rank has nothing to postprocess.
++    def broadcast_drafts(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Publish this step's proposals to the other PP ranks.
++
++        Only the last rank runs the drafter, but the first rank owns
++        embed_tokens and therefore builds the input embeddings for the whole
++        pipeline. Without this the non-last ranks embed the scheduler's
++        PLACEHOLDER_TOKEN_ID (-1) in the draft slots, and the last rank ends up
++        verifying real proposals against logits computed from placeholders.
 +        """
++        assert self.is_last_rank
++        if compute_need_sampled_mask(input_batch) is None:
++            return
 +        with torch.cuda.stream(self.broadcast_stream):
 +            self.broadcast_stream.wait_stream(self.main_stream)
-+            sampled_tokens = torch.empty(
++            send = draft_tokens.contiguous()
++            torch.distributed.broadcast(
++                send, src=self.last_rank, group=self.broadcast_group
++            )
++            send.record_stream(self.broadcast_stream)
++
++    def receive_drafts(self, input_batch: InputBatch) -> None:
++        """Counterpart of `broadcast_drafts`.
++
++        Attaches to the slot `receive` just pushed so the proposals are
++        consumed at the same step as the sampled tokens they belong with. Both
++        sides gate on the same mask, so the wire order always matches.
++        """
++        assert not self.is_last_rank
++        if compute_need_sampled_mask(input_batch) is None:
++            return
++        num_reqs = input_batch.num_reqs
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            draft_tokens = torch.empty(
 +                num_reqs,
-+                self.max_sample_len,
++                self.num_speculative_steps,
 +                dtype=torch.int64,
 +                device=self.device,
 +            )
-+            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
 +            torch.distributed.broadcast(
-+                sampled_tokens, src=self.last_rank, group=self.broadcast_group
++                draft_tokens, src=self.last_rank, group=self.broadcast_group
 +            )
-+            torch.distributed.broadcast(
-+                combined, src=self.last_rank, group=self.broadcast_group
-+            )
-+
++            # Strictly later on broadcast_stream than the event `receive`
++            # recorded, so it also covers the sampled tensors. Replacing the
++            # slot's event keeps the consumer's single wait_event correct;
++            # waiting on the older event would not order this broadcast.
++            event = self.broadcast_stream.record_event()
++            draft_tokens.record_stream(self.main_stream)
++        slot = self.queue[-1]
++        if slot is not None:
++            slot.draft_tokens = draft_tokens
++            slot.event = event
+ 
      def receive(self, input_batch: InputBatch) -> bool:
          """Returns True iff sampled tokens need to be gathered from *all*
-         requests in the batch."""
-         assert not self.is_last_rank
-         need_sampled_mask = compute_need_sampled_mask(input_batch)
-         if need_sampled_mask is None:
--            # Leave this step's reserved slot as None.
-+            if not self.always_broadcast:
-+                # Leave this step's reserved slot as None.
-+                return False
-+            # Under spec decoding the two stages can disagree on this mask, so
-+            # take part anyway and discard; see `always_broadcast`.
-+            self._recv_and_discard(input_batch.num_reqs)
-             return False
+@@ -186,8 +264,24 @@ class PPHandler:
  
-         # Snapshot the per-slot generation counter so a later free of any of
-@@ -175,8 +212,8 @@ class PPHandler:
-         input_batch: InputBatch,
-     ) -> None:
-         assert self.is_last_rank
--        if compute_need_sampled_mask(input_batch) is None:
--            # No request needs sampled outputs for a subsequent decode step.
-+        if not self.always_broadcast and compute_need_sampled_mask(input_batch) is None:
-+            # No request needs sampled outputs for a subsequent step.
-             return
- 
-         assert sampled_token_ids.dtype == torch.int64
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            # receive() unconditionally allocates max_sample_len columns, but
++            # the non-spec sampler path (num_draft_tokens == 0) returns width 1,
++            # so an unpadded broadcast leaves the peer waiting on a larger count
++            # than the root sends. NCCL does not diagnose the mismatch: the root
++            # completes and the receiver hangs until the watchdog fires. Pad so
++            # both sides agree. post_update reads each row with
++            # sampled_tokens.stride(0) and stops at num_sampled, so the pad
++            # columns are never observed.
++            send_tokens = sampled_token_ids
++            width = send_tokens.shape[-1]
++            if width < self.max_sample_len:
++                padded = send_tokens.new_zeros(
++                    send_tokens.shape[0], self.max_sample_len
++                )
++                padded[:, :width] = send_tokens
++                send_tokens = padded
+             torch.distributed.broadcast(
+-                sampled_token_ids.contiguous(),
++                send_tokens.contiguous(),
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
-index 13c7644315..d85435f59a 100644
+index 13c7644315..17ebe10be1 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
-@@ -6,6 +6,7 @@ import torch.nn as nn
+@@ -1,16 +1,25 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import glob
++import json
++import os
++
++import torch
+ import torch.nn as nn
++from safetensors import safe_open
+ 
  from vllm.config import VllmConfig, replace
- from vllm.distributed.parallel_state import get_pp_group
+-from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
  from vllm.model_executor.model_loader import get_model
 +from vllm.model_executor.models.utils import PPMissingLayer
  from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
      _should_share,
      get_target_lm_head,
-@@ -41,14 +42,25 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
-     # config is retained for DSpark's target-layer metadata, so we must override it.
-     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+ )
  
-+    # Under PP the drafter is built only on the last stage, but the
-+    # fastsafetensors loader collectives over torch.distributed.group.WORLD
-+    # (weight_utils.fastsafetensors_weights_iterator). The stages that never
-+    # build a drafter never join, and every rank hangs until the NCCL collective
-+    # times out. Fall back to the default loader for the draft; it is a handful
-+    # of layers, so the parallel loader buys nothing here anyway.
-+    if get_pp_group().world_size > 1 and draft_vllm_config.load_config.load_format == (
-+        "fastsafetensors"
-+    ):
-+        draft_vllm_config = replace(
-+            draft_vllm_config,
-+            load_config=replace(draft_vllm_config.load_config, load_format="auto"),
-+        )
++logger = init_logger(__name__)
 +
-     with set_model_tag("dspark_head"):
-         draft_model = get_model(
+ 
+ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+     speculative_config = vllm_config.speculative_config
+@@ -46,9 +55,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
              vllm_config=draft_vllm_config, model_config=draft_model_config
          )
  
@@ -321,26 +485,115 @@ index 13c7644315..d85435f59a 100644
      target_language_model = (
          target_model.get_language_model()
          if hasattr(target_model, "get_language_model")
-@@ -57,11 +69,22 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
-     target_inner = target_language_model.model
-     draft_inner = draft_model.model
+@@ -59,6 +65,13 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
  
-+    # The drafter has no embedding of its own and embeds its draft tokens with the
-+    # target's. Under PP the target materializes a copy on the last stage for
-+    # exactly this (see KimiLinearModel.__init__); refuse a PPMissingLayer rather
-+    # than sharing a stub, which surfaces later as an opaque assert inside the
-+    # draft forward.
      target_embed = getattr(target_inner, "embed_tokens", None)
      draft_embed = getattr(draft_inner, "embed_tokens", None)
++    # Under PP the target's vocab embedding lives on the first stage, so on the
++    # last stage -- where the drafter runs -- there is only a PPMissingLayer to
++    # alias. PPMissingLayer.forward returns its input unchanged, which would
++    # feed raw int64 token ids into the draft backbone's norm. Load the real
++    # table from the target checkpoint instead.
++    if isinstance(target_embed, PPMissingLayer):
++        target_embed = _load_target_embed_tokens_for_pp(vllm_config)
      if target_embed is not None and _should_share(
          draft_model, "has_own_embed_tokens", draft_embed, target_embed
      ):
-+        if isinstance(target_embed, PPMissingLayer):
-+            raise RuntimeError(
-+                "The drafter needs the target's token embedding, but this "
-+                "pipeline stage has none. The target model must build "
-+                "embed_tokens on the last stage when a drafter is configured."
-+            )
-         if draft_embed is not None:
-             del draft_inner.embed_tokens
-         draft_inner.embed_tokens = target_embed
+@@ -76,3 +89,69 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+         draft_model.lm_head = target_lm_head
+ 
+     return draft_model
++
++
++def _load_target_embed_tokens_for_pp(vllm_config: VllmConfig) -> nn.Module:
++    """Build and load the target's vocab embedding on a non-first PP stage.
++
++    Mirrors the target's own construction (a VocabParallelEmbedding sharded over
++    the TP group) and loads the weight from the target checkpoint, which is
++    present in full on every node's model directory. Costs
++    vocab_size * hidden_size * dtype_size / tp_size bytes, e.g. 0.28 GiB per GPU
++    for a 163840 x 7168 bf16 table at TP8.
++    """
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        VocabParallelEmbedding,
++    )
++    from vllm.platforms import current_platform
++
++    model_config = vllm_config.model_config
++    text_config = model_config.hf_text_config
++    model_dir = model_config.model
++
++    # Locate the embedding tensor: prefer the shard index, else scan the shards.
++    key = None
++    shard_path = None
++    index_path = os.path.join(model_dir, "model.safetensors.index.json")
++    if os.path.isfile(index_path):
++        with open(index_path) as f:
++            weight_map = json.load(f)["weight_map"]
++        for name, shard in weight_map.items():
++            if name.endswith("embed_tokens.weight"):
++                key = name
++                shard_path = os.path.join(model_dir, shard)
++                break
++    else:
++        for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
++            with safe_open(path, framework="pt") as f:
++                # safe_open is not a dict and is not directly iterable.
++                for name in f.keys():  # noqa: SIM118
++                    if name.endswith("embed_tokens.weight"):
++                        key = name
++                        shard_path = path
++                        break
++            if key is not None:
++                break
++    if key is None:
++        raise RuntimeError(
++            "DSpark under pipeline parallelism needs the target's embed_tokens "
++            f"on the last stage, but no *embed_tokens.weight was found in "
++            f"{model_dir}"
++        )
++
++    with torch.device(current_platform.current_device()):
++        embed = VocabParallelEmbedding(
++            text_config.vocab_size,
++            text_config.hidden_size,
++            params_dtype=model_config.dtype,
++            prefix="dspark_pp.embed_tokens",
++        )
++    with safe_open(shard_path, framework="pt") as f:
++        embed.weight_loader(embed.weight, f.get_tensor(key))
++    logger.info(
++        "Loaded draft embed_tokens %s from %s (key %s) for PP",
++        tuple(embed.weight.shape),
++        os.path.basename(shard_path),
++        key,
++    )
++    return embed
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index a37a4c83b3..f659e76a0f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -32,6 +32,23 @@ def set_eagle3_aux_hidden_state_layers(
+     eagle3_model.set_aux_hidden_state_layers(aux_layers)
+ 
+ 
++def supports_aux_hidden_states_over_pp(model: nn.Module) -> bool:
++    """Whether `model` carries its aux hidden states across pipeline stages.
++
++    EAGLE3-style drafting runs on the last PP rank but taps layers that may sit
++    on earlier stages, so the target has to forward those tensors with its
++    IntermediateTensors. Models that do opt in via
++    `EagleModelMixin.supports_aux_hidden_states_over_pp`.
++    """
++    parent_ref = model
++    if hasattr(model, "get_language_model"):
++        parent_ref = model.get_language_model()
++    elif hasattr(model, "language_model"):
++        parent_ref = model.language_model
++    inner = getattr(parent_ref, "model", None)
++    return bool(getattr(inner, "supports_aux_hidden_states_over_pp", False))
++
++
+ def get_eagle3_aux_layers_from_config(
+     spec_config: SpeculativeConfig,
+ ) -> tuple[int, ...] | None:
