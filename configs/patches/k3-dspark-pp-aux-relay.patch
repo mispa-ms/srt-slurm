@@ -435,7 +435,7 @@ index 9b1786cbe4..2bd52f838f 100644
                  group=self.broadcast_group,
              )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
-index 13c7644315..8307d8f1b7 100644
+index 13c7644315..5ad75087a1 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 @@ -1,16 +1,26 @@
@@ -508,7 +508,7 @@ index 13c7644315..8307d8f1b7 100644
      if target_embed is not None and _should_share(
          draft_model, "has_own_embed_tokens", draft_embed, target_embed
      ):
-@@ -76,3 +104,69 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+@@ -76,3 +104,81 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
          draft_model.lm_head = target_lm_head
  
      return draft_model
@@ -531,6 +531,18 @@ index 13c7644315..8307d8f1b7 100644
 +    model_config = vllm_config.model_config
 +    text_config = model_config.hf_text_config
 +    model_dir = model_config.model
++    if not os.path.isdir(model_dir):
++        # model_config.model is an HF repo id whenever the model was not given
++        # as a local path; resolve it to the already-populated cache snapshot.
++        # local_files_only: the weights are staged ahead of the job, and a
++        # multi-hundred-GB download inside a benchmark is never the right answer.
++        from huggingface_hub import snapshot_download
++
++        model_dir = snapshot_download(
++            model_dir,
++            revision=model_config.revision,
++            local_files_only=True,
++        )
 +
 +    # Locate the embedding tensor: prefer the shard index, else scan the shards.
 +    key = None
