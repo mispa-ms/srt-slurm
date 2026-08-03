@@ -51,12 +51,13 @@ guard_target="${dist_packages}/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
 relay_target="${dist_packages}/vllm/models/kimi_k3/nvidia/model.py"
 utils_target="${dist_packages}/vllm/model_executor/models/utils.py"
 registry_target="${dist_packages}/vllm/model_executor/models/registry.py"
+warmup_target="${dist_packages}/vllm/v1/worker/gpu/warmup.py"
 
 unpatched_marker="DSpark does not support pipeline parallelism."
 patched_marker="supports_pp_aux_hidden_states"
 aux_split_marker="def pp_aux_split("
 
-for f in "${guard_target}" "${relay_target}" "${utils_target}" "${registry_target}"; do
+for f in "${guard_target}" "${relay_target}" "${utils_target}" "${registry_target}" "${warmup_target}"; do
     if [ ! -f "${f}" ]; then
         echo "ERROR: ${f} not found; container layout changed" >&2
         exit 1
@@ -84,6 +85,10 @@ fi
 # context, and both hunks failed in pipeline 60754095.
 python3 /configs/patches/k3_registry_pp_aux.py "${registry_target}"
 
+# warmup.py: same reason — the guard sits in a nested function whose
+# surrounding lines drift, and its diff hunk failed in pipeline 60893881.
+python3 /configs/patches/k3_warmup_pp_skip.py "${warmup_target}"
+
 # Verify both halves landed: the guard must be gone AND the relay present.
 # Checking only one would let a partially-applied patch through.
 if grep -Fq "${unpatched_marker}" "${guard_target}"; then
@@ -100,6 +105,10 @@ if ! grep -Fq "${aux_split_marker}" "${utils_target}"; then
 fi
 if ! grep -Fq "def model_supports_pp_aux_hidden_states(" "${registry_target}"; then
     echo "ERROR: registry accessor missing after patch" >&2
+    exit 1
+fi
+if ! grep -Fq "get_pp_group().world_size > 1" "${warmup_target}"; then
+    echo "ERROR: warmup PP+spec guard missing after patch" >&2
     exit 1
 fi
 

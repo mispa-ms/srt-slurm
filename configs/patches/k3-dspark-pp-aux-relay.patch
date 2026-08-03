@@ -344,38 +344,3 @@ index 13c7644315..d85435f59a 100644
          if draft_embed is not None:
              del draft_inner.embed_tokens
          draft_inner.embed_tokens = target_embed
-diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
-index cb39581c20..6a17d81277 100644
---- a/vllm/v1/worker/gpu/warmup.py
-+++ b/vllm/v1/worker/gpu/warmup.py
-@@ -9,6 +9,7 @@ import numpy as np
- import torch
- 
- from vllm import PoolingParams, SamplingParams
-+from vllm.distributed.parallel_state import get_pp_group
- from vllm.logger import init_logger
- from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
- from vllm.utils.math_utils import cdiv
-@@ -365,8 +366,20 @@ def warmup_kernels(
-         elif use_spec_decode:
-             decode_steps.append(([0], [False]))
- 
--        for step_indices, step_spec_flags in decode_steps:
--            _run_decode_step(step_indices, step_spec_flags)
-+        if use_spec_decode and get_pp_group().world_size > 1:
-+            # The two stages deadlock here: one ends up in the sampled-token
-+            # broadcast while the other waits on the inter-stage recv, and every
-+            # rank sits there until NCCL times out. Warmup only pre-JITs kernels,
-+            # so skipping these steps costs a slower first decode rather than
-+            # correctness. Prefill warmup above still runs.
-+            logger.warning(
-+                "Skipping V2 decode warmup: it deadlocks with speculative "
-+                "decoding under pipeline parallelism. Decode kernels will "
-+                "compile on the first request instead."
-+            )
-+        else:
-+            for step_indices, step_spec_flags in decode_steps:
-+                _run_decode_step(step_indices, step_spec_flags)
- 
-     # Clean up - process finish_req_ids.
-     cleanup_output = SchedulerOutput.make_empty()
