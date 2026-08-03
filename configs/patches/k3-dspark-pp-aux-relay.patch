@@ -206,6 +206,80 @@ index cea735c0e8..138ed766e6 100644
                      )
  
          # Draft tokens propagation - for spec-dec + struct outputs.
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe4..8059803c14 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -65,6 +65,16 @@ class PPHandler:
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        # Both stages decide independently whether to join the sampled-token
++        # broadcast, from compute_need_sampled_mask over their own
++        # num_computed_tokens. Without spec decoding every step advances
++        # exactly one token, so the non-last rank's optimistic update always
++        # matches and the two agree. Under spec decoding rejections make that
++        # update provisional, the masks can disagree, and one rank enters the
++        # collective alone — the ranks then hang until NCCL times out. Keep the
++        # collective unconditional in that case; the cost is one small
++        # broadcast per step on the rare steps that need nothing.
++        self.always_broadcast = num_speculative_steps > 0
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -123,13 +133,40 @@ class PPHandler:
+             idx_mapping=idx_mapping,
+         )
+ 
++    def _recv_and_discard(self, num_reqs: int) -> None:
++        """Join the broadcast without keeping the result.
++
++        Shapes match `broadcast` so the collective stays symmetric even when
++        this rank has nothing to postprocess.
++        """
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            sampled_tokens = torch.empty(
++                num_reqs,
++                self.max_sample_len,
++                dtype=torch.int64,
++                device=self.device,
++            )
++            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
++            torch.distributed.broadcast(
++                sampled_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            torch.distributed.broadcast(
++                combined, src=self.last_rank, group=self.broadcast_group
++            )
++
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+         assert not self.is_last_rank
+         need_sampled_mask = compute_need_sampled_mask(input_batch)
+         if need_sampled_mask is None:
+-            # Leave this step's reserved slot as None.
++            if not self.always_broadcast:
++                # Leave this step's reserved slot as None.
++                return False
++            # Under spec decoding the two stages can disagree on this mask, so
++            # take part anyway and discard; see `always_broadcast`.
++            self._recv_and_discard(input_batch.num_reqs)
+             return False
+ 
+         # Snapshot the per-slot generation counter so a later free of any of
+@@ -175,8 +212,8 @@ class PPHandler:
+         input_batch: InputBatch,
+     ) -> None:
+         assert self.is_last_rank
+-        if compute_need_sampled_mask(input_batch) is None:
+-            # No request needs sampled outputs for a subsequent decode step.
++        if not self.always_broadcast and compute_need_sampled_mask(input_batch) is None:
++            # No request needs sampled outputs for a subsequent step.
+             return
+ 
+         assert sampled_token_ids.dtype == torch.int64
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 index 13c7644315..d85435f59a 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
