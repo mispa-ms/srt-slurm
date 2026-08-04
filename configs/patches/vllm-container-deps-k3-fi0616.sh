@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kimi-K3 HF cache shim plus a FlashInfer upgrade to 0.6.16.post1.
+# Kimi-K3 HF cache shim plus a FlashInfer upgrade to 0.6.16rc5.
 # =============================================================================
 # WHY: vLLM main refuses the TRT-LLM MXFP4 MoE path for this model --
 #
@@ -29,11 +29,15 @@
 # trtllm-gen MoE kernels live in the cubin package, so upgrading flashinfer-python alone would
 # not bring the SITU kernel.
 #
+# rc5 rather than 0.6.16 / 0.6.16.post1 on purpose: it is what the K3 DISAGG stack on this
+# branch already runs, and it is the first release carrying the MegaMoE kernels. Keeping the
+# two tracks on one FlashInfer means an AGG number and a DISAGG number stay comparable.
+#
 # ~2.5 GB of wheels. Comparable to the 421 MB nsys package the sibling script already pulls.
 # =============================================================================
 set -euo pipefail
 
-FI_VERSION="0.6.16.post1"
+FI_VERSION="0.6.16rc5"
 FI_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FI_VERSION}"
 
 echo "=== k3-flashinfer: upgrading FlashInfer to ${FI_VERSION} ==="
