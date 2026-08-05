@@ -66,6 +66,32 @@
 # That masking is load-bearing. It is why the earlier revision of 60b327588
 # could drop its "no full-CUDA-graph support under DCP" guard, so a broken mask
 # means the guard is gone and nothing replaced it.
+#
+# k3-dcp-offload-hybrid-fix.patch is also ours, and it is what pipeline 61277279
+# hit next, 26 minutes in:
+#
+#   AssertionError: num_external_tokens=9216 not aligned to group 0
+#                   block_size=6144            (simple_kv_offload/manager.py)
+#
+# 6144 is 1536 x DCP4 and 9216 is 1536 x 6, so the CPU tier returned a hit at
+# hash granularity. Two separate defects meet there, neither owned by the PRs:
+#
+#   1. #50493 turns on partial hash hits under DCP, including for the CPU
+#      offload tier's own coordinator, but it only touches block_pool.py,
+#      kv_cache_coordinator.py and kv_cache_manager.py.
+#      simple_kv_offload/manager.py still documents and asserts that
+#      num_external_tokens is scheduler-block aligned. We re-align at the
+#      producer, get_num_new_matched_tokens, restoring the stated contract.
+#
+#   2. The manager scaled *every* group's block by cp_world_size. Core does not:
+#      HybridKVCacheCoordinator.find_longest_cache_hit passes dcp_world_size
+#      only for FullAttentionSpec and 1 otherwise, and
+#      resolve_kv_cache_block_sizes says so outright -- "Mamba groups keep their
+#      full per-rank state and are not scaled". On K3 (24 MLA + 69 KDA layers)
+#      that made the manager take a quarter of the KDA blocks it should, which
+#      is a silent wrong-KV bug, not a crash. It is invisible at dcp=1 because
+#      the multiplier is 1. The fix routes all four sites through one helper
+#      that mirrors core, and is a no-op for every dcp=1 run.
 
 set -euo pipefail
 
@@ -82,13 +108,15 @@ else
     patch -p1 --forward -d "$SITE" < "$PATCH_FILE"
 fi
 
-echo "=== DCP cudagraph padding fix (ours, on top of the PRs) ==="
-FIX_FILE=/configs/patches/k3-dcp-cudagraph-pad-fix.patch
-if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX_FILE" >/dev/null 2>&1; then
-    echo "cudagraph padding fix already applied"
-else
-    patch -p1 --forward -d "$SITE" < "$FIX_FILE"
-fi
+for fix in k3-dcp-cudagraph-pad-fix k3-dcp-offload-hybrid-fix; do
+    echo "=== ${fix} (ours, on top of the PRs) ==="
+    FIX_FILE="/configs/patches/${fix}.patch"
+    if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX_FILE" >/dev/null 2>&1; then
+        echo "${fix} already applied"
+    else
+        patch -p1 --forward -d "$SITE" < "$FIX_FILE"
+    fi
+done
 
 python3 -c "
 import pathlib
@@ -106,6 +134,9 @@ present = [
     ('v1/core/kv_cache_coordinator.py', 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size'),
     # ours, not upstream: without it a padded decode batch kills EngineCore
     ('v1/attention/ops/common.py', 'padding = lse.shape[0] - query_start_loc[-1]'),
+    # ours, not upstream: hybrid + DCP + CPU offload
+    ('v1/simple_kv_offload/manager.py', 'def _group_block_size'),
+    ('v1/simple_kv_offload/manager.py', 'hit_length = hit_length // self.block_size'),
 ]
 for rel, marker in present:
     src = (root / rel).read_text()
