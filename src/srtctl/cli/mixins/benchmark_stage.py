@@ -473,10 +473,14 @@ class BenchmarkStageMixin:
         if runner.name == "SA-Bench":
             env.update(self._get_sa_bench_slow_down_env())
 
-        # Add AIPerf-specific env vars for AIPerf-driven benchmarks only
-        if isinstance(runner, AIPerfBenchmarkRunner):
+        # AIPerf-driven runners get the metrics endpoints directly. Custom
+        # commands commonly wrap AIPerf without inheriting from its base class --
+        # SemiAnalysis's agentic_srt.sh is one -- and would otherwise see only the
+        # public frontend, whose /metrics carries router and frontend series but
+        # nothing from the engines themselves.
+        if isinstance(runner, AIPerfBenchmarkRunner) or self.config.benchmark.type == "custom":
             env.update(self._get_aiperf_server_metrics_env())
-            if self.config.benchmark.aiperf_package:
-                env["AIPERF_PACKAGE"] = self.config.benchmark.aiperf_package
+        if isinstance(runner, AIPerfBenchmarkRunner) and self.config.benchmark.aiperf_package:
+            env["AIPERF_PACKAGE"] = self.config.benchmark.aiperf_package
 
         return env

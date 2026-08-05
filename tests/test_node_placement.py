@@ -128,7 +128,9 @@ def test_frontend_default_head_does_not_touch_processes():
 
 
 def test_frontend_orchestrator_on_first_decode():
-    orch = SweepOrchestrator(config=_config(orchestrator_placement="first_decode"), runtime=_runtime(["p0", "g0", "g1"]))
+    orch = SweepOrchestrator(
+        config=_config(orchestrator_placement="first_decode"), runtime=_runtime(["p0", "g0", "g1"])
+    )
     with patch.object(type(orch), "backend_processes", new_callable=PropertyMock, return_value=_PROCS):
         topo = orch._compute_frontend_topology()
     assert topo.frontend_nodes == ["g0"]
@@ -160,3 +162,41 @@ def test_benchmark_env_injects_frontend_host():
         env = orch._get_benchmark_env(runner)
     assert env["SRT_FRONTEND_HOST"] == "ip-g0"
     assert env["SRT_FRONTEND_PORT"] == "8000"
+
+
+def test_benchmark_env_injects_server_metrics_urls_for_custom_command():
+    """A custom command is not an AIPerfBenchmarkRunner but still drives AIPerf.
+
+    Without this the client only ever scrapes the public frontend, whose
+    /metrics carries frontend and router series but nothing from the engines.
+    """
+    from unittest.mock import MagicMock
+
+    procs = [
+        _proc("p0", "prefill", 0),
+        _proc("g0", "decode", 1),
+        _proc("g1", "decode", 2),
+    ]
+    procs = [
+        Process(
+            node=p.node,
+            gpu_indices=p.gpu_indices,
+            sys_port=7500 + i,
+            http_port=p.http_port,
+            endpoint_mode=p.endpoint_mode,
+            endpoint_index=p.endpoint_index,
+            node_rank=p.node_rank,
+        )
+        for i, p in enumerate(procs)
+    ]
+    orch = SweepOrchestrator(config=_config(), runtime=_runtime(["p0", "g0", "g1"]))
+    runner = MagicMock()  # not an AIPerfBenchmarkRunner
+    runner.name = "custom"
+    with (
+        patch.object(type(orch), "backend_processes", new_callable=PropertyMock, return_value=procs),
+        patch("srtctl.cli.mixins.benchmark_stage.get_hostname_ip", side_effect=lambda n, *a, **k: f"ip-{n}"),
+    ):
+        env = orch._get_benchmark_env(runner)
+    assert env["AIPERF_SERVER_METRICS_URLS"] == (
+        "http://ip-g0:7501/metrics,http://ip-g1:7502/metrics,http://ip-p0:7500/metrics"
+    )
