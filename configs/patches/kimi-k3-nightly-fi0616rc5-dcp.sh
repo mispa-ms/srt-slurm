@@ -49,11 +49,23 @@
 #   "Known gaps: plain-fp8-cache DCP all-gather and CUDA-graph e2e are
 #    runtime-validation follow-ups"
 #
-# Both describe this arm: kv-cache-dtype is plain fp8, and cudagraph_mode stays
-# FULL_AND_PIECEWISE. His validation was GB200 sm100 at TP16/DCP4 and
-# TP8/DP2/EP16/DCP8; this is B300 at TP8/DCP4. A cudagraph replay fault here
-# shows up as wrong text, not as a crash, so compare generated output against a
-# -cur-tp8base- run before reading any timing from this.
+# The plain-fp8 one held: the server came up and served for 15 minutes on B300
+# at TP8/DCP4 with kv-cache-dtype fp8 (pipeline 61257869).
+#
+# The CUDA-graph one did not, and k3-dcp-cudagraph-pad-fix.patch below is ours.
+# mask_dcp_empty_shards_ sizes repeat_interleave with output_size=lse.shape[0]
+# while the repeats come from query_start_loc. A full CUDA graph replays at a
+# captured batch size, so a 3-decode step runs on the size-4 graph and lse has
+# a padding row query_start_loc does not account for. repeat_interleave then
+# fires a device-side assert -- "output_size argument (4) must be the same as
+# the sum of the elements in the repeats tensor (3)" -- and EngineCore dies.
+# The fix carries the padding as one trailing masked segment, which is also the
+# right semantics: those rows hold no query and must not reach the DCP combine.
+# When there is no padding the emitted mask is identical to before.
+#
+# That masking is load-bearing. It is why the earlier revision of 60b327588
+# could drop its "no full-CUDA-graph support under DCP" guard, so a broken mask
+# means the guard is gone and nothing replaced it.
 
 set -euo pipefail
 
@@ -70,22 +82,32 @@ else
     patch -p1 --forward -d "$SITE" < "$PATCH_FILE"
 fi
 
+echo "=== DCP cudagraph padding fix (ours, on top of the PRs) ==="
+FIX_FILE=/configs/patches/k3-dcp-cudagraph-pad-fix.patch
+if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX_FILE" >/dev/null 2>&1; then
+    echo "cudagraph padding fix already applied"
+else
+    patch -p1 --forward -d "$SITE" < "$FIX_FILE"
+fi
+
 python3 -c "
 import pathlib
 import vllm
 
 root = pathlib.Path(vllm.__file__).parent
 
-present = {
-    'models/kimi_k3/nvidia/mla.py': 'self.dcp_manager: MLADCPManager | None = None',
-    'v1/attention/ops/dcp_utils.py': 'class MLADCPManager',
-    'v1/attention/ops/common.py': 'def mask_dcp_empty_shards_',
-    'v1/attention/ops/dcp_alltoall.py': 'mask_dcp_empty_shards_(cp_attn_lse',
-    'model_executor/layers/attention/mla_attention.py': 'align_mla_chunked_context_workspace_size',
-    'envs.py': 'VLLM_USE_DIRECT_DCP_A2A',
-    'v1/core/kv_cache_coordinator.py': 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size',
-}
-for rel, marker in present.items():
+present = [
+    ('models/kimi_k3/nvidia/mla.py', 'self.dcp_manager: MLADCPManager | None = None'),
+    ('v1/attention/ops/dcp_utils.py', 'class MLADCPManager'),
+    ('v1/attention/ops/common.py', 'def mask_dcp_empty_shards_'),
+    ('v1/attention/ops/dcp_alltoall.py', 'mask_dcp_empty_shards_(cp_attn_lse'),
+    ('model_executor/layers/attention/mla_attention.py', 'align_mla_chunked_context_workspace_size'),
+    ('envs.py', 'VLLM_USE_DIRECT_DCP_A2A'),
+    ('v1/core/kv_cache_coordinator.py', 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size'),
+    # ours, not upstream: without it a padded decode batch kills EngineCore
+    ('v1/attention/ops/common.py', 'padding = lse.shape[0] - query_start_loc[-1]'),
+]
+for rel, marker in present:
     src = (root / rel).read_text()
     assert marker in src, f'DCP patch missing in {rel}: {marker}'
 
