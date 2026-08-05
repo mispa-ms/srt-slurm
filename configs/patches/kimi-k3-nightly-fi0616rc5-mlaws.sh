@@ -1,8 +1,8 @@
 #!/bin/bash
-# kimi-k3-nightly-fi0616rc5.sh plus the MLA chunked-prefill workspace patch.
+# kimi-k3-nightly-fi0616rc5-hma.sh plus the MLA chunked-prefill workspace patch.
 #
-# One delta against the script it wraps, so an arm using this and an arm using
-# the base script differ only by wzhao18/vllm@2331dddd94 + @d4f1b6438c.
+# One delta against the script it wraps, so an arm on -hma.sh and an arm on this
+# one differ by exactly wzhao18/vllm@2331dddd94 + @d4f1b6438c.
 #
 # What the patch buys: the workspace stops scaling with max_num_seqs. Unpatched,
 # Kimi-K3's block_size of 1536 makes the "1 page per request" floor override the
@@ -14,31 +14,11 @@
 # The patch is not upstream and carries no upstream review; its correctness
 # rests on the claim that the gather kernels accept unaligned chunk starts. A
 # wrong claim shows up as wrong output, not as a crash, so compare generated
-# text against a base-script run before reading any timing from this.
+# text against a -hma.sh run before reading any timing from this.
 
 set -euo pipefail
 
-bash /configs/patches/kimi-k3-nightly-fi0616rc5.sh
-
-# The base script applies the hybrid-KV recompute patch behind a `|| echo NOTE`,
-# so a missing file reads as a note rather than a failure. Pipeline 61123650 lost
-# four B300 jobs to exactly that: the patch file was absent from this branch, the
-# note scrolled past, and the engine died 11 minutes into the benchmark with
-# `ValueError: too many values to unpack (expected 1)` at
-# scheduler.py:_update_requests_with_invalid_blocks. Mooncake makes external KV
-# loads fail occasionally, which is what reaches that path; the SimpleCPUOffload
-# arms never did. Assert it here instead of trusting the note.
-echo "=== hybrid-KV recompute patch ==="
-python3 /configs/patches/patch_kimi_k3_mooncake_hma_recompute.py
-python3 -c "
-import vllm, pathlib
-p = pathlib.Path(vllm.__file__).parent / 'v1/core/sched/scheduler.py'
-src = p.read_text()
-assert 'req_hybrid_block_ids = {' in src, 'hybrid-KV recompute patch not present'
-assert '(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)' not in src, \
-    'the single-group unpack that crashes hybrid models is still there'
-print('hybrid-KV recompute patch verified in', p)
-"
+bash /configs/patches/kimi-k3-nightly-fi0616rc5-hma.sh
 
 echo "=== MLA chunked-prefill workspace patch ==="
 python3 - <<'PY'
