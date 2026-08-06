@@ -95,7 +95,12 @@
 
 set -euo pipefail
 
-bash /configs/patches/kimi-k3-nightly-fi0616rc5.sh
+# Which stack the DCP patches land on. Default is the plain rc5 script, which is
+# what the -cur- ladder uses. The weiport wrapper points this at -hma.sh so its
+# arms keep the hybrid-KV recompute patch they were measured with.
+DCP_BASE_SCRIPT="${DCP_BASE_SCRIPT:-/configs/patches/kimi-k3-nightly-fi0616rc5.sh}"
+echo "=== DCP base stack: ${DCP_BASE_SCRIPT} ==="
+bash "$DCP_BASE_SCRIPT"
 
 echo "=== Kimi-K3 DCP patch (vllm#50484 @5dfad640d + #50493 @9f409e3e2) ==="
 PATCH_FILE=/configs/patches/k3-dcp-pr50484-50493.patch
