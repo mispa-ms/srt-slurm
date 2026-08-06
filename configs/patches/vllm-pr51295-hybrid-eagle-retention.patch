@@ -1,0 +1,1263 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c8463542f..f8857c0fe3b7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -14,6 +14,8 @@
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     KVCacheBlock,
++    get_prefix_replay_checkpoint,
++    get_prompt_cache_checkpoints,
+ )
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+@@ -89,14 +91,40 @@ def __init__(
+         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+-
+-    def align_lookup_length(self, length: int) -> int:
+-        alignment = (
++        self.replay_alignment_tokens = (
+             self.hash_block_size
+             if self.enable_partial_hash_hits
+             else self.lcm_block_size
+         )
+-        return length // alignment * alignment
++        eagle_replay_candidates = (
++            self.hash_block_size
++            if self.enable_partial_hash_hits
++            and group.manager_cls.supports_fine_grained_hash_lookup
++            else group.spec.block_size
++            for group in self.attention_groups
++            if group.use_eagle and not isinstance(group.spec, MambaSpec)
++        )
++        self.eagle_replay_tokens = (
++            max(eagle_replay_candidates, default=0) if self.use_eagle else 0
++        )
++
++    def get_max_cache_hit_length(self, num_tokens: int) -> int:
++        """Return the external lookup limit used by the local coordinator."""
++        return get_prefix_replay_checkpoint(num_tokens, self.replay_alignment_tokens, 1)
++
++    def get_proof_query_length(self, token_len: int, num_hashes: int) -> int:
++        """Tokens the store must be probed over in order to prove ``token_len``.
++
++        EAGLE reuse at a boundary requires matching one alignment unit past it,
++        so the probe covers that extra unit even though the hit stays capped at
++        ``token_len``.
++        """
++        if not self.eagle_replay_tokens:
++            return token_len
++        return min(
++            token_len + self.replay_alignment_tokens,
++            num_hashes * self.hash_block_size,
++        )
+ 
+     def _verify_and_split_kv_cache_groups(self) -> None:
+         """Mirrors KVCacheCoordinator.verify_and_split_kv_cache_groups but
+@@ -126,34 +154,20 @@ def _verify_and_split_kv_cache_groups(self) -> None:
+         if self.use_eagle and not any(g.use_eagle for g in attention_groups):
+             attention_groups = [g._replace(use_eagle=True) for g in attention_groups]
+         self.attention_groups = attention_groups
+-        # Per-group eagle bits. SpecGroup carries use_eagle for the whole
+-        # merged spec group, so the per-group store/lookup masks agree with
+-        # the merged-group hit check, which applies the eagle drop to every
+-        # group sharing the spec.
+-        self.eagle_group_ids = {
+-            gid for g in attention_groups if g.use_eagle for gid in g.group_ids
+-        }
+ 
+     def find_longest_cache_hit(
+         self,
+         block_hashes: Sequence[BlockHash],
+         max_length: int,
+         cached_block_pool: ExternalCachedBlockPool,
+-        *,
+-        apply_eagle: bool = True,
+     ) -> tuple[tuple[list[bool], ...], int]:
+         """Returns ``(load_mask_per_group, hit_length)``. ``mask[g][i]`` is True iff
+         group ``g`` populates chunk ``i`` locally (e.g. SWA and Mamba tail-only);
+         recv-side callers skip False slots.
+ 
+-        ``apply_eagle`` controls whether the per-spec ``use_eagle`` last-block
+-        pop is applied. Lookup callers want it (the drafter requires recomputing
+-        the last block); per-chunk mask callers must not, because ``token_len``
+-        already reflects the eagle-pruned hit length and a second pop would
+-        leave the trailing block unloaded.
+         """
+         blocks_per_group, hit_length = self._find_hit_blocks(
+-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
++            block_hashes, max_length, cached_block_pool
+         )
+         masks = tuple(
+             [blk is not cached_block_pool.null_block for blk in blocks]
+@@ -170,17 +184,10 @@ def load_mask(
+         spec would populate chunk ``i`` locally at length ``token_len``
+         (e.g. SWA / Mamba tail-only).
+         """
+-        # ``apply_eagle=False`` because ``token_len`` is already the
+-        # eagle-pruned hit length returned by ``client.lookup``. Re-applying
+-        # the pop here would shorten the mask by one extra block; the recv
+-        # thread would then silently skip the trailing chunk yielded by
+-        # ``db.process_tokens`` and leave that block uninitialized in the
+-        # local KV pool.
+         masks, _ = self.find_longest_cache_hit(
+             block_hashes,
+             token_len,
+             ExternalCachedBlockPool(self.hash_block_size),
+-            apply_eagle=False,
+         )
+         return masks
+ 
+@@ -247,16 +254,20 @@ def _reachable_masks(
+             start_chunk = min(end_chunk, max(0, cdiv(start_token, spec.block_size)))
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             assert manager_cls is not None
+-            use_eagle = g_idx in self.eagle_group_ids
+             reachable_boundaries = (
+-                () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
++                ()
++                if num_prompt_tokens is None
++                else get_prompt_cache_checkpoints(
++                    num_prompt_tokens,
++                    self.replay_alignment_tokens,
++                    self.eagle_replay_tokens,
++                )
+             )
+             mask = manager_cls.reachable_block_mask(
+                 start_block=start_chunk,
+                 end_block=end_chunk,
+                 alignment_tokens=self.lcm_block_size,
+                 kv_cache_spec=spec,
+-                use_eagle=use_eagle,
+                 retention_interval=retention_interval,
+                 reachable_boundaries=reachable_boundaries,
+             )
+@@ -272,35 +283,70 @@ def block_hashes_for_spec(
+             block_hashes, self.hash_block_size, spec.block_size
+         )
+ 
++    def _eagle_proof_ceiling(
++        self,
++        block_hashes: Sequence[BlockHash],
++        max_length: int,
++        alignment_tokens: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> int:
++        """Mirrors KVCacheCoordinator._eagle_proof_ceiling.
++
++        Draft KV at a matched boundary is produced from the token just past it,
++        which the match does not prove, so reuse stays one alignment unit below
++        each EAGLE group's match.
++        """
++        if not self.eagle_replay_tokens:
++            return max_length
++        proof_length = min(
++            max_length + alignment_tokens,
++            len(block_hashes) * self.hash_block_size,
++        )
++        ceiling = max_length
++        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
++            if not use_eagle or isinstance(spec, MambaSpec):
++                continue
++            _blocks, matched = manager_cls.find_longest_cache_hit(
++                block_hashes=block_hashes,  # type: ignore[arg-type]
++                max_length=proof_length,
++                kv_cache_group_ids=group_ids,
++                block_pool=cast(BlockPool, cached_block_pool),
++                kv_cache_spec=spec,
++                alignment_tokens=alignment_tokens,
++            )
++            ceiling = min(
++                ceiling, get_prefix_replay_checkpoint(matched, alignment_tokens, 1)
++            )
++        return ceiling
++
+     def _find_hit_blocks(
+         self,
+         block_hashes: Sequence[BlockHash],
+         max_length: int,
+         cached_block_pool: ExternalCachedBlockPool,
+-        *,
+-        apply_eagle: bool = True,
+     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+         """Mirrors HybridKVCacheCoordinator.find_longest_cache_hit but
+         dispatches via spec_manager_map (we don't allocate managers).
+-
+-        When ``apply_eagle`` is False, ignore each group's ``use_eagle`` —
+-        used by ``load_mask`` to avoid popping a second block on top of the
+-        one already removed by the lookup.
+         """
+         alignment_tokens = (
+             self.hash_block_size
+             if self.enable_partial_hash_hits
+             else self.lcm_block_size
+         )
++        max_length = min(
++            max_length,
++            self._eagle_proof_ceiling(
++                block_hashes, max_length, alignment_tokens, cached_block_pool
++            ),
++        )
+         if len(self.attention_groups) == 1:
+-            spec, group_ids, manager_cls, group_eagle = self.attention_groups[0]
++            spec, group_ids, manager_cls, _ = self.attention_groups[0]
+             hit_blocks, hit_length = manager_cls.find_longest_cache_hit(
+                 block_hashes=block_hashes,  # type: ignore[arg-type]
+                 max_length=max_length,
+                 kv_cache_group_ids=group_ids,
+                 block_pool=cast(BlockPool, cached_block_pool),
+                 kv_cache_spec=spec,
+-                drop_eagle_block=apply_eagle and group_eagle,
+                 alignment_tokens=alignment_tokens,
+             )
+             num_groups = len(self.kv_cache_groups)
+@@ -317,14 +363,10 @@ def _find_hit_blocks(
+         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
+             self.attention_groups[0].spec, FullAttentionSpec
+         )
+-        eagle_verified: set[int] = set()
+-
+         while True:
+             curr_hit_length = hit_length
+ 
+-            for idx, (spec, group_ids, manager_cls, group_eagle) in enumerate(
+-                self.attention_groups
+-            ):
++            for spec, group_ids, manager_cls, _ in self.attention_groups:
+                 first_group_id = group_ids[0]
+                 cached = hit_blocks_by_group[first_group_id]
+                 if isinstance(spec, FullAttentionSpec) and cached is not None:
+@@ -333,35 +375,14 @@ def _find_hit_blocks(
+                     )
+                     continue
+ 
+-                drop_eagle_block = (
+-                    apply_eagle and group_eagle and idx not in eagle_verified
+-                )
+-                _max_length = curr_hit_length
+-                # No eagle peek margin for a recurrent (Mamba) group: its finder
+-                # never drops a block, so a widened bound would match past the
+-                # attention-verified hit and resume from speculative state (#43559).
+-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+-                    eagle_margin = (
+-                        self.hash_block_size
+-                        if self.enable_partial_hash_hits
+-                        and manager_cls.supports_fine_grained_hash_lookup
+-                        and spec.block_size > self.hash_block_size
+-                        else spec.block_size
+-                    )
+-                    _max_length = min(curr_hit_length + eagle_margin, max_length)
+                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                     block_hashes=block_hashes,  # type: ignore[arg-type]
+-                    max_length=_max_length,
++                    max_length=curr_hit_length,
+                     kv_cache_group_ids=group_ids,
+                     block_pool=cast(BlockPool, cached_block_pool),
+                     kv_cache_spec=spec,
+-                    drop_eagle_block=drop_eagle_block,
+                     alignment_tokens=alignment_tokens,
+                 )
+-                if drop_eagle_block:
+-                    eagle_verified.add(idx)
+-                elif _new_hit_length < curr_hit_length:
+-                    eagle_verified.clear()
+                 curr_hit_length = _new_hit_length
+                 for gid, blocks in zip(group_ids, hit_blocks, strict=True):
+                     hit_blocks_by_group[gid] = blocks
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index c62eaefc3543..b64d0977b86d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -1677,28 +1677,30 @@ def _get_and_clear_finished_sending(
+     def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+         """Check how many prefix tokens exist in the store.
+ 
+-        Checks across all rank-specific key namespaces that may be loaded. A
+-        hit covering all ``num_tokens`` is re-derived below the request end so
+-        the last token is recomputed for sampling.
++        Checks across all rank-specific key namespaces that may be loaded,
++        bounded by the prompt's globally selected replay checkpoint.
+         """
+         if self._capacity_only:
+             return 0
+ 
+-        token_len = self.coord.align_lookup_length(num_tokens)
++        token_len = self.coord.get_max_cache_hit_length(num_tokens)
+         if not block_hashes or token_len <= 0:
+             return 0
++        # Probe one unit past the cap so the EAGLE proof boundary is visible;
++        # the returned hit is still capped at ``token_len``.
++        query_len = self.coord.get_proof_query_length(token_len, len(block_hashes))
+ 
+         # Build per-(group, hash) candidate keys expanded across rank namespaces.
+         # candidate_meta stores the (group, hash_bytes) for key slice.
+         candidate_keys: list[str] = []
+         candidate_meta: list[tuple[int, bytes]] = []
+         fine_grained = self.coord.enable_partial_hash_hits
+-        lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
++        lookup_masks = None if fine_grained else self.coord.lookup_mask(query_len)
+         for g_idx, db in enumerate(self.token_dbs):
+             spec_block_size = db.block_size
+             key_prefixes = self._lookup_key_prefixes[g_idx]
+             if fine_grained:
+-                max_units = min(len(block_hashes), token_len // self.hash_block_size)
++                max_units = min(len(block_hashes), query_len // self.hash_block_size)
+                 unit_ids: range | list[int] = range(max_units)
+                 group_hashes: Sequence[BlockHash] = block_hashes
+             else:
+@@ -1706,7 +1708,7 @@ def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+                 group_hashes = self.coord.block_hashes_for_spec(
+                     block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+                 )
+-                max_chunks = min(len(group_hashes), cdiv(token_len, spec_block_size))
++                max_chunks = min(len(group_hashes), cdiv(query_len, spec_block_size))
+                 mask_limit = (
+                     max_chunks
+                     if lookup_mask is None
+@@ -1768,15 +1770,6 @@ def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+             token_len,
+             cached_block_pool,
+         )
+-        if hit_length >= num_tokens:
+-            usable_length = self.coord.align_lookup_length(num_tokens - 1)
+-            if usable_length <= 0:
+-                return 0
+-            _masks, hit_length = self.coord.find_longest_cache_hit(
+-                block_hashes,
+-                usable_length,
+-                cached_block_pool,
+-            )
+         return hit_length
+ 
+     def get_kv_events(self) -> list[BlockStored]:
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 70cd267506d6..2df3b12f2647 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -11,6 +11,7 @@
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     KVCacheBlock,
++    get_prefix_replay_checkpoint,
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
+@@ -86,6 +87,21 @@ def __init__(
+             for g in kv_cache_config.kv_cache_groups
+         )
+         self.scheduler_block_size = scheduler_block_size
++        self.hash_block_size = hash_block_size
++        self.use_eagle = use_eagle
++        self.enable_partial_hash_hits = False
++        # The model-level replay grid: the granularity at which every group can
++        # both materialize and look up state, so a cache hit here lets all of
++        # them resume at the same position. Subclasses narrow it once the
++        # groups are known (fine-grained hash units, DCP-scaled blocks, ...).
++        self.replay_alignment_tokens = scheduler_block_size
++        # Prompt suffix EAGLE/MTP must re-execute after a checkpoint to produce
++        # the drafter's hidden states; 0 when the model has no such group, in
++        # which case only the final token is recomputed (for logits). Bounds
++        # lookup in ``get_max_cache_hit_length`` and picks the second retained
++        # checkpoint in ``get_prompt_cache_checkpoints`` -- both must agree, or
++        # a group retains state at a position lookup can never ask for.
++        self.eagle_replay_tokens = 0
+ 
+         self.block_pool = BlockPool(
+             num_gpu_blocks=kv_cache_config.num_blocks,
+@@ -119,6 +135,9 @@ def __init__(
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
+ 
++        for manager in self.single_type_managers:
++            manager.replay_alignment_tokens = self.replay_alignment_tokens
++
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+         # 0 = keep only the latest replay boundary; None = dense;
+@@ -127,6 +146,17 @@ def __init__(
+             self.retention_interval, self.scheduler_block_size, kv_cache_config
+         )
+ 
++    def get_max_cache_hit_length(self, num_tokens: int) -> int:
++        """Return the latest checkpoint this request can resume execution from.
++
++        The final token must always execute: it produces the sampling logits,
++        and under EAGLE the target hidden state the drafter proposes from.
++
++        This bounds the request by its own length only. EAGLE's second bound
++        depends on what is cached and is applied in ``find_longest_cache_hit``.
++        """
++        return get_prefix_replay_checkpoint(num_tokens, self.replay_alignment_tokens, 1)
++
+     def get_num_blocks_to_allocate(
+         self,
+         request_id: str,
+@@ -480,25 +510,48 @@ def __init__(
+         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+             "UnitaryKVCacheCoordinator assumes only one kv cache group"
+         )
+-        # Single group; useless but just set ``use_eagle`` for consistency regardless.
+-        self.single_type_managers[0].use_eagle = 0 in self.eagle_group_ids
++        self.replay_alignment_tokens = self.block_size
++        # A mamba-only model needs no eagle replay suffix: draft models have no
++        # recurrent layers, so no state has to be recomputed for the drafter.
++        if self.use_eagle and not isinstance(self.kv_cache_spec, MambaSpec):
++            self.eagle_replay_tokens = self.block_size
++        self.single_type_managers[
++            0
++        ].replay_alignment_tokens = self.replay_alignment_tokens
++        self.single_type_managers[0].eagle_replay_tokens = self.eagle_replay_tokens
+ 
+     def find_longest_cache_hit(
+         self,
+         block_hashes: list[BlockHash],
+         max_cache_hit_length: int,
+     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
++        # Draft KV at a matched boundary is produced from the token just past
++        # it, which the match does not prove. Match one unit further than we
++        # may return, then resume at the last proven position.
++        proof_length = max_cache_hit_length
++        if self.eagle_replay_tokens:
++            proof_length = min(
++                proof_length + self.block_size,
++                len(block_hashes) * self.block_pool.hash_block_size,
++            )
+         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
+             block_hashes=block_hashes,
+-            max_length=max_cache_hit_length,
++            max_length=proof_length,
+             kv_cache_group_ids=[0],
+             block_pool=self.block_pool,
+             kv_cache_spec=self.kv_cache_spec,
+-            drop_eagle_block=0 in self.eagle_group_ids,
+             alignment_tokens=self.block_size,
+             dcp_world_size=self.dcp_world_size,
+             pcp_world_size=self.pcp_world_size,
+         )
++        if self.eagle_replay_tokens:
++            hit_length = min(
++                max_cache_hit_length,
++                get_prefix_replay_checkpoint(hit_length, self.block_size, 1),
++            )
++            num_blocks = cdiv(hit_length, self.block_size)
++            for blocks in hit_blocks:
++                del blocks[num_blocks:]
+         # Single group: nothing "uncached common" -- no other group to lag it.
+         return hit_blocks, hit_length, 0
+ 
+@@ -551,11 +604,6 @@ def __init__(
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
+         )
+-        # hash_block_size: the block size used to compute block hashes.
+-        # The actual block size usually equals hash_block_size, but in cases where
+-        # different KV cache groups have different block sizes, the actual block size
+-        # can be a multiple of hash_block_size.
+-        self.hash_block_size = hash_block_size
+         self.dcp_world_size = dcp_world_size
+         group_block_sizes = [
+             manager.block_size for manager in self.single_type_managers
+@@ -586,7 +634,24 @@ def __init__(
+             and g.kv_cache_spec.block_size > hash_block_size
+             for g in kv_cache_config.kv_cache_groups
+         )
++        self.replay_alignment_tokens = self._cache_hit_alignment_tokens
+         self.verify_and_split_kv_cache_groups()
++        eagle_replay_candidates = (
++            (
++                self.hash_block_size
++                if self.enable_partial_hash_hits
++                and group.manager_cls.supports_fine_grained_hash_lookup
++                else self.single_type_managers[group.group_ids[0]].block_size
++            )
++            for group in self.attention_groups
++            if group.use_eagle and not isinstance(group.spec, MambaSpec)
++        )
++        self.eagle_replay_tokens = (
++            max(eagle_replay_candidates, default=0) if self.use_eagle else 0
++        )
++        for manager in self.single_type_managers:
++            manager.replay_alignment_tokens = self.replay_alignment_tokens
++            manager.eagle_replay_tokens = self.eagle_replay_tokens
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+@@ -643,12 +708,6 @@ def verify_and_split_kv_cache_groups(self) -> None:
+             first.group_ids[0] if isinstance(first.spec, FullAttentionSpec) else None
+         )
+ 
+-        # Propagate the eagle bit to each manager (default to ``use_eagle=False``).
+-        for group in self.attention_groups:
+-            if group.use_eagle:
+-                for gid in group.group_ids:
+-                    self.single_type_managers[gid].use_eagle = True
+-
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         if self.enable_partial_hash_hits:
+             aligned_num_computed_tokens = num_computed_tokens
+@@ -664,24 +723,74 @@ def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+                 * self.scheduler_block_size
+             )
+         for manager in self.single_type_managers:
+-            num_tokens_to_cache = aligned_num_computed_tokens
+-            # EAGLE groups match one block past each aligned boundary and drop
+-            # it, so make that lookahead block eligible to be cached.
+-            if manager.use_eagle and aligned_num_computed_tokens > 0:
+-                num_tokens_to_cache = min(
+-                    num_computed_tokens,
+-                    aligned_num_computed_tokens + manager.block_size,
+-                )
+-            # The manager already knows the fine hit granularity
+-            # (``scheduler_block_size``); retention is passed separately so it
+-            # can keep both the coarse segment tails and the fine replay
+-            # boundary (which needs the fine value).
+             manager.cache_blocks(
+                 request,
+-                num_tokens_to_cache,
++                aligned_num_computed_tokens,
+                 retention_interval=self.retention_interval,
+             )
+ 
++    def _eagle_proof_ceiling(
++        self,
++        block_hashes: list[BlockHash],
++        max_cache_hit_length: int,
++        hit_blocks_by_group: list[list[KVCacheBlock] | None],
++        hit_length_by_group: list[int],
++    ) -> tuple[int, int]:
++        """Lower the ceiling to the last position the hash chain proves.
++
++        A draft layer's KV at position ``p`` is produced from token ``p + 1``
++        (the drafter's input is token-shifted), but matching ``M`` tokens only
++        proves tokens ``[0, M)`` equal. Reuse must therefore stay one alignment
++        unit below every EAGLE group's match, or the drafter resumes on state
++        derived from another request's boundary token.
++
++        The lookup runs one unit above ``max_cache_hit_length``: proving that
++        ceiling itself requires a match strictly past it. The extra unit only
++        ever serves as proof -- the returned ceiling is still capped.
++
++        Groups matched here are recorded so the fixed-point loop below reuses
++        the result instead of looking them up a second time.
++
++        Returns:
++            The ceiling, and the longest match seen (for uncached shared-prefix
++            detection).
++        """
++        if not self.eagle_replay_tokens:
++            return max_cache_hit_length, 0
++
++        alignment = self._cache_hit_alignment_tokens
++        proof_length = min(
++            max_cache_hit_length + alignment,
++            len(block_hashes) * self.hash_block_size,
++        )
++        ceiling = max_cache_hit_length
++        longest = 0
++        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
++            # Mamba is never an EAGLE group: draft models have no recurrent
++            # layers, so nothing there depends on the boundary token.
++            if not use_eagle or isinstance(spec, MambaSpec):
++                continue
++            hit_blocks, matched = manager_cls.find_longest_cache_hit(
++                block_hashes=block_hashes,
++                max_length=proof_length,
++                kv_cache_group_ids=group_ids,
++                block_pool=self.block_pool,
++                kv_cache_spec=spec,
++                alignment_tokens=alignment,
++                dcp_world_size=(
++                    self.dcp_world_size if isinstance(spec, FullAttentionSpec) else 1
++                ),
++            )
++            longest = max(longest, min(matched, max_cache_hit_length))
++            ceiling = min(ceiling, get_prefix_replay_checkpoint(matched, alignment, 1))
++            if isinstance(spec, FullAttentionSpec):
++                # Downward-closed, so the loop can trim this result instead of
++                # repeating the lookup.
++                for group_id, blocks in zip(group_ids, hit_blocks):
++                    hit_blocks_by_group[group_id] = blocks
++                    hit_length_by_group[group_id] = matched
++        return ceiling, longest
++
+     def find_longest_cache_hit(
+         self,
+         block_hashes: list[BlockHash],
+@@ -708,32 +817,27 @@ def find_longest_cache_hit(
+         """
+ 
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+-        hit_length = max_cache_hit_length
+-        longest_hit_length = 0
+         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
+         hit_length_by_group: list[int] = [0] * num_groups
+ 
++        hit_length, longest_hit_length = self._eagle_proof_ceiling(
++            block_hashes,
++            max_cache_hit_length,
++            hit_blocks_by_group,
++            hit_length_by_group,
++        )
++
+         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
+         # Full attn is always first if it exists.
+         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
+             self.attention_groups[0].spec, FullAttentionSpec
+         )
+ 
+-        # Attention-group indices whose EAGLE drop is verified at the current
+-        # ``curr_hit_length``. Each eagle group applies the drop at most once
+-        # per candidate length (see issue #32802).
+-        eagle_verified: set[int] = set()
+-
+         while True:
+             curr_hit_length = hit_length
+ 
+-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+-                self.attention_groups
+-            ):
++            for spec, group_ids, manager_cls, _ in self.attention_groups:
+                 first_group_id = group_ids[0]
+-                # DCP/PCP shard each block's KV across ranks, so the manager's
+-                # effective block size may exceed the spec's.
+-                group_block_size = self.single_type_managers[first_group_id].block_size
+                 cached_blocks = hit_blocks_by_group[first_group_id]
+                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
+                     # Full attention is downward-closed: we only need to look
+@@ -744,32 +848,12 @@ def find_longest_cache_hit(
+                     )
+                     continue
+ 
+-                drop_eagle_block = use_eagle and idx not in eagle_verified
+-
+-                _max_length = curr_hit_length
+-                # Eagle matches one extra drop unit (one hash unit for
+-                # fine-grained managers, else one cache block) and then drops
+-                # it, landing back at the candidate length. No margin for
+-                # mamba: its finder never drops (draft models have no mamba
+-                # layers), so the hit would grow past the candidate.
+-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+-                    eagle_margin = (
+-                        self.hash_block_size
+-                        if self.enable_partial_hash_hits
+-                        and manager_cls.supports_fine_grained_hash_lookup
+-                        and group_block_size > self.hash_block_size
+-                        else group_block_size
+-                    )
+-                    _max_length = min(
+-                        curr_hit_length + eagle_margin, max_cache_hit_length
+-                    )
+                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                     block_hashes=block_hashes,
+-                    max_length=_max_length,
++                    max_length=curr_hit_length,
+                     kv_cache_group_ids=group_ids,
+                     block_pool=self.block_pool,
+                     kv_cache_spec=spec,
+-                    drop_eagle_block=drop_eagle_block,
+                     alignment_tokens=self._cache_hit_alignment_tokens,
+                     dcp_world_size=(
+                         self.dcp_world_size
+@@ -777,11 +861,6 @@ def find_longest_cache_hit(
+                         else 1
+                     ),
+                 )
+-                if drop_eagle_block:
+-                    eagle_verified.add(idx)
+-                elif _new_hit_length < curr_hit_length:
+-                    # length shrunk; invalidate previous eagle verifications
+-                    eagle_verified.clear()
+                 curr_hit_length = _new_hit_length
+                 for group_id, blocks in zip(group_ids, hit_blocks):
+                     hit_blocks_by_group[group_id] = blocks
+@@ -831,14 +910,13 @@ def find_longest_cache_hit_per_group(
+         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
+         hit_lengths: list[int] = [0] * num_groups
+ 
+-        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
++        for spec, group_ids, manager_cls, _ in self.attention_groups:
+             blocks, group_hit = manager_cls.find_longest_cache_hit(
+                 block_hashes=block_hashes,
+                 max_length=max_cache_hit_length,
+                 kv_cache_group_ids=group_ids,
+                 block_pool=self.block_pool,
+                 kv_cache_spec=spec,
+-                drop_eagle_block=use_eagle,
+                 alignment_tokens=self._cache_hit_alignment_tokens,
+             )
+             for gid, blks in zip(group_ids, blocks):
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index fcb67726a515..b61748e07db4 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -250,13 +250,9 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int
+         if not self.prefix_cache_lookup_enabled(request):
+             return self.empty_kv_cache_blocks, 0, 0
+ 
+-        # NOTE: When all tokens hit the cache, we must recompute the last token
+-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+-        # This can trigger recomputation of an entire block, rather than just
+-        # the single last token, because allocate_slots() requires
+-        # num_computed_tokens to be block-size aligned. Removing this limitation
+-        # could slightly improve performance in the future.
+-        max_cache_hit_length = request.num_tokens - 1
++        max_cache_hit_length = self.coordinator.get_max_cache_hit_length(
++            request.num_tokens
++        )
+         computed_blocks, num_new_computed_tokens, num_uncached = (
+             self.coordinator.find_longest_cache_hit(
+                 request.block_hashes, max_cache_hit_length
+@@ -328,7 +324,8 @@ def get_computed_blocks_for_connector(
+ 
+         fa_group_id = coordinator.full_attention_group_id
+         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+-            request.block_hashes, request.num_tokens - 1
++            request.block_hashes,
++            coordinator.get_max_cache_hit_length(request.num_tokens),
+         )
+         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+             # A lagging group hit deeper than full attention means its
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index fab52a355dae..be58b43c324b 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -54,6 +54,51 @@
+ ExternalBlockHash: TypeAlias = bytes | int
+ 
+ 
++def get_prefix_replay_checkpoint(
++    prefix_tokens: int,
++    alignment_tokens: int,
++    recompute_tokens: int,
++) -> int:
++    """Return the latest aligned checkpoint that leaves a replay suffix.
++
++    Args:
++        prefix_tokens: Number of prompt tokens available to support the
++            checkpoint.
++        alignment_tokens: Prefix-cache replay granularity.
++        recompute_tokens: Number of tokens that must execute after the
++            checkpoint.
++
++    Returns:
++        The latest replayable checkpoint, or zero if the suffix consumes the
++        available prefix.
++    """
++    replayable_tokens = max(prefix_tokens - recompute_tokens, 0)
++    return replayable_tokens // alignment_tokens * alignment_tokens
++
++
++def get_prompt_cache_checkpoints(
++    num_prompt_tokens: int,
++    alignment_tokens: int,
++    eagle_replay_tokens: int,
++) -> tuple[int, ...]:
++    """Return the latest and replay checkpoints produced by a prompt."""
++    latest_checkpoint = get_prefix_replay_checkpoint(
++        num_prompt_tokens,
++        alignment_tokens,
++        0,
++    )
++    replay_checkpoint = get_prefix_replay_checkpoint(
++        num_prompt_tokens,
++        alignment_tokens,
++        eagle_replay_tokens or 1,
++    )
++    return tuple(
++        checkpoint
++        for checkpoint in dict.fromkeys((latest_checkpoint, replay_checkpoint))
++        if checkpoint > 0
++    )
++
++
+ def make_block_hash_with_group_id(
+     block_hash: BlockHash, group_id: int
+ ) -> BlockHashWithGroupId:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 99a8b44041f9..e899bbea8856 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -37,7 +37,10 @@
+ )
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+-from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlock,
++    get_prompt_cache_checkpoints,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -314,13 +317,16 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
+-        # A finer prefix_match_unit is configured: a mamba partial tail entry
+-        # can only be registered by a step ending exactly at the prompt's last
+-        # hash boundary, so the split adds that stop.
++        # Fine-grained Mamba checkpoints are registered only by a step ending
++        # exactly at their replay boundary.
+         self.mamba_partial_cache_hit = (
+             self.need_mamba_block_aligned_split
+-            and self.hash_block_size < self.block_size
++            and self.kv_cache_manager.coordinator.enable_partial_hash_hits
++        )
++        self.replay_alignment_tokens = (
++            self.kv_cache_manager.coordinator.replay_alignment_tokens
+         )
++        self.eagle_replay_tokens = self.kv_cache_manager.coordinator.eagle_replay_tokens
+ 
+         # Counts of non-empty steps scheduled / processed. update_from_output
+         # is called once per scheduled step in FIFO order, so these stay in sync.
+@@ -385,12 +391,8 @@ def _mamba_block_aligned_split(
+             return num_new_tokens
+ 
+         block_size = self.cache_config.block_size
+-        # The last block-aligned position whose state can be cached. With
+-        # Eagle, FullAttn prunes the last matching block, so back off one
+-        # block to avoid a Mamba cache miss.
++        # The last block-aligned position whose state can be cached.
+         last_cache_position = request.num_tokens - request.num_tokens % block_size
+-        if self.use_eagle:
+-            last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+         # Until `last_cache_position`, prefer chunks ending on block
+@@ -406,11 +408,24 @@ def _mamba_block_aligned_split(
+                 end = aligned_end
+ 
+         next_block_boundary = (start // block_size + 1) * block_size
+-        tail_boundary = (
+-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
++        # The two checkpoints at the prompt boundary: the latest aligned
++        # position, and the one leaving the replay suffix after it. Both sit
++        # on the fine hash grid, so only chunks ending exactly there can
++        # register them.
++        prompt_boundary_checkpoints = (
++            get_prompt_cache_checkpoints(
++                request.num_prompt_tokens,
++                self.replay_alignment_tokens,
++                self.eagle_replay_tokens,
++            )
+             if self.mamba_partial_cache_hit
+-            else 0
++            else ()
+         )
++        # TODO: these stops materialize every block-boundary state, a superset
++        # of what retention keeps. Under a sparse retention interval only the
++        # interval-aligned boundaries and the block below each checkpoint are
++        # ever cached, so the rest could be dropped. Note MambaManager's mask
++        # falls back to dense when the interval is at or below the block size.
+         stops = (
+             # Resumed mid-block (fine-grained partial hash hit): re-align to
+             # the block grid before running on, so the crossed boundary's
+@@ -420,11 +435,8 @@ def _mamba_block_aligned_split(
+             else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+-            # Fine-grained hits: the prompt's partial-tail entry can only be
+-            # registered by a chunk ending exactly at its last hash boundary.
+-            tail_boundary
+-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+-            else 0,
++            # Fine-grained prompt boundary checkpoints
++            *prompt_boundary_checkpoints,
+             # Marconi shared-prefix junction, block-floored (a sub-block
+             # junction's state is not separately cacheable): cache its state
+             # so sibling requests sharing the prefix can reuse it.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f4f461..61ab8309cef6 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -13,6 +13,7 @@
+     BlockHashListWithBlockSize,
+     BlockHashWithGroupId,
+     KVCacheBlock,
++    get_prompt_cache_checkpoints,
+     resolve_block_hashes,
+ )
+ from vllm.v1.kv_cache_interface import (
+@@ -105,11 +106,8 @@ def __init__(
+         self.kv_cache_group_id = kv_cache_group_id
+         self._null_block = block_pool.null_block
+ 
+-        # Whether this group's prefix-cache hits drop the EAGLE/MTP lookahead
+-        # block. Only consulted by managers whose hit logic is sparse within an
+-        # aligned segment (SWA). Initialized lazily by the coordinator after
+-        # determining the attention groups.
+-        self.use_eagle = False
++        self.replay_alignment_tokens = scheduler_block_size
++        self.eagle_replay_tokens = 0
+ 
+         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
+         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+@@ -438,9 +436,9 @@ def cache_blocks(
+             num_tokens: The total number of tokens that need to be cached
+                 (including tokens that are already cached).
+             retention_interval: Sparse local-checkpoint granularity. ``None``
+-                keeps dense checkpointing; ``0`` keeps only the latest replay
+-                boundary; a positive multiple of ``scheduler_block_size`` keeps
+-                a tail once per that-sized segment. Only SWA acts on it.
++                keeps dense checkpointing; ``0`` keeps only prompt-relative
++                checkpoints; a positive multiple of ``scheduler_block_size``
++                also keeps one checkpoint per segment. SWA and Mamba act on it.
+         """
+         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+         num_full_blocks = num_tokens // self.block_size
+@@ -448,10 +446,13 @@ def cache_blocks(
+         if num_cached_blocks >= num_full_blocks:
+             return
+ 
+-        # Token boundaries whose reachable tail must be retained under sparse
+-        # retention: the replay boundary (``num_prompt - 1``, capped by
+-        # ``get_computed_blocks``) and any detected shared-prefix junction.
+-        reachable_boundaries = [request.num_prompt_tokens - 1]
++        reachable_boundaries = list(
++            get_prompt_cache_checkpoints(
++                request.num_prompt_tokens,
++                self.replay_alignment_tokens,
++                self.eagle_replay_tokens,
++            )
++        )
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
+@@ -460,7 +461,6 @@ def cache_blocks(
+             end_block=num_full_blocks,
+             alignment_tokens=self.scheduler_block_size,
+             kv_cache_spec=self.kv_cache_spec,
+-            use_eagle=self.use_eagle,
+             retention_interval=retention_interval,
+             reachable_boundaries=reachable_boundaries,
+         )
+@@ -483,7 +483,6 @@ def reachable_block_mask(
+         end_block: int,
+         alignment_tokens: int | None,
+         kv_cache_spec: KVCacheSpec,
+-        use_eagle: bool,
+         retention_interval: int | None = None,
+         reachable_boundaries: Sequence[int] = (),
+     ) -> list[bool] | None:
+@@ -551,7 +550,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+@@ -561,20 +559,12 @@ def find_longest_cache_hit(
+         `max_length`. The prefix should be a common prefix hit for all the
+         kv cache groups in `kv_cache_group_ids`. If no cache hit is found,
+         return an empty list.
+-        If eagle is enabled, drop the last matched block to force recompute the
+-        last block to get the required hidden states for eagle drafting head.
+-        Need to be customized for each attention type.
+-
+         Args:
+             block_hashes: The block hashes of the request.
+             max_length: The maximum length of the cache hit prefix.
+             kv_cache_group_ids: The ids of the kv cache groups.
+             block_pool: The block pool.
+             kv_cache_spec: The kv cache spec.
+-            drop_eagle_block: Whether to drop the last matched block for EAGLE/MTP.
+-                Always False for non-EAGLE/MTP groups, but can be False for EAGLE/MTP
+-                groups too if the last block is already dropped (e.g., in a
+-                convergence loop in `find_longest_cache_hit`).
+             alignment_tokens: The returned cache hit length (in tokens) should
+                 be a multiple of this value (in tokens). By default, it should
+                 be set to the block_size.
+@@ -686,7 +676,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+@@ -761,12 +750,6 @@ def find_longest_cache_hit(
+                 hit_length = (fine_idx + 1) * alignment_tokens
+                 break
+ 
+-        # Eagle needs the tokens right before the generation point recomputed:
+-        # drop one hash unit when fine-grained (the tail block's KV is
+-        # append-only, so it still covers the reduced length), else one cache
+-        # block.
+-        if drop_eagle_block and hit_length > 0:
+-            hit_length -= min(alignment_tokens, block_size)
+         # Round down to the alignment; a no-op when fine-grained (hits land on
+         # hash boundaries by construction) and when alignment_tokens ==
+         # block_size. Then trim blocks past the new tail.
+@@ -793,27 +776,24 @@ def _cache_partial_tail_block(
+         request: Request,
+         num_tokens: int,
+     ) -> None:
+-        """Cache the prompt tail when it ends inside a cache block.
+-
+-        Only the final prompt hash boundary is registered as a partial
+-        prefix-cache entry; intermediate hash boundaries inside the same cache
+-        block are intentionally skipped.
+-        """
+-        hash_block_size = self.block_pool.hash_block_size
+-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
++        """Cache a prompt checkpoint that ends inside a cache block."""
++        if num_tokens not in get_prompt_cache_checkpoints(
++            request.num_prompt_tokens,
++            self.replay_alignment_tokens,
++            self.eagle_replay_tokens,
++        ):
+             return
+-        if boundary_tokens % self.block_size == 0:
++        if num_tokens % self.block_size == 0:
+             return
+ 
+         blocks = self.req_to_blocks[request.request_id]
+-        block_idx = boundary_tokens // self.block_size
++        block_idx = num_tokens // self.block_size
+         if block_idx >= len(blocks):
+             return
+         self.block_pool.cache_partial_block(
+             request=request,
+             block=blocks[block_idx],
+-            num_tokens=boundary_tokens,
++            num_tokens=num_tokens,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
+         )
+@@ -881,17 +861,8 @@ def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
+         self.sliding_window = kv_cache_spec.sliding_window
+ 
+     @classmethod
+-    def _contiguous_blocks_for_hit(
+-        cls, window_size: int, block_size: int, use_eagle: bool
+-    ) -> int:
+-        blocks = cdiv(window_size - 1, block_size)
+-        if use_eagle:
+-            # Need to drop the last matched block if eagle is enabled. For
+-            # sliding window layer, we achieve this by increasing the number of
+-            # contiguous blocks needed for prefix cache hit by one and dropping
+-            # the last matched block.
+-            blocks += 1
+-        return blocks
++    def _contiguous_blocks_for_hit(cls, window_size: int, block_size: int) -> int:
++        return cdiv(window_size - 1, block_size)
+ 
+     @classmethod
+     def find_longest_cache_hit(
+@@ -901,7 +872,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+@@ -925,7 +895,7 @@ def find_longest_cache_hit(
+ 
+         # The number of contiguous blocks needed for a prefix cache hit.
+         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
+-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
++            kv_cache_spec.sliding_window, kv_cache_spec.block_size
+         )
+ 
+         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
+@@ -948,10 +918,12 @@ def find_longest_cache_hit(
+             ):
+                 # Skip prefix matching check if the block is not aligned with
+                 # `alignment_tokens`.
+-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
+-                    post_pop_blocks = i if drop_eagle_block else i + 1
+-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
+-                        continue
++                if (
++                    num_contiguous_blocks == 0
++                    and block_size != alignment_tokens
++                    and ((i + 1) * block_size) % alignment_tokens != 0
++                ):
++                    continue
+                 # Add the cached block to the computed blocks.
+                 for computed, cached in zip(computed_blocks, cached_block):
+                     computed[i] = cached
+@@ -977,18 +949,6 @@ def find_longest_cache_hit(
+             ):
+                 for computed in computed_blocks:
+                     computed.pop()
+-        if drop_eagle_block and computed_blocks[0]:
+-            for computed in computed_blocks:
+-                computed.pop()
+-            # Re-align after eagle pop: the pop may break the alignment
+-            # when block_size != alignment_tokens (hybrid models with
+-            # different page sizes, e.g. Gemma4).
+-            while (
+-                block_size != alignment_tokens
+-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
+-            ):
+-                for computed in computed_blocks:
+-                    computed.pop()
+         hit_length = len(computed_blocks[0]) * block_size
+         return computed_blocks, hit_length
+ 
+@@ -999,7 +959,6 @@ def reachable_block_mask(
+         end_block: int,
+         alignment_tokens: int | None,
+         kv_cache_spec: KVCacheSpec,
+-        use_eagle: bool,
+         retention_interval: int | None = None,
+         reachable_boundaries: Sequence[int] = (),
+     ) -> list[bool] | None:
+@@ -1010,16 +969,11 @@ def reachable_block_mask(
+         assert alignment_tokens % kv_cache_spec.block_size == 0
+ 
+         block_size = kv_cache_spec.block_size
+-        # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
++        # Contiguous blocks a hit needs at a replay checkpoint.
+         need = cls._contiguous_blocks_for_hit(
+             window_size=kv_cache_spec.sliding_window,
+             block_size=block_size,
+-            use_eagle=use_eagle,
+         )
+-        # The matched run's right edge sits on the aligned boundary block when
+-        # EAGLE peeks one block past it (shift=1), otherwise on the last block
+-        # before the boundary (shift=0).
+-        shift = 1 if use_eagle else 0
+ 
+         mask = [False] * (end_block - start_block)
+ 
+@@ -1038,17 +992,14 @@ def reachable_block_mask(
+                 # Every block is reachable; cache them all.
+                 return None
+             for i in range(start_block, end_block):
+-                if i >= shift and (i - shift) % per_segment >= per_segment - need:
++                if i % per_segment >= per_segment - need:
+                     mask[i - start_block] = True
+ 
+-        # (2) Reachable-boundary tails: the replay boundary (``num_prompt - 1``,
+-        # capped by ``get_computed_blocks``) and any shared-prefix junction. Both
+-        # land before segments would cover them under sparse retention, so keep
+-        # the ``need``-block tail ending on each boundary explicitly.
++        # (2) Prompt-relative and shared-prefix checkpoint windows.
+         if retention_interval is not None:
+             for boundary_tokens in reachable_boundaries:
+                 aligned = boundary_tokens // alignment_tokens * alignment_tokens
+-                end = aligned // block_size + shift
++                end = aligned // block_size
+                 for j in range(max(start_block, end - need), min(end_block, end)):
+                     mask[j - start_block] = True
+ 
+@@ -1105,7 +1056,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+@@ -1136,7 +1086,6 @@ def find_longest_cache_hit(
+             kv_cache_group_ids: The ids of the kv cache groups.
+             block_pool: The block pool.
+             kv_cache_spec: The kv cache spec.
+-            drop_eagle_block: Whether to drop the last matched block for EAGLE/MTP.
+             dcp_world_size: The world size of decode context parallelism.
+             pcp_world_size: The world size of prefill context parallelism.
+             alignment_tokens: The returned cache hit length (in tokens) should
+@@ -1149,9 +1098,6 @@ def find_longest_cache_hit(
+             "ChunkedLocalAttentionManager can only be used for "
+             "chunked local attention groups"
+         )
+-        assert drop_eagle_block is False, (
+-            "Hybrid KV cache is not supported for " + "eagle + chunked local attention."
+-        )
+         assert dcp_world_size == 1, "DCP not support chunked local attn now."
+         assert pcp_world_size == 1, "PCP not support chunked local attn now."
+         assert kv_cache_spec.block_size == alignment_tokens, (
+@@ -1284,7 +1230,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+@@ -1362,7 +1307,6 @@ def reachable_block_mask(
+         end_block: int,
+         alignment_tokens: int | None,
+         kv_cache_spec: KVCacheSpec,
+-        use_eagle: bool,
+         retention_interval: int | None = None,
+         reachable_boundaries: Sequence[int] = (),
+     ) -> list[bool] | None:
+@@ -1374,9 +1318,9 @@ def reachable_block_mask(
+           ``0``    -> keep only the ``reachable_boundaries`` states
+           ``> 0``  -> keep one state per ``retention_interval``-sized segment
+ 
+-        ``reachable_boundaries`` are proven reuse points (the replay boundary and
+-        any cross-request shared-prefix junction, Marconi-style APC); their
+-        boundary state is always kept so sparse retention does not defeat reuse.
++        ``reachable_boundaries`` are reusable prompt-relative or shared-prefix
++        checkpoints. Their state is always kept so sparse retention does not
++        defeat reuse.
+         """
+         if retention_interval is None or alignment_tokens is None:
+             # Dense caching (default) or no alignment constraint imposed.
+@@ -1401,10 +1345,8 @@ def reachable_block_mask(
+             for i in range(first_boundary - start_block, len(mask), per_segment):
+                 mask[i] = True
+ 
+-        # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
+-        # capped by ``get_computed_blocks``) and any shared-prefix junction, both
+-        # of which segments would otherwise skip under sparse retention. A Mamba
+-        # hit needs exactly the single state block ending on the boundary.
++        # (2) Prompt-relative and shared-prefix checkpoint states. A Mamba hit
++        # needs exactly the single state block ending on the boundary.
+         for boundary_tokens in reachable_boundaries:
+             aligned = boundary_tokens // alignment_tokens * alignment_tokens
+             boundary_block = aligned // block_size - 1
+@@ -1712,10 +1654,11 @@ def _cache_partial_tail_block(
+             return None
+         if num_tokens % hash_block_size != 0:
+             return None
+-        latest_prompt_hash_boundary = (
+-            request.num_prompt_tokens // hash_block_size
+-        ) * hash_block_size
+-        if num_tokens != latest_prompt_hash_boundary:
++        if num_tokens not in get_prompt_cache_checkpoints(
++            request.num_prompt_tokens,
++            self.replay_alignment_tokens,
++            self.eagle_replay_tokens,
++        ):
+             return None
+ 
+         block_idx = num_tokens // self.block_size
+@@ -1790,7 +1733,6 @@ def find_longest_cache_hit(
+         kv_cache_group_ids: list[int],
+         block_pool: BlockPool,
+         kv_cache_spec: KVCacheSpec,
+-        drop_eagle_block: bool,
+         alignment_tokens: int,
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 67c6f6646302..4a95d61ad8aa 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -256,9 +256,13 @@ def get_num_new_matched_tokens(
+ 
+         if not remaining_hashes:
+             return 0, False
+-        # Must recompute at least the last token, matching the logic in
+-        # kv_cache_manager.get_computed_blocks().
+-        max_hit_len = request.num_tokens - 1 - num_computed_tokens
++        # Bound the lookup by the same replay checkpoint the GPU coordinator
++        # uses in kv_cache_manager.get_computed_blocks(): the managers no
++        # longer shorten the hit themselves.
++        max_hit_len = (
++            self.cpu_coordinator.get_max_cache_hit_length(request.num_tokens)
++            - num_computed_tokens
++        )
+         if max_hit_len <= 0:
+             return 0, False
+         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
