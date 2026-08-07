@@ -68,6 +68,28 @@ index 2060acdf47..0aab8675d6 100644
          self.dcp_manager: MLADCPManager | None = None
          if self.dcp_world_size > 1:
              query_dtype = (
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index cc0232ec42..4bbf9f64b5 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -578,8 +578,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                     "full-attention and Mamba groups, got: "
+                     f"{type(g.kv_cache_spec).__name__}."
+                 )
+-        self.verify_and_split_kv_cache_groups()
+-
+         # TP needs hashing finer than the Mamba block. DCP accepts equality
+         # because it scales the effective full-attention block instead.
+         self.enable_partial_hash_hits = any(
+@@ -594,6 +592,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             for g in kv_cache_config.kv_cache_groups
+         )
+ 
++        self.verify_and_split_kv_cache_groups()
++
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+         # Fine-grained partial hits may return hash-block-aligned lengths;
 diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
 index 5d17868b17..e424286e10 100644
 --- a/vllm/v1/worker/gpu/block_table.py
