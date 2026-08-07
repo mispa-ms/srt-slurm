@@ -1,0 +1,149 @@
+diff --git a/vllm/models/kimi_k3/nvidia/kda.py b/vllm/models/kimi_k3/nvidia/kda.py
+index 3bc3ab5de0..d6c69adb7c 100644
+--- a/vllm/models/kimi_k3/nvidia/kda.py
++++ b/vllm/models/kimi_k3/nvidia/kda.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Callable
+ 
+ import torch
+@@ -51,6 +52,72 @@ logger = init_logger(__name__)
+ 
+ _KDA_GATE_LOGBOUND_MIN = -5.0
+ 
++# Diagnostic only, off unless VLLM_KDA_STATE_INDEX_DEBUG=1. Validates the KDA
++# state slot ids before anything indexes the state cache with them, so the
++# offending values are readable; once the device-side assert fires the CUDA
++# context is dead and nothing can be read back.
++_KDA_IDX_DEBUG = os.getenv("VLLM_KDA_STATE_INDEX_DEBUG", "0") == "1"
++# One check per step, not per layer: all 69 KDA layers share the one index
++# tensor the metadata builder produced.
++_KDA_IDX_DEBUG_LAYER: str | None = None
++_KDA_IDX_DEBUG_STEP = 0
++
++
++def _kda_debug_check_state_indices(m, idx, recurrent_state, conv_state, prefix):
++    global _KDA_IDX_DEBUG_STEP
++    _KDA_IDX_DEBUG_STEP += 1
++    step = _KDA_IDX_DEBUG_STEP
++    n_state = recurrent_state.shape[0]
++    bad = (idx < 0) | (idx >= n_state)
++    n_bad = int(bad.sum())
++
++    seq_lens = getattr(m, "dbg_seq_lens", None)
++    blk = getattr(m, "dbg_cache_block_size", None)
++    raw_w = getattr(m, "dbg_raw_block_table_width", None)
++    slots = None
++    if seq_lens is not None and blk:
++        slots = torch.clamp((seq_lens - 1) // blk, min=0)
++
++    if not n_bad:
++        # Periodic healthy sample: shows how close to the edge it normally runs.
++        if step % 500 == 1:
++            logger.info(
++                "KDA-IDX ok step=%d layer=%s n_state_blocks=%d idx_max=%d "
++                "idx_numel=%d slot_max=%s bt_width=%s cache_block=%s "
++                "prefills=%d decodes=%d spec=%d tokens=%d",
++                step, prefix, n_state, int(idx.max()) if idx.numel() else -1,
++                idx.numel(), int(slots.max()) if slots is not None else None,
++                raw_w, blk, m.num_prefills, m.num_decodes, m.num_spec_decodes,
++                m.num_actual_tokens,
++            )
++        return
++
++    pos = bad.nonzero().flatten()[:16]
++    logger.error(
++        "KDA-IDX BAD step=%d layer=%s n_bad=%d/%d n_state_blocks=%d "
++        "conv_state_blocks=%d bt_width=%s cache_block=%s "
++        "prefills=%d decodes=%d spec=%d prefill_tokens=%d decode_tokens=%d "
++        "tokens=%d bad_pos=%s bad_val=%s seq_lens_at_bad=%s slot_at_bad=%s "
++        "idx_head=%s slot_head=%s seq_lens_head=%s",
++        step, prefix, n_bad, idx.numel(), n_state, conv_state.shape[0],
++        raw_w, blk, m.num_prefills, m.num_decodes, m.num_spec_decodes,
++        m.num_prefill_tokens, m.num_decode_tokens, m.num_actual_tokens,
++        pos.tolist(), idx[pos].tolist(),
++        seq_lens[pos].tolist() if seq_lens is not None else None,
++        slots[pos].tolist() if slots is not None else None,
++        idx[:16].tolist(),
++        slots[:16].tolist() if slots is not None else None,
++        seq_lens[:16].tolist() if seq_lens is not None else None,
++    )
++    bt = getattr(m, "dbg_raw_block_table", None)
++    if bt is not None and pos.numel():
++        r = int(pos[0])
++        if r < bt.shape[0]:
++            logger.error(
++                "KDA-IDX BAD step=%d row=%d raw_block_table_row_head=%s tail=%s",
++                step, r, bt[r, :12].tolist(), bt[r, -4:].tolist(),
++            )
++
+ 
+ def a_log_weight_loader(
+     shard_axis: int,
+@@ -544,6 +611,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
+         beta = beta[:, :num_actual_tokens]
+ 
+         conv_state, recurrent_state = self.kv_cache
++
++        if _KDA_IDX_DEBUG and non_spec_state_indices_tensor is not None:
++            global _KDA_IDX_DEBUG_LAYER
++            if _KDA_IDX_DEBUG_LAYER is None:
++                _KDA_IDX_DEBUG_LAYER = self.prefix
++            if self.prefix == _KDA_IDX_DEBUG_LAYER:
++                _kda_debug_check_state_indices(
++                    m, non_spec_state_indices_tensor, recurrent_state,
++                    conv_state, self.prefix,
++                )
++
+         # The convolution kernels consume (..., dim, width - 1).
+         if not is_conv_state_dim_first():
+             conv_state = conv_state.transpose(-1, -2)
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 0bb4864d29..91e446ca2f 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -8,6 +8,7 @@ prefill KDA kernel internally, so this builder omits the shared FLA chunk
+ metadata construction.
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from functools import cache
+ 
+@@ -29,6 +30,9 @@ from vllm.v1.attention.backends.utils import (
+ )
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
++# Mirrors kda.py; see the diagnostic there.
++_KDA_IDX_DEBUG = os.getenv("VLLM_KDA_STATE_INDEX_DEBUG", "0") == "1"
++
+ 
+ @cache
+ def _metadata_launch_pdl() -> bool:
+@@ -463,7 +467,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+                 :batch_size
+             ]
+ 
+-        return KimiK3KDAMetadata(
++        md = KimiK3KDAMetadata(
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
+             num_decodes=num_decodes,
+@@ -484,6 +488,14 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
++        if _KDA_IDX_DEBUG:
++            # The kda.py check needs the inputs _get_aligned_state_indices_kernel
++            # derived the slot from; none of them survive on the metadata.
++            md.dbg_seq_lens = m.seq_lens
++            md.dbg_cache_block_size = self.kv_cache_spec.block_size
++            md.dbg_raw_block_table = m.block_table_tensor
++            md.dbg_raw_block_table_width = m.block_table_tensor.shape[1]
++        return md
+ 
+ 
+ class KimiK3KDAAttentionBackend(GDNAttentionBackend):
