@@ -1,0 +1,1846 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 3f23fb6152..c2314891cb 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -189,6 +189,9 @@ if TYPE_CHECKING:
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+     VLLM_DCP_Q_REPLICATE: bool = False
++    VLLM_USE_DIRECT_DCP_A2A: bool | None = None
++    VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
++    VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+     VLLM_DEEP_GEMM_WARMUP: Literal[
+         "skip",
+         "full",
+@@ -2048,6 +2051,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
+         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+     ),
++    # Direct DCP ops default on when applicable; set to 1 to enforce or 0 to disable.
++    "VLLM_USE_DIRECT_DCP_A2A": lambda: maybe_convert_bool(
++        os.getenv("VLLM_USE_DIRECT_DCP_A2A")
++    ),
++    "VLLM_USE_DIRECT_DCP_Q_GATHER": lambda: maybe_convert_bool(
++        os.getenv("VLLM_USE_DIRECT_DCP_Q_GATHER")
++    ),
++    "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
++        os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
++    ),
+     # Whether to enable dual cuda streams for LoRA computation
+     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
+     # overlap the base layer compute with the LoRA fast path).
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 978ee27ed7..b21f967732 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -206,6 +206,7 @@ from abc import abstractmethod
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from enum import Enum
++from math import lcm
+ from typing import ClassVar, Generic, TypeVar, cast
+ 
+ import numpy as np
+@@ -222,7 +223,6 @@ from vllm.config import (
+     ModelConfig,
+     VllmConfig,
+     get_current_vllm_config,
+-    get_current_vllm_config_or_none,
+ )
+ from vllm.config.cache import CacheDType
+ from vllm.distributed.parallel_state import (
+@@ -264,7 +264,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+ from vllm.model_executor.utils import replace_parameter
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import has_flashinfer
+-from vllm.utils.math_utils import cdiv, round_down
++from vllm.utils.math_utils import cdiv, round_down, round_up
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+     _encode_layer_name,
+@@ -292,8 +292,7 @@ from vllm.v1.attention.backends.utils import (
+     get_num_attention_heads_from_layers,
+     split_decodes_and_prefills,
+ )
+-from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
+-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
++from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+ from vllm.v1.attention.selector import get_attn_backend
+ from vllm.v1.kv_cache_interface import (
+@@ -579,12 +578,27 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+ 
+         self.use_sparse = use_sparse
+ 
+-        _vllm_config = get_current_vllm_config_or_none()
+-        self.dcp_a2a = (
+-            _vllm_config is not None
+-            and _vllm_config.parallel_config.decode_context_parallel_size > 1
+-            and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+-        )
++        self.dcp_manager: MLADCPManager | None = None
++        if self.impl.dcp_world_size > 1:
++            query_dtype = (
++                current_platform.fp8_dtype()
++                if is_quantized_kv_cache(self.kv_cache_dtype)
++                and self.kv_cache_dtype != "fp8_ds_mla"
++                and self.impl.supports_quant_query_input
++                else dtype
++            )
++            self.dcp_manager = MLADCPManager(
++                vllm_config=vllm_config,
++                device=next(kv_b_proj.parameters()).device,
++                num_heads=self.num_heads,
++                query_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
++                output_head_dim=self.kv_lora_rank,
++                query_dtype=query_dtype,
++                output_dtype=dtype,
++                padded_num_heads=self.q_pad_num_heads,
++                is_lse_base_on_e=self.impl.lse_base_on_e,
++                use_pcp=self.use_pcp,
++            )
+ 
+         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
+ 
+@@ -753,9 +767,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                 return quant_output.fill_(0)
+             return output.fill_(0)
+ 
+-        if self.impl.dcp_world_size == -1:
+-            self.impl.dcp_world_size = get_dcp_group().world_size
+-
+         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
+ 
+         num_actual_toks = attn_metadata.num_actual_tokens
+@@ -914,6 +925,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
+             if self.impl.dcp_world_size > 1:
++                assert self.dcp_manager is not None
+                 if self.use_pcp:
+                     if self.impl.dcp_world_size > self.impl.pcp_world_size:
+                         if isinstance(mqa_q, tuple):
+@@ -924,8 +936,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                         mqa_q = torch.cat(mqa_q, dim=-1)
+                     if not qrep_decode:
+-                        # mqa_q do allgather in head dim.
+-                        mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
++                        assert self.dcp_manager.query_gather is not None
++                        mqa_q = self.dcp_manager.query_gather(mqa_q)
+ 
+             # call decode attn
+             if not self.impl.is_sparse:
+@@ -935,27 +947,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             # correct dcp attn_out with lse.
+             if self.impl.dcp_world_size > 1:
+                 assert lse is not None
+-                if self.dcp_a2a:
+-                    attn_out = dcp_a2a_lse_reduce(
+-                        attn_out,
+-                        lse,
+-                        get_dcp_group(),
+-                        is_lse_base_on_e=self.impl.lse_base_on_e,
+-                    )
+-                elif self.use_pcp:
+-                    attn_out = cp_lse_ag_out_ar(
+-                        attn_out,
+-                        lse,
+-                        get_dcp_group(),
+-                        is_lse_base_on_e=self.impl.lse_base_on_e,
+-                    )
+-                else:
+-                    attn_out = cp_lse_ag_out_rs(
+-                        attn_out,
+-                        lse,
+-                        get_dcp_group(),
+-                        is_lse_base_on_e=self.impl.lse_base_on_e,
+-                    )
++                assert self.dcp_manager is not None
++                seq_lens = (
++                    attn_metadata.decode.seq_lens
++                    if attn_metadata.decode is not None
++                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
++                        : attn_metadata.num_decodes
++                    ]
++                )
++                query_start_loc = attn_metadata.query_start_loc[
++                    : attn_metadata.num_decodes + 1
++                ]
++                attn_out = self.dcp_manager.combine(
++                    attn_out,
++                    lse,
++                    seq_lens=seq_lens,
++                    query_start_loc=query_start_loc,
++                )
+                 if self.use_pcp:
+                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+ 
+@@ -1427,6 +1435,7 @@ class MLACommonPrefillMetadata:
+         chunks: "list[MLACommonPrefillMetadata.ContextChunk]"
+         context_lens_list: list[int]
+         empty_token_slices: list[slice]
++        dcp_manager: MLADCPManager | None = None
+ 
+     block_table: torch.Tensor
+     query_start_loc: torch.Tensor
+@@ -1684,6 +1693,25 @@ def _flat_int32(values: list[int] | np.ndarray) -> torch.Tensor:
+     return np_to_pinned_tensor(np.asarray(values, dtype=np.int32))
+ 
+ 
++def align_mla_chunked_context_workspace_size(
++    vllm_config: VllmConfig,
++    workspace_size: int,
++) -> int:
++    parallel_config = vllm_config.parallel_config
++    alignment = vllm_config.cache_config.block_size
++    if parallel_config.decode_context_parallel_size > 1:
++        alignment = lcm(
++            alignment,
++            parallel_config.decode_context_parallel_size
++            * parallel_config.cp_kv_cache_interleave_size,
++        )
++    workspace_size = max(
++        workspace_size,
++        vllm_config.scheduler_config.max_num_seqs * alignment,
++    )
++    return round_up(workspace_size, alignment)
++
++
+ def build_mla_chunked_context_metadata(
+     *,
+     context_lens_cpu: torch.Tensor,
+@@ -1696,6 +1724,7 @@ def build_mla_chunked_context_metadata(
+     dcp_world_size: int,
+     dcp_local_block_size: int,
+     dcp_virtual_block_size: int,
++    dcp_manager: MLADCPManager | None = None,
+ ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
+     """Build chunked-context metadata for an MLA prefill.
+ 
+@@ -1714,6 +1743,7 @@ def build_mla_chunked_context_metadata(
+         dcp_world_size: Decode-context-parallel world size (1 if disabled).
+         dcp_local_block_size: Per-rank interleave block size for DCP.
+         dcp_virtual_block_size: ``dcp_local_block_size * dcp_world_size``.
++        dcp_manager: Shared MLA DCP collective manager.
+ 
+     Returns:
+         The chunked-context metadata, or None when no prefill has any context.
+@@ -1902,6 +1932,7 @@ def build_mla_chunked_context_metadata(
+         chunks=chunks,
+         context_lens_list=context_lens,
+         empty_token_slices=empty_token_slices,
++        dcp_manager=dcp_manager,
+     )
+ 
+ 
+@@ -1954,7 +1985,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+             64 * 1024,
+         )
+ 
+-        return max(chunked_prefill_workspace_size, cache_config.block_size)
++        return align_mla_chunked_context_workspace_size(
++            vllm_config,
++            chunked_prefill_workspace_size,
++        )
+ 
+     @staticmethod
+     def determine_prefill_query_data_type(
+@@ -2033,6 +2067,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         self.q_data_type = self.determine_prefill_query_data_type(
+             vllm_config, self.model_config.dtype
+         )
++        attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
+ 
+         try:
+             self.dcp_world_size = get_dcp_group().world_size
+@@ -2050,6 +2085,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         )
+ 
+         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
++        self.dcp_manager: MLADCPManager | None = None
+         if self.dcp_world_size > 1:
+             # Note(hc): The local kvcache is incomplete when DCP is triggered,
+             # an additional kvcache allgather across the DCP group is therefore
+@@ -2067,6 +2103,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+                 else self.model_config.dtype,
+                 device=device,
+             )
++            self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
++            assert isinstance(self.dcp_manager, MLADCPManager)
++            self.dcp_manager.init_kv_gather(
++                self.chunked_prefill_workspace,
++                self.chunked_prefill_workspace_size,
++            )
+         else:
+             self.chunked_prefill_workspace = torch.empty(
+                 (
+@@ -2080,9 +2122,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         # Metadata builders are created per ubatch when DBO is enabled. MLA
+         # prefill backends keep the prepared metadata on the backend object, so
+         # each builder needs its own backend instance to avoid cross-ubatch races.
+-        self._prefill_backend = self.compilation_config.static_forward_context[
+-            layer_names[0]
+-        ].prefill_backend.clone()
++        self._prefill_backend = attention_layer.prefill_backend.clone()
+ 
+         supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
+         self._init_reorder_batch_threshold(
+@@ -2223,6 +2263,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+                 dcp_world_size=self.dcp_world_size,
+                 dcp_local_block_size=self.dcp_local_block_size,
+                 dcp_virtual_block_size=self.dcp_virtual_block_size,
++                dcp_manager=self.dcp_manager,
+             )
+ 
+             prefill_metadata = MLACommonPrefillMetadata(
+@@ -2660,9 +2701,8 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+             ]
+             assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
+             cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
+-            cur_allgather_kvcache.copy_(
+-                get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
+-            )
++            dcp_manager = cast(MLADCPManager, chunked_context.dcp_manager)
++            dcp_manager.kv_gather(cur_allgather_kvcache, local_gathered_kvcache)
+             assert (
+                 cur_allgather_kvcache.shape[-1]
+                 == self.kv_lora_rank + self.qk_rope_head_dim
+@@ -2732,8 +2772,6 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+         output_scale: torch.Tensor | None = None,
+     ) -> None:
+         assert attn_metadata.prefill is not None
+-        assert self.dcp_world_size != -1
+-
+         prefill_metadata = attn_metadata.prefill
+         assert prefill_metadata.prefill_backend is not None
+         use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
+@@ -2877,10 +2915,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
+             and (self.qk_rope_head_dim == 64)
+         )
+ 
+-        self.dcp_world_size: int = -1
+-
++        parallel_config = get_current_vllm_config().parallel_config
++        # Avoid requiring an initialized DCP group in tests.
++        self.dcp_world_size: int = parallel_config.decode_context_parallel_size
+         self.cp_kv_cache_interleave_size: int = (
+-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
++            parallel_config.cp_kv_cache_interleave_size
+         )
+ 
+     @abstractmethod
+diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+index ec3a86bbb3..132bb5f920 100644
+--- a/vllm/model_executor/layers/attention/sparse_mla_attention.py
++++ b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+@@ -20,6 +20,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
+     MLACommonMetadata,
+     MLACommonPrefillMetadata,
+     accumulate_mla_context_chunk,
++    align_mla_chunked_context_workspace_size,
+     build_mla_chunked_context_metadata,
+     get_mla_dims,
+     init_mla_context_partial,
+@@ -31,6 +32,7 @@ from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+ from vllm.v1.attention.backend import AttentionMetadata, AttentionMetadataBuilder
+ from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+ 
+ if TYPE_CHECKING:
+@@ -162,9 +164,19 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
+                 dtype=torch.int32,
+                 device=device,
+             )
+-        layer_prefill_backend = vllm_config.compilation_config.static_forward_context[
++        attention_layer = vllm_config.compilation_config.static_forward_context[
+             layer_names[0]
+-        ].prefill_backend
++        ]
++        layer_prefill_backend = attention_layer.prefill_backend
++        self.dcp_manager: MLADCPManager | None = None
++        if self.dcp_world_size > 1:
++            self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
++            assert isinstance(self.dcp_manager, MLADCPManager)
++            if layer_prefill_backend is not None:
++                self.dcp_manager.init_kv_gather(
++                    self.chunked_prefill_workspace,
++                    self.chunked_prefill_workspace_size,
++                )
+         self._prefill_backend = (
+             layer_prefill_backend.clone() if layer_prefill_backend is not None else None
+         )
+@@ -184,7 +196,13 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
+             64 * 1024,
+             scheduler_config.max_num_seqs * topk_tokens,
+         )
+-        return max(workspace_size, cache_config.block_size)
++        workspace_size = max(
++            workspace_size,
++            scheduler_config.max_num_seqs * cache_config.block_size,
++        )
++        if vllm_config.parallel_config.decode_context_parallel_size > 1:
++            return align_mla_chunked_context_workspace_size(vllm_config, workspace_size)
++        return workspace_size
+ 
+     def _build_req_id_per_token(
+         self,
+@@ -232,6 +250,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
+             dcp_world_size=self.dcp_world_size,
+             dcp_local_block_size=self.dcp_local_block_size,
+             dcp_virtual_block_size=self.dcp_virtual_block_size,
++            dcp_manager=self.dcp_manager,
+         )
+ 
+     def build(
+diff --git a/vllm/models/kimi_k3/nvidia/mla.py b/vllm/models/kimi_k3/nvidia/mla.py
+index c4e3ce90e5..654f83b452 100644
+--- a/vllm/models/kimi_k3/nvidia/mla.py
++++ b/vllm/models/kimi_k3/nvidia/mla.py
+@@ -24,8 +24,8 @@ KV cache, and absorbs ``kv_b_proj`` into ``W_UK_T`` / ``W_UV`` -- mirroring the
+ K3 specifics: optional rotary embedding (disabled for the target model's NoPE
+ layers, enabled for DSpark) and an optional sigmoid output gate (``g_proj``).
+ 
+-Out of scope (extension points, not wired here): context parallelism (DCP/PCP),
+-sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths.
++Out of scope (extension points, not wired here): prefill context parallelism
++(PCP), sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths.
+ """
+ 
+ import math
+@@ -35,7 +35,11 @@ import torch
+ from torch import nn
+ 
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
++from vllm.config import (
++    CacheConfig,
++    VllmConfig,
++    get_current_vllm_config,
++)
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+@@ -78,6 +82,7 @@ from vllm.v1.attention.backend import (
+     MLAAttentionImpl,
+ )
+ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
++from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+ from vllm.v1.attention.selector import get_attn_backend
+ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+@@ -310,10 +315,36 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
+ 
+         vllm_config = get_current_vllm_config()
+         parallel_config = vllm_config.parallel_config
+-        assert (
+-            parallel_config.decode_context_parallel_size <= 1
+-            and parallel_config.prefill_context_parallel_size <= 1
+-        ), "Kimi-K3 MultiHeadLatentAttention does not support context parallelism."
++        assert parallel_config.prefill_context_parallel_size == 1, (
++            "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
++            "parallelism."
++        )
++        self.dcp_world_size = parallel_config.decode_context_parallel_size
++        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
++            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
++            "context parallelism because gathered queries require gathered "
++            "positions."
++        )
++        self.dcp_manager: MLADCPManager | None = None
++        if self.dcp_world_size > 1:
++            query_dtype = (
++                torch.float8_e4m3fn
++                if is_quantized_kv_cache(self.kv_cache_dtype)
++                and self.kv_cache_dtype != "fp8_ds_mla"
++                else dtype
++            )
++            self.dcp_manager = MLADCPManager(
++                vllm_config=vllm_config,
++                device=next(self.kv_b_proj.parameters()).device,
++                num_heads=self.num_local_heads,
++                query_head_dim=self.head_size,
++                output_head_dim=self.kv_lora_rank,
++                query_dtype=query_dtype,
++                output_dtype=dtype,
++                padded_num_heads=self.q_pad_num_heads,
++                is_lse_base_on_e=self.impl.lse_base_on_e,
++                use_pcp=False,
++            )
+         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
+             num_heads=self.num_local_heads,
+             scale=self.scale,
+@@ -584,9 +615,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
+                 cos_sin_cache,
+                 slot_mapping[:num_mqa_tokens],
+             )
+-            latent_out, _lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
++            if self.dcp_world_size > 1:
++                assert self.dcp_manager is not None
++                assert self.dcp_manager.query_gather is not None
++                mqa_q = self.dcp_manager.query_gather(mqa_q)
++            latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
+             )
++            if self.dcp_world_size > 1:
++                assert lse is not None
++                assert self.dcp_manager is not None
++                assert attn_metadata.decode is not None
++                latent_out = self.dcp_manager.combine(
++                    latent_out,
++                    lse,
++                    seq_lens=attn_metadata.decode.seq_lens,
++                    query_start_loc=attn_metadata.query_start_loc[
++                        : attn_metadata.num_decodes + 1
++                    ],
++                )
+             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
+ 
+     def _decode_concat_cache(
+@@ -752,9 +799,20 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
+         )
+ 
+         if has_context:
+-            context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
+-                q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
+-            )
++            if self.dcp_world_size > 1:
++                context_output, context_lse = (
++                    self.impl._context_parallel_compute_prefill_context(  # type: ignore[attr-defined]
++                        q,
++                        self._attn_read_kv_cache(),
++                        attn_metadata,
++                        k_scale=self._k_scale,
++                        dcp_world_size=self.dcp_world_size,
++                    )
++                )
++            else:
++                context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
++                    q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
++                )
+             suffix_output, suffix_lse = output_prefill
+             out = out.view(-1, self.num_local_heads, self.v_head_dim)
+             merge_attn_states(
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla.py b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+index acd3b81816..bf92bf692b 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+@@ -309,9 +309,11 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
+ 
+         return_lse = self.need_to_return_lse_for_decode
+         workspace_buffer = _get_workspace_buffer(return_lse)
++        # Parallel gathers can change the runtime Q heads from TP-local num_heads.
++        runtime_num_heads = q.shape[-2]
+         # trtllm-gen rejects MLA head counts it can't tile (e.g. 96);
+         # fall back to cute-dsl for those.
+-        decode_backend = _select_mla_decode_backend(self.num_heads)
++        decode_backend = _select_mla_decode_backend(runtime_num_heads)
+         extra_kwargs = {}
+         if decode_backend:
+             extra_kwargs["backend"] = decode_backend
+@@ -326,7 +328,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
+             if self._mla_counter_bytes is None:
+                 self._mla_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                     self._mla_counter_max_batch,
+-                    self.num_heads,
++                    runtime_num_heads,
+                     get_device_sm_count(q.device),
+                 )
+             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
+diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+index df4e5c45d1..8ab81c438f 100644
+--- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
++++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+@@ -289,8 +289,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+             self.output_scale = layer._k_scale_float
+ 
+         if self._workspace_buffer is None:
++            # Parallelism can change the runtime query head count.
+             self._workspace_buffer = _get_workspace(
+-                q.device, self.num_heads, self.kv_lora_rank
++                q.device, q.shape[-2], self.kv_lora_rank
+             )
+ 
+         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
+diff --git a/vllm/v1/attention/ops/common.py b/vllm/v1/attention/ops/common.py
+index 901d6bb30b..cbe24cf87c 100644
+--- a/vllm/v1/attention/ops/common.py
++++ b/vllm/v1/attention/ops/common.py
+@@ -6,6 +6,34 @@ from vllm.distributed.parallel_state import GroupCoordinator
+ from vllm.triton_utils import tl, triton
+ 
+ 
++def mask_dcp_empty_shards_(
++    lse: torch.Tensor,
++    seq_lens: torch.Tensor | None,
++    query_start_loc: torch.Tensor | None,
++) -> None:
++    if seq_lens is None and query_start_loc is None:
++        return
++    if seq_lens is None or query_start_loc is None:
++        raise ValueError("seq_lens and query_start_loc must be provided together")
++    if (
++        seq_lens.ndim != 1
++        or query_start_loc.ndim != 1
++        or query_start_loc.shape[0] != seq_lens.shape[0] + 1
++    ):
++        raise ValueError("query_start_loc must contain one boundary per sequence")
++
++    row_indices = torch.arange(
++        lse.shape[0], device=lse.device, dtype=query_start_loc.dtype
++    )
++    sequence_indices = torch.searchsorted(
++        query_start_loc[1:], row_indices, right=True
++    ).clamp_max(seq_lens.shape[0] - 1)
++    empty_rows = (row_indices >= query_start_loc[-1]) | (
++        seq_lens[sequence_indices] == 0
++    )
++    lse.masked_fill_(empty_rows[:, None], float("-inf"))
++
++
+ @triton.jit
+ def _correct_attn_cp_out_kernel(
+     outputs_ptr,
+@@ -51,7 +79,7 @@ def _correct_attn_cp_out_kernel(
+     )
+ 
+     # calc final lse
+-    lse = tl.load(lses_ptr + lse_offsets)
++    lse = tl.load(lses_ptr + lse_offsets).to(tl.float32)
+     lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+     lse_max = tl.max(lse, axis=0)
+     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
+@@ -80,7 +108,7 @@ def _correct_attn_cp_out_kernel(
+     lse_offset = (
+         lse_idx * lses_stride_N + batch_idx * lses_stride_B + head_idx * lses_stride_H
+     )
+-    lse_tmp = tl.load(lses_ptr + lse_offset)
++    lse_tmp = tl.load(lses_ptr + lse_offset).to(tl.float32)
+     lse_finally = lse_tmp - lse
+     lse_finally = tl.where(
+         (lse_finally != lse_finally) | (lse_finally == float("inf")),
+@@ -185,6 +213,8 @@ def _cp_lse_common(
+     cp_group: GroupCoordinator,
+     ctx: CPTritonContext | None = None,
+     is_lse_base_on_e=True,
++    seq_lens: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
+ ):
+     """
+     cp_attn_out: [ B, H, D ]
+@@ -197,6 +227,7 @@ def _cp_lse_common(
+         ctx = CPTritonContext()
+ 
+     cp_attn_lse = cp_attn_lse.contiguous()
++    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+     lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
+         (cp_group.world_size,) + cp_attn_lse.shape
+     )
+@@ -217,13 +248,21 @@ def cp_lse_ag_out_rs(
+     ctx: CPTritonContext | None = None,
+     return_lse: bool = False,
+     is_lse_base_on_e=True,
++    seq_lens: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
+ ):
+     """
+     cp_attn_out: [ B, H, D ]
+     cp_attn_lse: [ B, H ]
+     """
+     out, lse = _cp_lse_common(
+-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
++        cp_attn_out,
++        cp_attn_lse,
++        cp_group,
++        ctx=ctx,
++        is_lse_base_on_e=is_lse_base_on_e,
++        seq_lens=seq_lens,
++        query_start_loc=query_start_loc,
+     )
+     out = cp_group.reduce_scatter(out, dim=1)
+ 
+@@ -242,13 +281,21 @@ def cp_lse_ag_out_ar(
+     ctx: CPTritonContext | None = None,
+     return_lse: bool = False,
+     is_lse_base_on_e=True,
++    seq_lens: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
+ ):
+     """
+     cp_attn_out: [ B, H, D ]
+     cp_attn_lse: [ B, H ]
+     """
+     out, lse = _cp_lse_common(
+-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
++        cp_attn_out,
++        cp_attn_lse,
++        cp_group,
++        ctx=ctx,
++        is_lse_base_on_e=is_lse_base_on_e,
++        seq_lens=seq_lens,
++        query_start_loc=query_start_loc,
+     )
+     out = cp_group.all_reduce(out)
+ 
+diff --git a/vllm/v1/attention/ops/dcp_alltoall.py b/vllm/v1/attention/ops/dcp_alltoall.py
+index e100dbc79e..5939b61a8d 100644
+--- a/vllm/v1/attention/ops/dcp_alltoall.py
++++ b/vllm/v1/attention/ops/dcp_alltoall.py
+@@ -26,6 +26,7 @@ import torch
+ import torch.distributed as dist
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.common import mask_dcp_empty_shards_
+ 
+ if TYPE_CHECKING:
+     from vllm.distributed.parallel_state import GroupCoordinator
+@@ -87,7 +88,9 @@ def _lse_weighted_combine(
+     weights = weights / weight_sum.clamp(min=1e-10)  # [N, B, H]
+ 
+     # Weighted combination: sum over N dimension
+-    result = (outputs * weights.unsqueeze(-1)).sum(dim=0)  # [B, H, D]
++    weights = weights.unsqueeze(-1)
++    outputs = torch.where(weights == 0, torch.zeros_like(outputs), outputs)
++    result = (outputs * weights).sum(dim=0)  # [B, H, D]
+ 
+     if return_lse:
+         if is_lse_base_on_e:
+@@ -172,7 +175,7 @@ def _dcp_a2a_pack_send_kernel(
+ 
+         lse_val = tl.load(
+             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
+-        )
++        ).to(tl.float32)
+         if LSE_PACK_DIM == 1:
+             tl.store(
+                 send_ptr + send_base + HEAD_DIM * send_stride_D,
+@@ -301,10 +304,11 @@ def _dcp_a2a_unpack_combine_kernel(
+         else:
+             weight = tl.exp2(lse_val - global_lse)
+         weight = tl.where(weight != weight, 0.0, weight)
+-        acc += (
+-            tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(tl.float32)
+-            * weight
++        partial = tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(
++            tl.float32
+         )
++        partial = tl.where(weight == 0.0, 0.0, partial)
++        acc += partial * weight
+ 
+     final_offsets = (
+         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
+@@ -324,7 +328,10 @@ def _dcp_a2a_pack_send(
+     h_per_rank: int,
+     head_dim: int,
+     lse_pack_dim: int,
++    seq_lens: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
+ ) -> None:
++    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+     grid = (cp_attn_out.shape[0], h_per_rank, 1)
+     _dcp_a2a_pack_send_kernel[grid](
+         cp_attn_out,
+@@ -396,20 +403,24 @@ def dcp_a2a_lse_reduce(
+     ctx: CPTritonContext | None = None,
+     return_lse: bool = False,
+     is_lse_base_on_e: bool = True,
++    seq_lens: torch.Tensor | None = None,
++    query_start_loc: torch.Tensor | None = None,
+ ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     """
+     Combine partial attention outputs across DCP ranks using All-to-All.
+ 
+-    The output and fp32 LSE are packed into a single output-dtype buffer, sent
++    The output and LSE are packed into a single output-dtype buffer, sent
+     with one All-to-All, then unpacked and combined with exact LSE weighting.
+ 
+     Args:
+         cp_attn_out: [B, H, D] where B=num_tokens, H=total_heads, D=head_dim
+-        cp_attn_lse: [B, H] log-sum-exp values (fp32)
++        cp_attn_lse: [B, H] floating-point log-sum-exp values
+         cp_group: GroupCoordinator for DCP communication
+         ctx: CPTritonContext (unused, for signature compatibility)
+         return_lse: If True, also return the combined global LSE
+         is_lse_base_on_e: If True, LSE is base e; if False, base 2
++        seq_lens: Local KV lengths. Empty shards contribute zero weight.
++        query_start_loc: Cumulative query-token offsets for each request.
+ 
+     Returns:
+         Combined output [B, H/N, D] (head-scattered)
+@@ -426,10 +437,6 @@ def dcp_a2a_lse_reduce(
+     if H % world_size != 0:
+         raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
+     H_per_rank = H // world_size
+-    # The pack kernel bit-casts the LSE as fp32; some MLA backends return it in
+-    # the activation dtype (bf16/fp16), so enforce the documented fp32 contract.
+-    if cp_attn_lse.dtype != torch.float32:
+-        cp_attn_lse = cp_attn_lse.to(torch.float32)
+     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
+ 
+     send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+@@ -446,6 +453,8 @@ def dcp_a2a_lse_reduce(
+         H_per_rank,
+         D,
+         lse_pack_dim,
++        seq_lens=seq_lens,
++        query_start_loc=query_start_loc,
+     )
+ 
+     work = dist.all_to_all_single(
+diff --git a/vllm/v1/attention/ops/dcp_utils.py b/vllm/v1/attention/ops/dcp_utils.py
+new file mode 100644
+index 0000000000..b28d337a10
+--- /dev/null
++++ b/vllm/v1/attention/ops/dcp_utils.py
+@@ -0,0 +1,740 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MLA DCP collective selection and direct symmetric-memory implementations."""
++
++from __future__ import annotations
++
++import functools
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any, Protocol
++
++import torch
++
++import vllm.envs as envs
++from vllm.config import VllmConfig
++from vllm.distributed import get_dcp_group
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
++from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
++from vllm.v1.worker.ubatching import dbo_current_ubatch_id
++
++logger = init_logger(__name__)
++
++if TYPE_CHECKING:
++    from torch.distributed import ProcessGroup
++
++    from vllm.distributed.parallel_state import GroupCoordinator
++
++try:
++    import torch.distributed._symmetric_memory as symm_mem
++
++    symm_mem_available = True
++except ImportError:
++    symm_mem = None  # type: ignore[assignment]
++    symm_mem_available = False
++
++
++@functools.cache
++def _symm_mem_spans_group(group: GroupCoordinator) -> bool:
++    """Probe whether the group has NVLS symmetric memory."""
++    if not symm_mem_available:
++        return False
++    try:
++        from torch._C._autograd import DeviceType
++        from torch._C._distributed_c10d import _SymmetricMemory
++
++        device = torch.device("cuda", torch.accelerator.current_device_index())
++        if not _SymmetricMemory.has_multicast_support(DeviceType.CUDA, device.index):
++            return False
++        probe = symm_mem.empty(8, dtype=torch.uint8, device=device)
++        probe.zero_()
++        torch.accelerator.synchronize()
++        handle = symm_mem.rendezvous(probe, group.device_group.group_name)
++        spans = handle is not None and handle.multicast_ptr != 0
++    except Exception as error:
++        logger.debug("Direct DCP symmetric-memory probe failed: %s", error)
++        return False
++    logger.debug_once(
++        "Direct DCP symmetric memory across %d ranks: %s",
++        group.world_size,
++        "available" if spans else "unavailable",
++    )
++    return spans
++
++
++def _direct_dcp_enabled(
++    group: GroupCoordinator,
++    dtype: torch.dtype,
++    use_direct: bool | None,
++    supported_dtypes: tuple[torch.dtype, ...] | None = None,
++) -> bool:
++    if use_direct is not None:
++        return use_direct
++    return (
++        symm_mem_available
++        and current_platform.is_cuda()
++        and (supported_dtypes is None or dtype in supported_dtypes)
++        and (
++            all(in_the_same_node_as(group.cpu_group, source_rank=0))
++            or _symm_mem_spans_group(group)
++        )
++    )
++
++
++def _direct_dcp_multicast_enabled(
++    group: GroupCoordinator,
++    dtype: torch.dtype,
++    use_direct: bool | None,
++    supported_dtypes: tuple[torch.dtype, ...] | None = None,
++) -> bool:
++    return _direct_dcp_enabled(
++        group, dtype, use_direct, supported_dtypes
++    ) and _symm_mem_spans_group(group)
++
++
++def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
++    scheduler_config = vllm_config.scheduler_config
++    speculative_config = vllm_config.speculative_config
++    speculative_tokens = vllm_config.num_speculative_tokens
++    tokens_per_seq = (
++        1
++        + (
++            2
++            if speculative_config is not None and speculative_config.parallel_drafting
++            else 1
++        )
++        * speculative_tokens
++    )
++    return min(
++        scheduler_config.max_num_batched_tokens,
++        max(
++            scheduler_config.max_num_seqs * tokens_per_seq,
++            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
++        ),
++    )
++
++
++class _DirectDCPWorkspace:
++    def __init__(
++        self,
++        group: ProcessGroup,
++        device: torch.device,
++        num_ubatches: int,
++    ) -> None:
++        self.group = group
++        self.world_size = group.size()
++        self.rank = group.rank()
++        self.device = torch.device(device)
++        self.num_ubatches = num_ubatches
++        self.epoch = torch.zeros(num_ubatches, dtype=torch.int64, device=self.device)
++        self._allocations: list[tuple[torch.Tensor, Any, list[torch.Tensor]]] = []
++
++    def _allocate(
++        self, shape: tuple[int, ...], dtype: torch.dtype
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        storage = symm_mem.empty(shape, device=self.device, dtype=dtype)
++        storage.zero_()
++        torch.accelerator.synchronize()
++        handle = symm_mem.rendezvous(storage, self.group.group_name)
++        assert handle is not None, "DCP symmetric memory rendezvous returned None"
++        handle.barrier()
++        views = [
++            handle.get_buffer(peer, list(shape), dtype, 0)
++            for peer in range(self.world_size)
++        ]
++        self.device = storage.device
++        peer_ptrs = torch.tensor(
++            [
++                [view[ubatch].data_ptr() for view in views]
++                for ubatch in range(self.num_ubatches)
++            ],
++            dtype=torch.int64,
++            device=self.device,
++        )
++        self._allocations.append((storage, handle, views))
++        return storage, peer_ptrs
++
++    def _multicast_ptrs(self, storage: torch.Tensor) -> list[int]:
++        disabled = [0] * self.num_ubatches
++        for allocated, handle, _ in self._allocations:
++            if allocated is storage:
++                break
++        else:
++            return disabled
++        try:
++            from torch._C._autograd import DeviceType
++            from torch._C._distributed_c10d import _SymmetricMemory
++
++            if not _SymmetricMemory.has_multicast_support(
++                DeviceType.CUDA, storage.device.index
++            ):
++                return disabled
++            multicast_base = handle.multicast_ptr
++        except Exception:
++            return disabled
++        if not multicast_base:
++            return disabled
++        storage_base = storage.data_ptr()
++        return [
++            multicast_base + (storage[ubatch].data_ptr() - storage_base)
++            for ubatch in range(self.num_ubatches)
++        ]
++
++
++def reserve_query_head_storage(
++    query: torch.Tensor, padded_num_heads: int
++) -> torch.Tensor:
++    """Reserve backing storage for fixed-head decode kernels."""
++    assert query.ndim == 3
++    assert query.shape[1] <= padded_num_heads
++    padded = query.new_empty((query.shape[0], padded_num_heads, query.shape[2]))
++    padded.resize_(query.shape)
++    padded.copy_(query)
++    return padded
++
++
++_A2A_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
++
++
++class DirectDCPA2AWorkspace(_DirectDCPWorkspace):
++    """Persistent symmetric buffers for direct DCP output exchange."""
++
++    def __init__(
++        self,
++        group: ProcessGroup,
++        device: torch.device,
++        max_num_tokens: int,
++        heads_per_rank: int,
++        head_dim: int,
++        dtype: torch.dtype = torch.bfloat16,
++        num_ubatches: int = 1,
++    ) -> None:
++        if dtype not in _A2A_SUPPORTED_DTYPES:
++            raise ValueError(f"Direct DCP A2A does not support {dtype}")
++        if num_ubatches < 1:
++            raise ValueError(
++                f"Direct DCP A2A requires at least one ubatch slot, got {num_ubatches}"
++            )
++        super().__init__(group, device, num_ubatches)
++        self.max_num_tokens = max_num_tokens
++        self.heads_per_rank = heads_per_rank
++        self.head_dim = head_dim
++
++        output_shape = (
++            num_ubatches,
++            2,
++            self.world_size,
++            max_num_tokens,
++            heads_per_rank,
++            head_dim,
++        )
++        lse_shape = (
++            num_ubatches,
++            2,
++            self.world_size,
++            max_num_tokens,
++            heads_per_rank,
++        )
++        signal_shape = (num_ubatches, 2, self.world_size)
++        self.received_output, self.peer_output_ptrs = self._allocate(
++            output_shape, dtype
++        )
++        self.received_lse, self.peer_lse_ptrs = self._allocate(lse_shape, torch.float32)
++        self.received_signal, self.peer_signal_ptrs = self._allocate(
++            signal_shape, torch.int32
++        )
++
++    def lse_reduce(
++        self,
++        partial_output: torch.Tensor,
++        partial_lse: torch.Tensor,
++        is_lse_base_on_e: bool,
++        seq_lens: torch.Tensor | None = None,
++        query_start_loc: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        ubatch = dbo_current_ubatch_id()
++        num_tokens = partial_output.shape[0]
++        output = partial_output.new_empty(
++            (num_tokens, self.heads_per_rank, self.head_dim)
++        )
++        torch.ops._C.direct_dcp_a2a_lse_reduce(
++            partial_output,
++            partial_lse,
++            seq_lens,
++            query_start_loc,
++            self.peer_output_ptrs[ubatch],
++            self.peer_lse_ptrs[ubatch],
++            self.peer_signal_ptrs[ubatch],
++            self.received_output[ubatch],
++            self.received_lse[ubatch],
++            self.received_signal[ubatch],
++            self.epoch[ubatch : ubatch + 1],
++            output,
++            self.world_size,
++            self.rank,
++            self.max_num_tokens,
++            is_lse_base_on_e,
++        )
++        return output
++
++
++@functools.cache
++def get_direct_dcp_a2a_workspace(
++    group: GroupCoordinator,
++    device: torch.device,
++    max_num_tokens: int,
++    heads_per_rank: int,
++    head_dim: int,
++    dtype: torch.dtype,
++    num_ubatches: int,
++) -> DirectDCPA2AWorkspace | None:
++    if not _direct_dcp_enabled(
++        group, dtype, envs.VLLM_USE_DIRECT_DCP_A2A, _A2A_SUPPORTED_DTYPES
++    ):
++        return None
++    return DirectDCPA2AWorkspace(
++        group.device_group,
++        device,
++        max_num_tokens,
++        heads_per_rank,
++        head_dim,
++        dtype,
++        num_ubatches,
++    )
++
++
++def _q_gather_layout_supported(
++    world_size: int,
++    heads_per_rank: int,
++    head_dim: int,
++    dtype: torch.dtype,
++    padded_num_heads: int | None,
++) -> bool:
++    element_size = torch.empty((), dtype=dtype).element_size()
++    gathered_num_heads = world_size * heads_per_rank
++    storage_num_heads = (
++        gathered_num_heads if padded_num_heads is None else padded_num_heads
++    )
++    return (
++        heads_per_rank * head_dim * element_size % 16 == 0
++        and storage_num_heads * head_dim * element_size % 16 == 0
++    )
++
++
++class DirectDCPQGatherWorkspace(_DirectDCPWorkspace):
++    """Publish query shards directly into the consumer-final symmetric buffer.
++
++    The final buffer is reusable after the downstream DCP output combine. That
++    combine orders all ranks after attention has consumed the gathered query.
++    """
++
++    def __init__(
++        self,
++        group: ProcessGroup,
++        device: torch.device,
++        max_num_tokens: int,
++        heads_per_rank: int,
++        head_dim: int,
++        dtype: torch.dtype = torch.bfloat16,
++        num_ubatches: int = 1,
++        padded_num_heads: int | None = None,
++    ) -> None:
++        if num_ubatches < 1:
++            raise ValueError(
++                "Direct DCP q-gather requires at least one ubatch slot, "
++                f"got {num_ubatches}"
++            )
++        if max_num_tokens < 1 or heads_per_rank < 1 or head_dim < 1:
++            raise ValueError(
++                "Direct DCP q-gather dimensions must be positive, got "
++                f"T={max_num_tokens}, H={heads_per_rank}, D={head_dim}"
++            )
++        gathered_num_heads = group.size() * heads_per_rank
++        if not _q_gather_layout_supported(
++            group.size(), heads_per_rank, head_dim, dtype, padded_num_heads
++        ):
++            raise ValueError("Direct DCP q-gather requires 16-byte-aligned query rows.")
++        super().__init__(group, device, num_ubatches)
++        if self.world_size <= 1:
++            raise ValueError("Direct DCP q-gather requires at least two ranks")
++        self.max_num_tokens = max_num_tokens
++        self.heads_per_rank = heads_per_rank
++        self.gathered_num_heads = gathered_num_heads
++        self.padded_num_heads = (
++            self.gathered_num_heads if padded_num_heads is None else padded_num_heads
++        )
++        if self.padded_num_heads < self.gathered_num_heads:
++            raise ValueError(
++                "Direct DCP q-gather padded heads must cover gathered heads: "
++                f"{self.padded_num_heads} < {self.gathered_num_heads}"
++            )
++        self.head_dim = head_dim
++
++        query_shape = (
++            num_ubatches,
++            max_num_tokens,
++            self.padded_num_heads,
++            head_dim,
++        )
++        signal_shape = (num_ubatches, 2, self.world_size)
++        self.final_query, _ = self._allocate(query_shape, dtype)
++        self.received_signal, _ = self._allocate(signal_shape, torch.int32)
++        query_multicast_ptrs = self._multicast_ptrs(self.final_query)
++        signal_multicast_ptrs = self._multicast_ptrs(self.received_signal)
++        self.multicast_ptrs = list(
++            zip(query_multicast_ptrs, signal_multicast_ptrs, strict=True)
++        )
++        if not all(
++            query_ptr and signal_ptr for query_ptr, signal_ptr in self.multicast_ptrs
++        ):
++            raise RuntimeError(
++                "Direct DCP q-gather requires NVLS symmetric-memory multicast."
++            )
++        self.completion = self.received_signal.new_zeros((num_ubatches, 1))
++        torch.accelerator.synchronize()
++
++    def gather(self, local_query: torch.Tensor) -> torch.Tensor:
++        ubatch = dbo_current_ubatch_id()
++        if not 0 <= ubatch < self.num_ubatches:
++            raise ValueError(
++                f"DCP q-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
++            )
++        if local_query.ndim == 3 and local_query.shape[1] != self.heads_per_rank:
++            raise ValueError(
++                f"DCP q-gather expected {self.heads_per_rank} local query heads, "
++                f"got {local_query.shape[1]}"
++            )
++
++        num_tokens = local_query.shape[0]
++        output = torch.as_strided(
++            self.final_query[ubatch],
++            size=(num_tokens, self.gathered_num_heads, self.head_dim),
++            stride=(
++                self.gathered_num_heads * self.head_dim,
++                self.head_dim,
++                1,
++            ),
++        )
++        query_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
++        torch.ops._C.direct_dcp_q_gather(
++            local_query,
++            output,
++            self.received_signal[ubatch],
++            self.completion[ubatch],
++            self.epoch[ubatch : ubatch + 1],
++            self.world_size,
++            self.rank,
++            self.max_num_tokens,
++            self.padded_num_heads,
++            query_multicast_ptr,
++            signal_multicast_ptr,
++        )
++        return output
++
++
++@functools.cache
++def get_direct_dcp_q_gather_workspace(
++    group: GroupCoordinator,
++    device: torch.device,
++    max_num_tokens: int,
++    heads_per_rank: int,
++    head_dim: int,
++    dtype: torch.dtype,
++    num_ubatches: int,
++    padded_num_heads: int | None = None,
++) -> DirectDCPQGatherWorkspace | None:
++    if not _direct_dcp_multicast_enabled(
++        group, dtype, envs.VLLM_USE_DIRECT_DCP_Q_GATHER
++    ):
++        return None
++    if not _q_gather_layout_supported(
++        group.world_size, heads_per_rank, head_dim, dtype, padded_num_heads
++    ):
++        return None
++    return DirectDCPQGatherWorkspace(
++        group.device_group,
++        device,
++        max_num_tokens,
++        heads_per_rank,
++        head_dim,
++        dtype,
++        num_ubatches,
++        padded_num_heads,
++    )
++
++
++_KV_GATHER_SUPPORTED_DTYPES = (
++    torch.float16,
++    torch.bfloat16,
++    torch.float8_e4m3fn,
++)
++
++
++def _kv_gather_layout_supported(token_dim: int, dtype: torch.dtype) -> bool:
++    return token_dim * torch.empty((), dtype=dtype).element_size() % 16 == 0
++
++
++class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
++    """Persistent symmetric buffers for direct DCP KV gather."""
++
++    def __init__(
++        self,
++        group: ProcessGroup,
++        device: torch.device,
++        max_gathered_tokens: int,
++        token_dim: int,
++        dtype: torch.dtype = torch.bfloat16,
++        num_ubatches: int = 1,
++    ) -> None:
++        if dtype not in _KV_GATHER_SUPPORTED_DTYPES:
++            raise ValueError(f"Direct DCP kv-gather does not support {dtype}")
++        if num_ubatches < 1:
++            raise ValueError(
++                "Direct DCP kv-gather requires at least one ubatch slot, "
++                f"got {num_ubatches}"
++            )
++        if max_gathered_tokens < 1 or token_dim < 1:
++            raise ValueError(
++                "Direct DCP kv-gather dimensions must be positive, got "
++                f"T={max_gathered_tokens}, D={token_dim}"
++            )
++        if not _kv_gather_layout_supported(token_dim, dtype):
++            raise ValueError("Direct DCP kv-gather requires 16-byte-aligned KV rows.")
++        super().__init__(group, device, num_ubatches)
++        if self.world_size <= 1:
++            raise ValueError("Direct DCP kv-gather requires at least two ranks")
++        if max_gathered_tokens % self.world_size != 0:
++            raise ValueError(
++                "Direct DCP kv-gather capacity must divide evenly across "
++                f"ranks: {max_gathered_tokens} % {self.world_size} != 0"
++            )
++        self.max_gathered_tokens = max_gathered_tokens
++
++        kv_shape = (num_ubatches, 2, max_gathered_tokens, token_dim)
++        signal_shape = (num_ubatches, 2, self.world_size)
++        self.received_kv, _ = self._allocate(kv_shape, dtype)
++        self.received_signal, _ = self._allocate(signal_shape, torch.int32)
++        kv_multicast_ptrs = self._multicast_ptrs(self.received_kv)
++        signal_multicast_ptrs = self._multicast_ptrs(self.received_signal)
++        self.multicast_ptrs = list(
++            zip(kv_multicast_ptrs, signal_multicast_ptrs, strict=True)
++        )
++        if not all(kv_ptr and signal_ptr for kv_ptr, signal_ptr in self.multicast_ptrs):
++            raise RuntimeError(
++                "Direct DCP kv-gather requires NVLS symmetric-memory multicast."
++            )
++        self.completion = self.received_signal.new_zeros((num_ubatches, 2))
++        torch.accelerator.synchronize()
++
++    def gather(self, gathered_kv: torch.Tensor, local_kv: torch.Tensor) -> None:
++        ubatch = dbo_current_ubatch_id()
++        if not 0 <= ubatch < self.num_ubatches:
++            raise ValueError(
++                f"DCP kv-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
++            )
++        kv_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
++        torch.ops._C.direct_dcp_kv_gather(
++            local_kv,
++            self.received_kv[ubatch],
++            self.received_signal[ubatch],
++            self.completion[ubatch],
++            self.epoch[ubatch : ubatch + 1],
++            gathered_kv,
++            self.world_size,
++            self.rank,
++            self.max_gathered_tokens,
++            kv_multicast_ptr,
++            signal_multicast_ptr,
++        )
++
++
++@functools.cache
++def get_direct_dcp_kv_gather_workspace(
++    group: GroupCoordinator,
++    device: torch.device,
++    max_gathered_tokens: int,
++    token_dim: int,
++    dtype: torch.dtype,
++    num_ubatches: int,
++) -> DirectDCPKVGatherWorkspace | None:
++    if not _direct_dcp_multicast_enabled(
++        group,
++        dtype,
++        envs.VLLM_USE_DIRECT_DCP_KV_GATHER,
++        _KV_GATHER_SUPPORTED_DTYPES,
++    ):
++        return None
++    if not _kv_gather_layout_supported(token_dim, dtype):
++        return None
++    return DirectDCPKVGatherWorkspace(
++        group.device_group,
++        device,
++        max_gathered_tokens,
++        token_dim,
++        dtype,
++        num_ubatches,
++    )
++
++
++class DCPCombine(Protocol):
++    def __call__(
++        self,
++        partial_output: torch.Tensor,
++        partial_lse: torch.Tensor,
++        *,
++        seq_lens: torch.Tensor,
++        query_start_loc: torch.Tensor,
++    ) -> torch.Tensor: ...
++
++
++class MLADCPManager:
++    """Select and own layer-level collective implementations for MLA DCP."""
++
++    _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        device: torch.device,
++        num_heads: int,
++        query_head_dim: int,
++        output_head_dim: int,
++        query_dtype: torch.dtype,
++        output_dtype: torch.dtype,
++        padded_num_heads: int | None,
++        is_lse_base_on_e: bool,
++        use_pcp: bool,
++    ) -> None:
++        parallel_config = vllm_config.parallel_config
++        self.group = get_dcp_group()
++        self.device = torch.device(device)
++        self.num_ubatches = max(parallel_config.num_ubatches, 1)
++        self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
++        self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
++        self.padded_num_heads = padded_num_heads
++
++        self.combine = self._init_combine(
++            num_heads,
++            output_head_dim,
++            output_dtype,
++            is_lse_base_on_e,
++            use_pcp,
++        )
++        self.query_gather = (
++            None
++            if use_pcp
++            else self._init_query_gather(
++                num_heads,
++                query_head_dim,
++                query_dtype,
++            )
++        )
++
++    def _init_combine(
++        self,
++        num_heads: int,
++        head_dim: int,
++        dtype: torch.dtype,
++        is_lse_base_on_e: bool,
++        use_pcp: bool,
++    ) -> DCPCombine:
++        direct_workspace = None
++        if self.use_a2a:
++            direct_workspace = get_direct_dcp_a2a_workspace(
++                self.group,
++                self.device,
++                self.max_num_tokens,
++                num_heads,
++                head_dim,
++                dtype,
++                self.num_ubatches,
++            )
++        if direct_workspace is not None:
++            logger.info_once("Using direct symmetric-memory DCP A2A for MLA.")
++            return functools.partial(
++                direct_workspace.lse_reduce,
++                is_lse_base_on_e=is_lse_base_on_e,
++            )
++
++        combine_fn = (
++            dcp_a2a_lse_reduce
++            if self.use_a2a
++            else cp_lse_ag_out_ar
++            if use_pcp
++            else cp_lse_ag_out_rs
++        )
++        return functools.partial(
++            combine_fn,
++            cp_group=self.group,
++            is_lse_base_on_e=is_lse_base_on_e,
++        )
++
++    def _init_query_gather(
++        self,
++        num_heads: int,
++        head_dim: int,
++        dtype: torch.dtype,
++    ) -> Callable[[torch.Tensor], torch.Tensor]:
++        direct_workspace = get_direct_dcp_q_gather_workspace(
++            self.group,
++            self.device,
++            self.max_num_tokens,
++            num_heads,
++            head_dim,
++            dtype,
++            self.num_ubatches,
++            self.padded_num_heads,
++        )
++        if direct_workspace is not None:
++            logger.info_once("Using direct symmetric-memory DCP query gather for MLA.")
++            return direct_workspace.gather
++        return self._gather_query
++
++    def _gather_query(self, query: torch.Tensor) -> torch.Tensor:
++        query = self.group.all_gather(query, dim=1)
++        if self.padded_num_heads is not None:
++            query = reserve_query_head_storage(query, self.padded_num_heads)
++        return query
++
++    def init_kv_gather(
++        self,
++        workspace: torch.Tensor,
++        max_gathered_tokens: int,
++    ) -> None:
++        world_size = self.group.world_size
++        assert max_gathered_tokens > 0
++        assert max_gathered_tokens % world_size == 0
++        assert workspace.ndim == 2
++        assert workspace.is_contiguous()
++        assert workspace.shape[0] == (
++            max_gathered_tokens + max_gathered_tokens // world_size
++        )
++        assert workspace.shape[1] > 0
++
++        direct_workspace = get_direct_dcp_kv_gather_workspace(
++            self.group,
++            workspace.device,
++            max_gathered_tokens,
++            workspace.shape[1],
++            workspace.dtype,
++            self.num_ubatches,
++        )
++        if direct_workspace is not None:
++            logger.info_once(
++                "Using direct symmetric-memory DCP chunked-context KV gather for MLA."
++            )
++            self._kv_gather = direct_workspace.gather
++        else:
++            self._kv_gather = functools.partial(
++                torch.distributed.all_gather_into_tensor,
++                group=self.group.device_group,
++            )
++
++    def kv_gather(
++        self,
++        gathered_kv: torch.Tensor,
++        local_kv: torch.Tensor,
++    ) -> object:
++        return self._kv_gather(gathered_kv, local_kv)
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index a64b7e3215..7073d45a97 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -14,6 +14,7 @@ from vllm.logger import init_logger
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
++    BlockHashList,
+     BlockHashWithGroupId,
+     ExternalBlockHash,
+     FreeKVCacheBlockQueue,
+@@ -370,14 +371,67 @@ class BlockPool:
+             group_idx=kv_cache_group_id,
+         )
+ 
++    def _emit_cached_block_run(
++        self,
++        request: Request,
++        block_hashes: BlockHashList,
++        run_start: int,
++        run_end: int,
++        block_size: int,
++        kv_cache_group_id: int,
++    ) -> None:
++        cached_hashes = [
++            maybe_convert_block_hash(block_hashes[i]) for i in range(run_start, run_end)
++        ]
++        extra_keys_list: list[tuple[Any, ...] | None] = []
++        curr_mm_idx = 0
++        for i in range(run_start, run_end):
++            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
++                request,
++                i * block_size,
++                (i + 1) * block_size,
++                curr_mm_idx,
++            )
++            extra_keys_list.append(extra_keys)
++
++        parent_block_hash = (
++            maybe_convert_block_hash(block_hashes[run_start - 1])
++            if run_start > 0
++            else None
++        )
++        start_token_idx = run_start * block_size
++        end_token_idx = run_end * block_size
++        logger.debug(
++            "EmitCachedBlock event: block_size=%d, num_cached_blocks=%d, "
++            "parent_block_hash=%s, token_ids_len=%d, group_idx=%s",
++            block_size,
++            run_end - run_start,
++            parent_block_hash,
++            len(request.all_token_ids[start_token_idx:end_token_idx]),
++            kv_cache_group_id,
++        )
++        self.kv_event_queue.append(
++            self._build_block_stored_event(
++                request,
++                block_hashes=cached_hashes,
++                parent_block_hash=parent_block_hash,
++                start_token_idx=start_token_idx,
++                end_token_idx=end_token_idx,
++                block_size=block_size,
++                kv_cache_group_id=kv_cache_group_id,
++                extra_keys_list=extra_keys_list,
++            )
++        )
++
+     def emit_cached_block_events(
+         self,
+         request: Request,
+-        num_cached_blocks: int,
++        num_cached_tokens: int,
+         block_size: int,
+         kv_cache_group_id: int,
++        cached_blocks: Sequence[KVCacheBlock] | None = None,
+     ) -> None:
+-        """Generate BlockStored events for blocks reused from prefix cache.
++        """Generate BlockStored events for a prefix reused from cache.
+ 
+         Unlike cache_full_blocks(), this does NOT modify block state —
+         the blocks are already cached. It only generates events so that
+@@ -385,60 +439,76 @@ class BlockPool:
+ 
+         Args:
+             request: The request whose prefix cache blocks were reused.
+-            num_cached_blocks: Number of blocks that were cache hits.
++            num_cached_tokens: Number of prefix tokens that were cache hits.
+             block_size: Number of tokens per block.
+             kv_cache_group_id: The KV cache group ID.
++            cached_blocks: Optional hit-block list. Null placeholders are not
++                reported as stored blocks.
+         """
+-        if not self.enable_kv_cache_events or num_cached_blocks == 0:
++        if not self.enable_kv_cache_events or num_cached_tokens == 0:
+             return
+ 
++        assert num_cached_tokens % self.hash_block_size == 0
++        num_cached_blocks = num_cached_tokens // block_size
+         block_hashes = resolve_block_hashes(
+             request.block_hashes, self.hash_block_size, block_size
+         )
+ 
+-        # Collect external hashes and extra_keys for cached blocks.
+-        cached_hashes: list[ExternalBlockHash] = []
+-        extra_keys_list: list[tuple[Any, ...] | None] = []
+-        curr_mm_idx = 0
+-        for i in range(num_cached_blocks):
+-            block_start = i * block_size
+-            block_end = block_start + block_size
+-            cached_hashes.append(maybe_convert_block_hash(block_hashes[i]))
+-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+-                request, block_start, block_end, curr_mm_idx
++        def block_is_present(block_idx: int) -> bool:
++            return cached_blocks is None or (
++                block_idx < len(cached_blocks) and not cached_blocks[block_idx].is_null
+             )
+-            extra_keys_list.append(extra_keys)
+ 
+-        if not cached_hashes:
+-            return
++        run_start: int | None = None
++        for block_idx in range(num_cached_blocks + 1):
++            present = block_idx < num_cached_blocks and block_is_present(block_idx)
++            if present and run_start is None:
++                run_start = block_idx
++            if run_start is None or present:
++                continue
++            self._emit_cached_block_run(
++                request,
++                block_hashes,
++                run_start,
++                block_idx,
++                block_size,
++                kv_cache_group_id,
++            )
++            run_start = None
+ 
+-        # Prefix-cache hits always form a contiguous prefix starting at block 0,
+-        # so the first (and thus the whole group's) parent block hash is None.
+-        parent_block_hash: ExternalBlockHash | None = None
+-        start_token_idx = 0
+-        end_token_idx = num_cached_blocks * block_size
++        if num_cached_tokens % block_size and block_is_present(num_cached_blocks):
++            self._emit_partial_block_stored_event(
++                request,
++                num_cached_tokens,
++                kv_cache_group_id,
++            )
+ 
+-        logger.debug(
+-            "EmitCachedBlock event: block_size=%d, "
+-            "num_cached_blocks=%d, parent_block_hash=%s, "
+-            "token_ids_len=%d, group_idx=%s",
+-            block_size,
+-            num_cached_blocks,
+-            parent_block_hash,
+-            len(request.all_token_ids[start_token_idx:end_token_idx]),
+-            kv_cache_group_id,
++    def _emit_partial_block_stored_event(
++        self,
++        request: Request,
++        num_tokens: int,
++        kv_cache_group_id: int,
++    ) -> None:
++        block_hash = self._get_partial_block_hash(request, num_tokens)
++        parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
++            request, num_tokens
++        )
++        parent_block_hash = (
++            maybe_convert_block_hash(parent_hash) if parent_hash is not None else None
++        )
++        extra_keys, _ = generate_block_hash_extra_keys(
++            request, block_start, num_tokens, 0
+         )
+-
+         self.kv_event_queue.append(
+             self._build_block_stored_event(
+                 request,
+-                block_hashes=cached_hashes,
++                block_hashes=[maybe_convert_block_hash(block_hash)],
+                 parent_block_hash=parent_block_hash,
+-                start_token_idx=start_token_idx,
+-                end_token_idx=end_token_idx,
+-                block_size=block_size,
++                start_token_idx=block_start,
++                end_token_idx=num_tokens,
++                block_size=num_tokens - block_start,
+                 kv_cache_group_id=kv_cache_group_id,
+-                extra_keys_list=extra_keys_list,
++                extra_keys_list=[extra_keys],
+             )
+         )
+ 
+@@ -488,7 +558,6 @@ class BlockPool:
+         assert block_size % self.hash_block_size == 0
+         assert num_tokens % block_size != 0
+         block_hash = self._get_partial_block_hash(request, num_tokens)
+-        num_hash_blocks = num_tokens // self.hash_block_size
+         block_hash_with_group_id = make_block_hash_with_group_id(
+             block_hash, kv_cache_group_id
+         )
+@@ -501,45 +570,18 @@ class BlockPool:
+             not already_cached
+             and block.block_hash is not None
+             and block.block_hash_num_tokens is not None
+-            and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
++            and block.block_hash_num_tokens < num_tokens
+         ):
+             removed_hashes = self._remove_cached_block_hashes(block)
+             self._emit_block_removed_events(removed_hashes)
+         self._insert_block_hash(
+             block_hash_with_group_id,
+             block,
+-            num_tokens=num_hash_blocks * self.hash_block_size,
++            num_tokens=num_tokens,
+         )
+         if self.enable_kv_cache_events and not already_cached:
+-            parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
+-                request, num_tokens
+-            )
+-            parent_block_hash = (
+-                maybe_convert_block_hash(parent_hash)
+-                if parent_hash is not None
+-                else None
+-            )
+-            block_end = num_tokens
+-            curr_mm_idx = -1 if block_start > 0 else 0
+-            extra_keys, _ = generate_block_hash_extra_keys(
+-                request, block_start, block_end, curr_mm_idx
+-            )
+-            self.kv_event_queue.append(
+-                BlockStored(
+-                    block_hashes=[maybe_convert_block_hash(block_hash)],
+-                    parent_block_hash=parent_block_hash,
+-                    token_ids=request.all_token_ids[block_start:block_end],
+-                    block_size=block_end - block_start,
+-                    lora_id=request.lora_request.adapter_id
+-                    if request.lora_request
+-                    else None,
+-                    medium=MEDIUM_GPU,
+-                    lora_name=request.lora_request.name
+-                    if request.lora_request
+-                    else None,
+-                    extra_keys=[extra_keys],
+-                    group_idx=kv_cache_group_id,
+-                )
++            self._emit_partial_block_stored_event(
++                request, num_tokens, kv_cache_group_id
+             )
+         return block_hash_with_group_id
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 70cd267506..cc0232ec42 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -578,15 +578,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                     "full-attention and Mamba groups, got: "
+                     f"{type(g.kv_cache_spec).__name__}."
+                 )
+-        # Partial hash hits are limited to full-attention + mamba ("align")
+-        # without context parallelism.
+-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
++        self.verify_and_split_kv_cache_groups()
++
++        # TP needs hashing finer than the Mamba block. DCP accepts equality
++        # because it scales the effective full-attention block instead.
++        self.enable_partial_hash_hits = any(
+             isinstance(g.kv_cache_spec, MambaSpec)
+             and g.kv_cache_spec.mamba_cache_mode == "align"
+-            and g.kv_cache_spec.block_size > hash_block_size
++            and (
++                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
++                or (
++                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
++                )
++            )
+             for g in kv_cache_config.kv_cache_groups
+         )
+-        self.verify_and_split_kv_cache_groups()
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index fcb67726a5..c881383074 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -272,15 +272,16 @@ class KVCacheManager:
+             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
+         ):
+             for group_idx, group_blocks in enumerate(computed_blocks):
+-                num_blocks = len(group_blocks)
+-                if num_blocks > 0:
+-                    group = self.kv_cache_config.kv_cache_groups[group_idx]
+-                    block_size = group.kv_cache_spec.block_size
++                if group_blocks:
++                    block_size = self.coordinator.single_type_managers[
++                        group_idx
++                    ].block_size
+                     self.block_pool.emit_cached_block_events(
+                         request,
+-                        num_blocks,
++                        num_new_computed_tokens,
+                         block_size,
+                         group_idx,
++                        group_blocks,
+                     )
+ 
+         # The junction to pin is where the lagging sparse-retention group stops
