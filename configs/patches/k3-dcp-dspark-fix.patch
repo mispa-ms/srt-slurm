@@ -19,6 +19,39 @@ index aa3fc67ea1..f6b6f3c439 100644
                  if self.num_speculative_tokens is not None and hasattr(
                      self.draft_model_config.hf_config, "num_lookahead_tokens"
                  ):
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index abe7de805c..53a2736979 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1980,12 +1980,23 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         Currently, only decode is supported for full cudagraphs with MLA.
+         """
+         m = common_attn_metadata
+-        assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
+-            "MLA only supports decode-only full CUDAGraph capture. "
+-            "Make sure all cudagraph capture sizes <= max_num_seq."
+-        )
++        # A non-causal multi-token decode block (DFlash/DSpark drafting) is a
++        # decode by construction: build() takes the whole batch as decodes and
++        # forward_mqa flattens the block to single-token rows. Its query length
++        # is the draft block size, which reorder_batch_threshold does not bound
++        # -- under DCP that threshold is forced to 1 for any backend without
++        # supports_dcp_with_varlen, and the draft runs on FLASHINFER_MLA because
++        # it is the only backend declaring supports_non_causal_multi_token_decode.
++        # build() already exempts this case; the two asserts below did not, so
++        # capture died before a single request was served.
++        non_causal_decode = m.causal is False
++        if not non_causal_decode:
++            assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
++                "MLA only supports decode-only full CUDAGraph capture. "
++                "Make sure all cudagraph capture sizes <= max_num_seq."
++            )
+ 
+-        assert m.max_query_len <= self.reorder_batch_threshold  # decode only
++            assert m.max_query_len <= self.reorder_batch_threshold  # decode only
+ 
+         return self.build(0, m)
+ 
 diff --git a/vllm/models/kimi_k3/nvidia/mla.py b/vllm/models/kimi_k3/nvidia/mla.py
 index 2060acdf47..0aab8675d6 100644
 --- a/vllm/models/kimi_k3/nvidia/mla.py

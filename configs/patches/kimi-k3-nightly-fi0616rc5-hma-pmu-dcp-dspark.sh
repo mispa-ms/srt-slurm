@@ -1,5 +1,5 @@
 #!/bin/bash
-# kimi-k3-nightly-fi0616rc5-hma-dcp.sh plus DCP under DSpark speculative decoding.
+# kimi-k3-nightly-fi0616rc5-hma-pmu-dcp.sh plus DCP under DSpark speculative decoding.
 #
 # One delta against the script it wraps, so a no-spec DCP4 arm and a
 # DSpark+DCP4 arm differ by exactly this patch plus the speculative-config
@@ -60,9 +60,22 @@
 # prefix-cache miss costs throughput, not correctness -- but the performance
 # ladder does. See DCP_DSPARK_DESIGN.md section 7.
 
+# WHY -hma-pmu-dcp.sh AND NOT -hma-dcp.sh. The -pmu- base carries
+# wzhao18/vllm@d87cdf5ce4, and under speculation that patch is a prerequisite,
+# not an optimisation. DCP_HANDOFF.md 5.3 measured it as not load-bearing for
+# a no-spec arm and noted that half of it is EAGLE-guarded, so a no-spec arm
+# never reaches that half. SpeculativeConfig.use_eagle() returns True for
+# "dspark", so this arm does. Without d87 it runs for ~22 minutes and then dies
+# in kv_cache_manager.truncate_computed_blocks on
+#
+#   assert num_blocks <= len(group_blocks)
+#
+# which is the exact assert d87 replaces with null-block padding. Pipeline
+# 61495299 (c16 dcp1) lost that way after serving 111 warmup requests.
+
 set -euo pipefail
 
-bash /configs/patches/kimi-k3-nightly-fi0616rc5-hma-dcp.sh
+bash /configs/patches/kimi-k3-nightly-fi0616rc5-hma-pmu-dcp.sh
 
 echo "=== k3-dcp-dspark-fix (ours, on top of the DCP stack) ==="
 FIX_FILE=/configs/patches/k3-dcp-dspark-fix.patch
