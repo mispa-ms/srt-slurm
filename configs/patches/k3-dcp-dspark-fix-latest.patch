@@ -20,7 +20,7 @@ index 7beecf8aa2..ebd13984d9 100644
                      self.draft_model_config.hf_config, "num_lookahead_tokens"
                  ):
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index b21f967732..85c675d9a2 100644
+index b21f967732..6f23f9cf9f 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -2128,6 +2128,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
@@ -37,46 +37,43 @@ index b21f967732..85c675d9a2 100644
  
          if self.query_len_support == QueryLenSupport.SINGLE_ONLY:
              assert self.reorder_batch_threshold == 1, (
-@@ -2159,12 +2166,33 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+@@ -2159,12 +2166,34 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
          Currently, only decode is supported for full cudagraphs with MLA.
          """
          m = common_attn_metadata
--        assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
--            "MLA only supports decode-only full CUDAGraph capture. "
--            "Make sure all cudagraph capture sizes <= max_num_seq."
--        )
-+        # A non-causal multi-token decode block (DFlash/DSpark drafting) is a
-+        # decode by construction: build() takes the whole batch as decodes and
-+        # forward_mqa flattens the block to single-token rows. Its query length
-+        # is the draft block size, which reorder_batch_threshold does not bound
-+        # -- under DCP that threshold is forced to 1 for any backend without
-+        # supports_dcp_with_varlen, and the draft runs on FLASHINFER_MLA because
-+        # it is the only backend declaring supports_non_causal_multi_token_decode.
-+        # build() already exempts this case; the two asserts below did not, so
-+        # capture died before a single request was served.
-+        non_causal_decode = m.causal is False
-+        if not non_causal_decode:
-+            assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
-+                "MLA only supports decode-only full CUDAGraph capture. "
-+                "Make sure all cudagraph capture sizes <= max_num_seq."
-+            )
++        # DO NOT BYPASS THESE. vllm#45425 documents what happens when this
++        # combination runs anyway: under DCP, _init_reorder_batch_threshold
++        # forces reorder_batch_threshold to 1 for any backend without
++        # supports_dcp_with_varlen, spec-decode verify rows are then classified
++        # as prefills at metadata-build time, and the full-cudagraph decode
++        # capture no longer matches what is replayed -- SILENT OUTPUT CORRUPTION,
++        # not a crash. The issue's own recommendation is to reject or downgrade
++        # at init, so this assert is the guard, not the defect.
++        #
++        # The fix is to put the draft on a backend that declares
++        # supports_dcp_with_varlen (TOKENSPEED_MLA since vllm#50911), which keeps
++        # the threshold at 1 + 2*ns and lets this pass on its own.
+         assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
+             "MLA only supports decode-only full CUDAGraph capture. "
+             "Make sure all cudagraph capture sizes <= max_num_seq."
+         )
  
 -        assert m.max_query_len <= self.reorder_batch_threshold  # decode only
-+            # Instrumented: a bare assert here names neither the builder nor the
-+            # KV cache group, and a traceback through build_attn_metadata cannot
-+            # be attributed to one by eye.
-+            assert m.max_query_len <= self.reorder_batch_threshold, (
-+                f"decode-only capture: {type(self).__name__} "
-+                f"max_query_len={m.max_query_len} "
-+                f"threshold={self.reorder_batch_threshold} "
-+                f"causal={m.causal} dcp={self.dcp_world_size} "
-+                f"non_causal_mtd={self.non_causal_multi_token_decode} "
-+                f"num_reqs={m.num_reqs} num_actual_tokens={m.num_actual_tokens}"
-+            )
++        # Instrumented: a bare assert here names neither the builder nor the KV
++        # cache group, and a traceback through build_attn_metadata cannot be
++        # attributed to one by eye.
++        assert m.max_query_len <= self.reorder_batch_threshold, (
++            f"decode-only capture: {type(self).__name__} "
++            f"max_query_len={m.max_query_len} "
++            f"threshold={self.reorder_batch_threshold} "
++            f"causal={m.causal} dcp={self.dcp_world_size} "
++            f"non_causal_mtd={self.non_causal_multi_token_decode} "
++            f"num_reqs={m.num_reqs} num_actual_tokens={m.num_actual_tokens}"
++        )
  
          return self.build(0, m)
  
-@@ -2283,6 +2311,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+@@ -2283,6 +2312,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
              dcp_tot_seq_lens_device = None
              if self.dcp_world_size > 1:
                  dcp_tot_seq_lens_device = seq_lens[:num_decodes]
