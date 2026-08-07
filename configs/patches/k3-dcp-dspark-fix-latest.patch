@@ -106,6 +106,30 @@ index 654f83b452..b4383de36a 100644
          self.dcp_manager: MLADCPManager | None = None
          if self.dcp_world_size > 1:
              query_dtype = (
+diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+index 8ab81c438f..e604b94ada 100644
+--- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
++++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+@@ -311,7 +311,18 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+             enable_pdl=False,
+             return_lse=return_lse,
+             causal_mask=attn_metadata.causal,
+-            causal_seqs=causal_seqs if self.dcp_world_size > 1 else None,
++            # causal_seqs reconstructs each query's causal KV boundary from the
++            # global length, which only means anything for a CAUSAL block. A
++            # non-causal DSpark/DFlash draft block must see its whole rank-local
++            # shard, bounded by seq_lens alone. Gating this on dcp alone fed
++            # causal boundaries to a non-causal block whenever dcp > 1 -- the
++            # one combination #50911 never tested (its non-causal case is
++            # dcp=1, where this is None, and its DCP case is single-token).
++            causal_seqs=(
++                causal_seqs
++                if (self.dcp_world_size > 1 and attn_metadata.causal)
++                else None
++            ),
+             cp_world=self.dcp_world_size,
+             cp_rank=self.dcp_rank,
+         )
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
 index cc0232ec42..4bbf9f64b5 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
