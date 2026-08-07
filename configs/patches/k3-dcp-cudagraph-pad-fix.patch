@@ -1,25 +1,40 @@
 diff --git a/vllm/v1/attention/ops/common.py b/vllm/v1/attention/ops/common.py
-index 0701807ba9..c325ac6556 100644
+index 0701807ba9..29920bebd3 100644
 --- a/vllm/v1/attention/ops/common.py
 +++ b/vllm/v1/attention/ops/common.py
-@@ -23,8 +23,19 @@ def mask_dcp_empty_shards_(
+@@ -22,13 +22,29 @@ def mask_dcp_empty_shards_(
+     ):
          raise ValueError("query_start_loc must contain one boundary per sequence")
  
-     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-+    is_empty = seq_lens == 0
-+    # A full CUDA graph replays at a captured batch size, so the decode region
-+    # is padded out and `lse` has more rows than `query_start_loc` accounts for
-+    # (e.g. 3 real decodes replayed on the size-4 graph). repeat_interleave
-+    # requires output_size to equal the sum of repeats exactly and raises a
-+    # device-side assert otherwise, which kills EngineCore. Carry the padding as
-+    # one trailing segment; masking it is also what we want, since those rows
-+    # hold no query and must not contribute to the DCP combine.
-+    padding = lse.shape[0] - query_start_loc[-1]
-+    query_lens = torch.cat([query_lens, padding.reshape(1)])
-+    is_empty = torch.cat([is_empty, is_empty.new_ones(1)])
-     empty_rows = torch.repeat_interleave(
+-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+-    empty_rows = torch.repeat_interleave(
 -        seq_lens == 0,
-+        is_empty,
-         query_lens,
-         output_size=lse.shape[0],
+-        query_lens,
+-        output_size=lse.shape[0],
++    # Map each row of `lse` to the request that owns it, rather than expanding
++    # per-request repeats out to `lse`. `repeat_interleave` requires its repeats
++    # to sum to `output_size`, and `lse` is not always the length
++    # `query_start_loc` implies: a full CUDA graph replays at a captured batch
++    # size, so the decode region can be padded longer, and it can also come up
++    # short. Deriving a repeat count from that difference produces a negative
++    # entry in the short case, which sums correctly and so passes
++    # `repeat_interleave`'s own check while making its internal cumulative sum
++    # non-monotonic -- the gather then indexes out of bounds and takes
++    # EngineCore down with a device-side assert from IndexKernel.cu.
++    #
++    # searchsorted cannot go out of range: `idx` lands in [0, n] and the flag
++    # vector carries n + 1 entries, the last of which marks any row past the
++    # final boundary as empty. Padding rows are masked, which is what we want --
++    # they hold no query and must not contribute to the DCP combine. No host
++    # synchronisation, so this stays capturable.
++    row = torch.arange(
++        lse.shape[0], device=lse.device, dtype=query_start_loc.dtype
      )
+-    lse.masked_fill_(empty_rows[:, None], float("-inf"))
++    idx = torch.searchsorted(query_start_loc[1:], row, right=True)
++    is_empty = seq_lens == 0
++    flags = torch.cat([is_empty, is_empty.new_ones(1)])
++    lse.masked_fill_(flags[idx][:, None], float("-inf"))
+ 
+ 
+ @triton.jit
