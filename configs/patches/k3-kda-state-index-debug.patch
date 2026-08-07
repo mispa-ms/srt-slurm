@@ -1,5 +1,5 @@
 diff --git a/vllm/models/kimi_k3/nvidia/kda.py b/vllm/models/kimi_k3/nvidia/kda.py
-index 3bc3ab5de0..d6c69adb7c 100644
+index 3bc3ab5de0..d1fe124ce0 100644
 --- a/vllm/models/kimi_k3/nvidia/kda.py
 +++ b/vllm/models/kimi_k3/nvidia/kda.py
 @@ -1,6 +1,7 @@
@@ -10,7 +10,7 @@ index 3bc3ab5de0..d6c69adb7c 100644
  from collections.abc import Callable
  
  import torch
-@@ -51,6 +52,72 @@ logger = init_logger(__name__)
+@@ -51,6 +52,75 @@ logger = init_logger(__name__)
  
  _KDA_GATE_LOGBOUND_MIN = -5.0
  
@@ -26,6 +26,9 @@ index 3bc3ab5de0..d6c69adb7c 100644
 +
 +
 +def _kda_debug_check_state_indices(m, idx, recurrent_state, conv_state, prefix):
++    # The check syncs, which CUDA forbids while a graph is being captured.
++    if torch.cuda.is_current_stream_capturing():
++        return
 +    global _KDA_IDX_DEBUG_STEP
 +    _KDA_IDX_DEBUG_STEP += 1
 +    step = _KDA_IDX_DEBUG_STEP
@@ -83,7 +86,7 @@ index 3bc3ab5de0..d6c69adb7c 100644
  
  def a_log_weight_loader(
      shard_axis: int,
-@@ -544,6 +611,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
+@@ -544,6 +614,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
          beta = beta[:, :num_actual_tokens]
  
          conv_state, recurrent_state = self.kv_cache
@@ -102,7 +105,7 @@ index 3bc3ab5de0..d6c69adb7c 100644
          if not is_conv_state_dim_first():
              conv_state = conv_state.transpose(-1, -2)
 diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
-index 0bb4864d29..91e446ca2f 100644
+index 0bb4864d29..497d3d43ce 100644
 --- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
 +++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
 @@ -8,6 +8,7 @@ prefill KDA kernel internally, so this builder omits the shared FLA chunk
@@ -132,7 +135,7 @@ index 0bb4864d29..91e446ca2f 100644
              num_prefills=num_prefills,
              num_prefill_tokens=num_prefill_tokens,
              num_decodes=num_decodes,
-@@ -484,6 +488,14 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+@@ -484,6 +488,56 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
              batch_ptr=batch_ptr,
              token_chunk_offset_ptr=token_chunk_offset_ptr,
          )
@@ -143,7 +146,49 @@ index 0bb4864d29..91e446ca2f 100644
 +            md.dbg_cache_block_size = self.kv_cache_spec.block_size
 +            md.dbg_raw_block_table = m.block_table_tensor
 +            md.dbg_raw_block_table_width = m.block_table_tensor.shape[1]
++            self._dbg_log_sizing_once(m)
 +        return md
++
++    def _dbg_log_sizing_once(self, m) -> None:
++        """One line naming every input that decides the block-table width.
++
++        The width the builder receives (86 at DCP=8) does not match
++        cdiv(max_model_len, spec.block_size) = 683, which is what
++        MambaSpec.max_num_blocks_per_req returns in align mode -- and the slot
++        the Triton kernel reads is derived from spec.block_size. Whichever of
++        these disagrees is the defect; printing them all settles it without
++        another round of source reading.
++        """
++        if getattr(self, "_dbg_logged", False):
++            return
++        self._dbg_logged = True
++        import logging
++
++        spec = self.kv_cache_spec
++        cfg = self.vllm_config
++        cc = cfg.cache_config
++        max_len = cfg.model_config.max_model_len
++        try:
++            computed = spec.max_num_blocks_per_req(cfg, max_len)
++        except Exception as exc:  # noqa: BLE001
++            computed = f"raised {exc!r}"
++        logging.getLogger("vllm.models.kimi_k3.nvidia.kda_metadata").error(
++            "KDA-IDX sizing: spec=%s spec.block_size=%s spec.num_spec_blocks=%s "
++            "spec.mamba_cache_mode=%s spec.page_size_bytes=%s | "
++            "cache_config.block_size=%s cache_config.mamba_cache_mode=%s | "
++            "max_model_len=%s dcp=%s | "
++            "spec.max_num_blocks_per_req=%s  ACTUAL_bt_width=%s | "
++            "cdiv(max_len, spec.block_size)=%s cdiv(max_len, spec.block_size*dcp)=%s",
++            type(spec).__name__, spec.block_size,
++            getattr(spec, "num_speculative_blocks", None),
++            getattr(spec, "mamba_cache_mode", None), spec.page_size_bytes,
++            cc.block_size, cc.mamba_cache_mode, max_len,
++            cfg.parallel_config.decode_context_parallel_size,
++            computed, m.block_table_tensor.shape[1],
++            -(-max_len // spec.block_size),
++            -(-max_len // (spec.block_size
++                           * cfg.parallel_config.decode_context_parallel_size)),
++        )
  
  
  class KimiK3KDAAttentionBackend(GDNAttentionBackend):

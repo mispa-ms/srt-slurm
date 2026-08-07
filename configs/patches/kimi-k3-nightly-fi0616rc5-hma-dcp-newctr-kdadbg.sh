@@ -65,6 +65,10 @@ for rel, marker in [
     ('models/kimi_k3/nvidia/kda.py', 'def _kda_debug_check_state_indices'),
     ('models/kimi_k3/nvidia/kda.py', 'KDA-IDX BAD step=%d'),
     ('models/kimi_k3/nvidia/kda_metadata.py', 'md.dbg_seq_lens = m.seq_lens'),
+    ('models/kimi_k3/nvidia/kda_metadata.py', 'KDA-IDX sizing: spec=%s'),
+    # The first attempt died here: the check syncs, and CUDA forbids a sync
+    # while a graph is being captured (pipeline 61639393, FULL capture).
+    ('models/kimi_k3/nvidia/kda.py', 'torch.cuda.is_current_stream_capturing()'),
 ]:
     src = (root / rel).read_text()
     assert marker in src, f'KDA debug patch missing in {rel}: {marker}'
