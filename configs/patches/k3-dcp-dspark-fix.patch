@@ -20,10 +20,31 @@ index aa3fc67ea1..f6b6f3c439 100644
                      self.draft_model_config.hf_config, "num_lookahead_tokens"
                  ):
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index abe7de805c..53a2736979 100644
+index abe7de805c..e8e2022afa 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
-@@ -1980,12 +1980,23 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+@@ -1949,6 +1949,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         self._init_reorder_batch_threshold(
+             self.reorder_batch_threshold, supports_spec_decode, supports_dcp_with_varlen
+         )
++        # Instrumented: which builder ends up with which threshold decides
++        # whether a spec-decode capture can run at all under DCP, and there is
++        # no other way to attribute the capture-time assert to a KV cache group.
++        logger.info(
++            "MLA builder %s: reorder_batch_threshold=%d spec_as_decode=%s "
++            "dcp_with_varlen=%s dcp=%d non_causal_mtd=%s layers=%s",
++            type(self).__name__,
++            self.reorder_batch_threshold,
++            supports_spec_decode,
++            supports_dcp_with_varlen,
++            self.dcp_world_size,
++            self.non_causal_multi_token_decode,
++            list(layer_names)[:3],
++        )
+ 
+         if self.query_len_support == QueryLenSupport.SINGLE_ONLY:
+             assert self.reorder_batch_threshold == 1, (
+@@ -1980,12 +1994,33 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
          Currently, only decode is supported for full cudagraphs with MLA.
          """
          m = common_attn_metadata
@@ -48,7 +69,17 @@ index abe7de805c..53a2736979 100644
 +            )
  
 -        assert m.max_query_len <= self.reorder_batch_threshold  # decode only
-+            assert m.max_query_len <= self.reorder_batch_threshold  # decode only
++            # Instrumented: the bare assert says nothing about which builder
++            # instance tripped it, and a traceback through build_attn_metadata
++            # cannot be attributed to a KV cache group by eye.
++            assert m.max_query_len <= self.reorder_batch_threshold, (
++                f"decode-only capture: {type(self).__name__} "
++                f"max_query_len={m.max_query_len} "
++                f"threshold={self.reorder_batch_threshold} "
++                f"causal={m.causal} dcp={self.dcp_world_size} "
++                f"num_reqs={m.num_reqs} num_actual_tokens={m.num_actual_tokens} "
++                f"layers={list(self.layer_names)[:3]}"
++            )
  
          return self.build(0, m)
  
