@@ -59,9 +59,20 @@
 # a padding row query_start_loc does not account for. repeat_interleave then
 # fires a device-side assert -- "output_size argument (4) must be the same as
 # the sum of the elements in the repeats tensor (3)" -- and EngineCore dies.
-# The fix carries the padding as one trailing masked segment, which is also the
-# right semantics: those rows hold no query and must not reach the DCP combine.
-# When there is no padding the emitted mask is identical to before.
+# Our first attempt carried the padding as one trailing segment, derived from
+# lse.shape[0] - query_start_loc[-1]. That is right when the graph pads the
+# decode region longer, and wrong when lse comes up short: the count goes
+# negative, the repeats still sum to output_size so repeat_interleave's own
+# check passes, and its internal cumsum stops being monotonic -- the gather then
+# indexes out of bounds and EngineCore dies on IndexKernel.cu instead. Three runs
+# died that way (c2 at DCP4, c2 and c32 at DCP8) before the traceback was read
+# back to our own line.
+#
+# The current version maps each row of lse to its owning request with
+# searchsorted instead of expanding repeats. idx lands in [0, n] against a flag
+# vector of n + 1 entries, so it cannot leave the range in either direction, and
+# rows past the final boundary are masked. Differential-tested over 4,000 random
+# shapes: identical to the old version wherever the old one was valid.
 #
 # That masking is load-bearing. It is why the earlier revision of 60b327588
 # could drop its "no full-CUDA-graph support under DCP" guard, so a broken mask
@@ -138,7 +149,7 @@ present = [
     ('envs.py', 'VLLM_USE_DIRECT_DCP_A2A'),
     ('v1/core/kv_cache_coordinator.py', 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size'),
     # ours, not upstream: without it a padded decode batch kills EngineCore
-    ('v1/attention/ops/common.py', 'padding = lse.shape[0] - query_start_loc[-1]'),
+    ('v1/attention/ops/common.py', 'idx = torch.searchsorted(query_start_loc[1:], row, right=True)'),
     # ours, not upstream: hybrid + DCP + CPU offload
     ('v1/simple_kv_offload/manager.py', 'def _group_block_size'),
     ('v1/simple_kv_offload/manager.py', 'hit_length = hit_length // self.block_size'),
