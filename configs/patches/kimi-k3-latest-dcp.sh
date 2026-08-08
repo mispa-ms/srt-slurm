@@ -44,6 +44,20 @@
 #   k3-dcp-offload-hybrid-fix.patch    _group_block_size + the partial-hash-hit
 #                                      floor. Xin Li's 2026-07-29 report is
 #                                      still open and manager.py is unchanged.
+#   k3-mamba-blocktable-dcp-fix        gpu/model_runner.py sizes EVERY group's
+#                                      block table with cdiv(max_model_len,
+#                                      block_size * dcp_size), applying the DCP
+#                                      divisor to Mamba groups too. Mamba state
+#                                      is replicated across DCP ranks and never
+#                                      sharded. At DCP=8 the spec asks for 683
+#                                      columns and the runner allocates 86, and
+#                                      _get_aligned_state_indices_kernel bounds
+#                                      only the row -- so past 86 * 1536 =
+#                                      132,096 tokens it reads off the end. This
+#                                      track's median ISL is ~104k and AgentX
+#                                      sessions accumulate, so DCP=8 needs it.
+#                                      At DCP=4 the same arithmetic gives 171
+#                                      columns = 262,656 tokens.
 #   wzhao-d87cdf5ce4                   still a prerequisite under speculation:
 #                                      kv_cache_manager still carries
 #                                      `assert num_blocks <= len(group_blocks)`,
@@ -76,6 +90,7 @@ apply_patch() {
 apply_patch k3-dcp-pr50484-50493-latest
 apply_patch k3-dcp-offload-hybrid-fix
 apply_patch wzhao-d87cdf5ce4-partial-prefix-hits
+apply_patch k3-mamba-blocktable-dcp-fix
 
 echo "=== hybrid-KV recompute patch ==="
 python3 /configs/patches/patch_kimi_k3_mooncake_hma_recompute.py || echo "NOTE: hma recompute patch not applied"
@@ -96,6 +111,9 @@ present = [
     # d87
     ('v1/core/single_type_kv_cache_manager.py', 'cache_speculative_replay_tail'),
     ('v1/core/kv_cache_coordinator.py', 'eagle_group_ids'),
+    # Mamba groups must not take the DCP divisor on the block table
+    ('v1/worker/gpu/model_runner.py', 'kv_shard_count'),
+    ('models/kimi_k3/nvidia/kda_metadata.py', '_check_block_table_width'),
     # #50911: the draft no longer has to leave TOKENSPEED_MLA
     ('v1/attention/backends/mla/tokenspeed_mla.py',
      'supports_non_causal_multi_token_decode: ClassVar[bool] = True'),
