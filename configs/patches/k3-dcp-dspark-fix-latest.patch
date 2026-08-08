@@ -107,18 +107,10 @@ index 654f83b452..b4383de36a 100644
          if self.dcp_world_size > 1:
              query_dtype = (
 diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
-index 8ab81c438f..9bfab7c3e9 100644
+index 8ab81c438f..aaaf9cfecb 100644
 --- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
 +++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
-@@ -2,6 +2,7 @@
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
- 
-+import os
- from typing import TYPE_CHECKING, ClassVar
- 
- import torch
-@@ -31,6 +32,10 @@ if TYPE_CHECKING:
+@@ -31,6 +31,10 @@ if TYPE_CHECKING:
  
  logger = init_logger(__name__)
  
@@ -129,58 +121,31 @@ index 8ab81c438f..9bfab7c3e9 100644
  # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
  #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
  # Matches the kernel's `get_workspace_size` formula. MAX_Q_LEN=8 covers up to
-@@ -220,6 +225,11 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
-         self.softmax_scale: float | None = None
-         self.output_scale: float | None = None
- 
-+        # A/B switch for the per-query causal-bound flatten below. Default 1 =
-+        # the shipped behaviour. See the block in forward_mqa for what it costs
-+        # and why the answer is not obvious enough to hard-code either way.
-+        self._dcp_flatten = os.environ.get("VLLM_TS_MLA_DCP_FLATTEN", "1") == "1"
-+
-         # Pre-JIT BF16 and FP8 prefill kernels here too — decode impl always
-         # runs when tokenspeed is selected, prefill backend may not (user can
-         # pair with flash_attn / trtllm). Idempotent.
-@@ -266,9 +276,96 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+@@ -266,9 +270,42 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
          seq_lens = attn_metadata.decode.seq_lens
          causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
  
-+        # causal_seqs is ONE global bound per request, but a causal multi-token
-+        # block needs one per query: query j of a q_len block ending at global
-+        # length L must see KV up to L - (q_len - 1 - j). Handing every query
-+        # the block's final bound lets the earlier ones attend to the KV of the
-+        # tokens that follow them -- corrupting position 1 the most, position 2
-+        # less, and the last not at all. That is the acceptance-rate signature
-+        # we measured (pos1 -42%, pos2 -29% against dcp1 on the same stack).
++        # NO PER-QUERY REWORK HERE: THE KERNEL ALREADY DOES IT.
++        # mla_decode_fp8.py computes, per query token q_tok of a causal block,
++        #   k_bound = ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world)
++        # which is exactly the rank-local count of keys below that query's global
++        # causal horizon; the wrapper folds cp_rank in, and mask_tile_count
++        # over-covers rather than under-covers under DCP.
 +        #
-+        # Off DCP the kernel derives per-query bounds from the contiguous
-+        # layout. Under DCP the rank-local index no longer tracks the global
-+        # position, so it cannot. Flatten the block to single-token rows and
-+        # give each its own bound, the same way FlashInferMLA flattens its
-+        # non-causal block. vllm#50391 describes this requirement; its tests
-+        # cover multi-token at dcp=1 and DCP at one token per decode, never both.
++        # This used to flatten the block to [B*q_len, 1, H, D] to hand each query
++        # its own bound. Measured at c8/dcp8 that was worse on every axis. It
++        # defeats the kernel's fold of q_len into the MMA M dimension
++        # (get_mla_decode_fold_sq_factor), so the KV is read q_len times instead
++        # of once: removing it moved ITL p90 -8.4%, x p10 +6.0% and tok/s/GPU
++        # +4.3% at a matched synthetic acceptance. And acceptance was LOWER with
++        # it than without -- AL 1.622 vs 1.587, pos1 0.407 vs 0.384, on standard
++        # rejection -- so it was not buying correctness either.
 +        #
-+        # WHAT THE FLATTEN COSTS, AND WHY IT IS A SWITCH.
-+        # The kernel folds q_len into the MMA M dimension
-+        # (get_mla_decode_fold_sq_factor), so a [B, q_len, H, D] block loads each
-+        # request's KV once and shares it across all q_len queries. Flattening to
-+        # [B*q_len, 1, H, D] defeats the fold: q_len separate passes over the same
-+        # KV. On a ~100k-token memory-bound decode that is 3x the traffic at ns2
-+        # and 8x at ns7, and it shows -- ITL p90 runs 1.30x no-spec at c8/c16
-+        # against the 3/2.51 = 1.195 the flatten alone predicts.
-+        #
-+        # It is also out of all proportion to what it fixes: the per-query LOCAL
-+        # bounds span at most ceil((q_len-1)/dcp) slots, which is ONE slot at
-+        # dcp8 for both ns2 and ns7, out of ~12,500 local slots at 100k context.
-+        #
-+        # And the kernel already implements this bound --
-+        # k_bound = ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world),
-+        # algebraically identical to what this block computes, with the wrapper
-+        # folding cp_rank in. Statically that path reads correct, yet dcp4 measured
-+        # AL 1.145 without the flatten and 1.218 with it on the same stack. Reading
-+        # has not closed that gap, so measure it: VLLM_TS_MLA_DCP_FLATTEN=0 takes
-+        # the kernel's own path. If AL holds there, this block should be deleted
-+        # rather than optimised.
++        # The dcp4 pair that originally motivated it (AL 1.145 -> 1.218) predates
++        # k3-mamba-blocktable-dcp-fix. At dcp4, 7-9% of that workload's requests
++        # crossed the 262,656-token Mamba block-table bound and silently
++        # corrupted KDA state. That was the acceptance defect, not the causal
++        # bound; the static reading of the kernel was right all along.
 +        q_len_per_req = num_decode_tokens // num_decodes if num_decodes else 0
 +        if self.dcp_world_size > 1 and q_len_per_req > 1:
 +            key = (bool(attn_metadata.causal), q_len_per_req)
@@ -188,50 +153,11 @@ index 8ab81c438f..9bfab7c3e9 100644
 +                _SEEN_DCP_BLOCK_SHAPES.add(key)
 +                logger.info(
 +                    "TokenspeedMLA DCP multi-token block: causal=%s q_len=%d "
-+                    "dcp=%d/%d interleave=%d flatten=%s -> %s",
-+                    key[0],
-+                    q_len_per_req,
-+                    self.dcp_rank,
-+                    self.dcp_world_size,
-+                    self.cp_kv_cache_interleave_size,
-+                    self._dcp_flatten,
-+                    "flattened to single-token rows"
-+                    if (key[0] and self._dcp_flatten and causal_seqs is not None)
-+                    else "kernel causal path",
++                    "dcp=%d/%d interleave=%d -> kernel causal path",
++                    key[0], q_len_per_req, self.dcp_rank,
++                    self.dcp_world_size, self.cp_kv_cache_interleave_size,
 +                )
 +
-+        if (
-+            self._dcp_flatten
-+            and attn_metadata.causal
-+            and self.dcp_world_size > 1
-+            and q_len_per_req > 1
-+            # An uneven batch makes q_len_per_req a floor, and the reshape below
-+            # would then be a numel mismatch. Fall through to the branch that
-+            # already warns about it instead of raising from here.
-+            and num_decode_tokens % num_decodes == 0
-+            and causal_seqs is not None
-+        ):
-+            offsets = torch.arange(
-+                q_len_per_req - 1, -1, -1, device=causal_seqs.device, dtype=causal_seqs.dtype
-+            )
-+            # [num_decodes, q_len] -> flattened per-query global bounds
-+            per_q_global = (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1)
-+            per_q_global = torch.clamp(per_q_global, min=0)
-+
-+            # Rank-local length of each global bound, matching
-+            # prepare_dcp_local_seq_lens in vllm/v1/worker/gpu/cp_utils.py.
-+            interleave = self.cp_kv_cache_interleave_size
-+            span = self.dcp_world_size * interleave
-+            rounds = per_q_global // span
-+            remainder = torch.clamp(
-+                per_q_global % span - self.dcp_rank * interleave, min=0
-+            )
-+            remainder = torch.clamp(remainder, max=interleave)
-+            seq_lens = rounds * interleave + remainder
-+
-+            causal_seqs = per_q_global
-+            block_tables = block_tables.repeat_interleave(q_len_per_req, dim=0)
-+            q = q.view(num_decodes * q_len_per_req, 1, q.shape[-2], q.shape[-1])
          # tokenspeed_mla_decode expects query shape
          # (num_decodes, q_len_per_request, num_heads, head_dim).
 -        if num_decode_tokens % num_decodes != 0:
