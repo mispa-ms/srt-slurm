@@ -74,21 +74,37 @@ profiling__start_profile_on_worker() {
         return 1
     fi
 
-    local start_path=""
+    local -a start_paths=()
     case "${SRTCTL_FRONTEND_TYPE}" in
-        dynamo) start_path="/engine/start_profile" ;;
-        sglang|vllm) start_path="/start_profile" ;;
+        # Dynamo renamed the engine routes to a control/ prefix. A worker on a
+        # build carrying the new names logs
+        #   Registered engine routes: control/sleep, control/wake_up,
+        #   control/scale_elastic_ep, control/start_profile, control/stop_profile
+        # and 404s on /engine/start_profile. Try the current name first and fall
+        # back, so this works on either build.
+        dynamo) start_paths=("/control/start_profile" "/engine/start_profile") ;;
+        sglang|vllm) start_paths=("/start_profile") ;;
         *)
             echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'sglang', or 'vllm')" >&2
             return 1
             ;;
     esac
 
-    if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
-        return 0
-    fi
-    echo "Warning: failed to start profiling on ${hostport}"
-    return 0
+    local start_path
+    for start_path in "${start_paths[@]}"; do
+        if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
+            echo "Armed profiling on ${hostport}${start_path}"
+            return 0
+        fi
+        echo "Note: POST ${start_path} to ${hostport} did not succeed, trying next route"
+    done
+
+    # Do not swallow this. Returning 0 here means the sweep runs to completion,
+    # reports success, and writes no trace at all: nsys is launched with
+    # -c cudaProfilerApi and waits for a cudaProfilerStart() that only fires
+    # once vLLM's CudaProfilerWrapper has been armed by this POST.
+    echo "Error: failed to start profiling on ${hostport} (tried: ${start_paths[*]})" >&2
+    return 1
 }
 
 profiling__stop_profile_on_worker() {
