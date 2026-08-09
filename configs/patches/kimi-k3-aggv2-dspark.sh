@@ -96,37 +96,56 @@ assert 'prepare_dcp_local_seq_lens(' in read('v1/worker/gpu/spec_decode/dflash/c
 )
 assert 'dcp_local_seq_lens' in read('v1/worker/gpu/spec_decode/speculator.py')
 
-# --- what must NOT be here ---
+# --- the flatten switch, and the invariant it must not break ---
 ts = read('v1/attention/backends/mla/tokenspeed_mla.py')
-assert 'repeat_interleave' not in ts, (
-    'the per-query causal-bound flatten is back; it was withdrawn on measurement'
-)
 assert 'supports_non_causal_multi_token_decode: ClassVar[bool] = True' in ts, (
     'vllm#50911 missing -- without it the draft is forced off TOKENSPEED_MLA and '
     'the DCP reorder threshold collapses to 1'
 )
+flat = [l for l in ts.splitlines() if l.startswith('_DCP_FLATTEN = os.environ.get')]
+assert len(flat) == 1 and 'VLLM_TS_MLA_DCP_FLATTEN' in flat[0], (
+    'the per-query causal-bound flatten switch is missing'
+)
+assert flat[0].split(',')[1].strip().strip(chr(34) + chr(39)).startswith('0'), (
+    'the per-query causal-bound flatten switch is missing, or no longer defaults off'
+)
 
-# forward_mqa must reshape q to 4D on EVERY path. That reshape sits in an
-# if/elif/else and a preceding standalone if is one edit from becoming the head
-# of the chain, which skips it on exactly the DCP multi-token path and hands the
-# kernel a 3D query -- an unpack error 15 minutes into startup, spec arms only.
-# Checked as control flow, because a text check sees the reshape either way.
+# q must be reshaped to 4D on EVERY path into the kernel. The reshape lives in
+# an if/elif/else whose head is the flatten branch, so the earlier check that it
+# was a top-level statement is now wrong -- the real invariant is that every
+# branch of the chain assigns q from .view/.unsqueeze. Getting this wrong hands
+# the kernel a 3D query: an unpack error 15 minutes into startup, spec arms only.
 fn = next(n for n in ast.walk(ast.parse(ts))
           if isinstance(n, ast.FunctionDef) and n.name == 'forward_mqa')
-reshape = None
-for st in ast.walk(fn):
-    if isinstance(st, ast.If) and st.orelse and any(
-            isinstance(x, ast.Attribute) and x.attr == 'view'
-            for b in st.orelse for x in ast.walk(b)):
-        reshape = st
-assert reshape is not None, 'forward_mqa has no 4D reshape branch'
-assert 'num_decode_tokens % num_decodes' in ast.unparse(reshape.test), (
-    f'the q reshape is guarded by {ast.unparse(reshape.test)!r}, not the uneven-length test'
-)
-assert reshape in fn.body, (
-    'the q reshape has been chained onto a preceding if, so some path reaches '
-    'the kernel with a 3D query'
-)
+
+def reshapes_q(body):
+    for st in body:
+        for n in ast.walk(st):
+            if (isinstance(n, ast.Assign)
+                    and any(getattr(t, 'id', None) == 'q' for t in n.targets)
+                    and isinstance(n.value, ast.Call)
+                    and getattr(n.value.func, 'attr', '') in ('view', 'unsqueeze')):
+                return True
+    return False
+
+chain = None
+for st in fn.body:
+    if not isinstance(st, ast.If):
+        continue
+    c, node = [], st
+    while True:
+        c.append(node)
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            node = node.orelse[0]
+        else:
+            break
+    if any('num_decode_tokens % num_decodes' in ast.unparse(x.test) for x in c):
+        chain = c
+        break
+assert chain is not None, 'forward_mqa has no if-chain containing the uneven-length test'
+bad = [ast.unparse(x.test)[:60] for x in chain if not reshapes_q(x.body)]
+assert not bad, f'these branches reach the kernel without reshaping q: {bad}'
+assert reshapes_q(chain[-1].orelse), 'the final else does not reshape q'
 
 # --- v2 itself must be untouched by all of the above ---
 for rel, marker, who in [
