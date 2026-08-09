@@ -302,10 +302,17 @@ class BenchmarkStageMixin:
             return env
 
         # Manual on-demand mode: workers are already nsys-wrapped at launch and the
-        # user fires the capture by hand (nsys-manual.sh). Export nothing here so the
-        # benchmark script's start_all_profiling/stop_all_profiling stay no-ops.
-        if p.is_nsys_manual:
-            return env
+        # capture is fired separately, so PROFILE_TYPE and PROFILE_OUTPUT_DIR stay
+        # unset and the benchmark script's start_all_profiling/stop_all_profiling
+        # remain no-ops.
+        #
+        # The endpoint lists are still exported. Upstream returns here outright,
+        # which is right when a human runs nsys-manual.sh, but in CI nobody is
+        # watching the job -- benchmark.command has to fire the two POSTs itself,
+        # and without these it has no address to send them to. That is a silent
+        # failure: the run goes green and captures nothing, which is what
+        # 61837113 did.
+        manual_only = p.is_nsys_manual
 
         # Inside the container, the host log directory is mounted to /logs. Use the container path so profiling
         # artifacts persist back to the host log directory across nodes.
@@ -372,6 +379,9 @@ class BenchmarkStageMixin:
             env["PROFILE_DECODE_ENDPOINTS"] = ",".join(decode_endpoints)
         if agg_endpoints:
             env["PROFILE_AGG_ENDPOINTS"] = ",".join(agg_endpoints)
+
+        if manual_only:
+            return env
 
         # Set profile output directory and common env vars for benchmarks that support profiling.
         # AgentX is here because iteration-based nsys needs a POST to /start_profile: vLLM's
