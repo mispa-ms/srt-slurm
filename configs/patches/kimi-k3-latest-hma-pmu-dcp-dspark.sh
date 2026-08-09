@@ -129,5 +129,33 @@ assert dflash.count('// (block_size * CP_SIZE)') == 2, (
     'expected both dflash slot sites to index with block_size * CP_SIZE'
 )
 
+# forward_mqa must still reshape q to 4D on EVERY path. The reshape lives in an
+# if/elif/else, and a preceding standalone `if` is one edit away from becoming
+# the head of that chain -- which skips the reshape on exactly the DCP
+# multi-token path and hands the kernel a 3D query. That is a shape unpack
+# error 15 minutes into startup, on the spec arms only, so check the control
+# flow here rather than the text.
+import ast
+fnsrc = (root / 'v1/attention/backends/mla/tokenspeed_mla.py').read_text()
+tree = ast.parse(fnsrc)
+fn = next(n for n in ast.walk(tree)
+          if isinstance(n, ast.FunctionDef) and n.name == 'forward_mqa')
+reshape_if = None
+for st in ast.walk(fn):
+    if isinstance(st, ast.If) and st.orelse and any(
+            isinstance(n, ast.Attribute) and n.attr == 'view'
+            for b in st.orelse for n in ast.walk(b)):
+        reshape_if = st
+assert reshape_if is not None, 'forward_mqa has no 4D reshape branch'
+assert 'num_decode_tokens % num_decodes' in ast.unparse(reshape_if.test), (
+    f'the q reshape is guarded by {ast.unparse(reshape_if.test)!r}, not the '
+    f'uneven-length test'
+)
+assert reshape_if in fn.body, (
+    'the q reshape is no longer a top-level statement of forward_mqa -- it has '
+    'been chained onto a preceding if, so some path reaches the kernel with a '
+    '3D query'
+)
+
 print('DSpark DCP patch verified in', root)
 "

@@ -107,7 +107,7 @@ index 654f83b452..b4383de36a 100644
          if self.dcp_world_size > 1:
              query_dtype = (
 diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
-index 8ab81c438f..aaaf9cfecb 100644
+index 8ab81c438f..336d601f20 100644
 --- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
 +++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
 @@ -31,6 +31,10 @@ if TYPE_CHECKING:
@@ -121,7 +121,7 @@ index 8ab81c438f..aaaf9cfecb 100644
  # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
  #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
  # Matches the kernel's `get_workspace_size` formula. MAX_Q_LEN=8 covers up to
-@@ -266,9 +270,42 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+@@ -266,8 +270,43 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
          seq_lens = attn_metadata.decode.seq_lens
          causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
  
@@ -159,12 +159,13 @@ index 8ab81c438f..aaaf9cfecb 100644
 +                )
 +
          # tokenspeed_mla_decode expects query shape
-         # (num_decodes, q_len_per_request, num_heads, head_dim).
--        if num_decode_tokens % num_decodes != 0:
-+        elif num_decode_tokens % num_decodes != 0:
+-        # (num_decodes, q_len_per_request, num_heads, head_dim).
++        # (num_decodes, q_len_per_request, num_heads, head_dim). Standalone `if`,
++        # not chained to the logging above: chaining it skips the reshape on
++        # exactly the DCP multi-token path and the kernel gets a 3D query.
+         if num_decode_tokens % num_decodes != 0:
              logger.warning_once(
                  """TokenspeedMLAImpl got a query of uneven length.
-                 This usually indicates an issue in batch reordering
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
 index cc0232ec42..4bbf9f64b5 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
