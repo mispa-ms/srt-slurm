@@ -1223,6 +1223,105 @@ class TestWorkerEnvironmentTemplating:
                     # Mixed case: supported replaced, unsupported kept
                     assert env_vars["MIXED"] == "gpu-01-{unsupported_var}-cache"
 
+    def _start_worker_env(self, tmp_path, backend, environment=None):
+        """Start one prefill worker and return the env srtctl would export to srun."""
+        import os
+        import subprocess
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.cli.mixins.worker_stage import WorkerStageMixin
+        from srtctl.core.runtime import RuntimeContext
+        from srtctl.core.schema import ModelConfig, ResourceConfig, SrtConfig
+        from srtctl.core.topology import Process
+
+        model_path = tmp_path / "model"
+        model_path.mkdir(exist_ok=True)
+        container_path = tmp_path / "container.sqsh"
+        container_path.touch()
+
+        slurm_env = {
+            "SLURM_JOB_ID": "12345",
+            "SLURM_JOBID": "12345",
+            "SLURM_NODELIST": "gpu-[01-03]",
+            "SLURM_JOB_NUM_NODES": "3",
+            "SRTCTL_SOURCE_DIR": str(Path(__file__).parent.parent),
+        }
+
+        def mock_scontrol(cmd, **kwargs):
+            if cmd[0] == "scontrol" and "hostnames" in cmd:
+                result = MagicMock()
+                result.stdout = "gpu-01\ngpu-02\ngpu-03"
+                result.returncode = 0
+                return result
+            raise subprocess.CalledProcessError(1, cmd)
+
+        with (
+            patch.dict(os.environ, slurm_env),
+            patch("subprocess.run", mock_scontrol),
+            patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"),
+        ):
+            config = SrtConfig(
+                name="test",
+                model=ModelConfig(path=str(model_path), container=str(container_path), precision="fp8"),
+                resources=ResourceConfig(gpu_type="h100", gpus_per_node=8, prefill_nodes=1, decode_nodes=1),
+                backend=backend,
+                environment=environment or {},
+            )
+            runtime = RuntimeContext.from_config(config, job_id="12345", log_dir_base=tmp_path)
+
+            class MockWorkerStage(WorkerStageMixin):
+                def __init__(self, config, runtime):
+                    self.config = config
+                    self.runtime = runtime
+
+            worker_stage = MockWorkerStage(config, runtime)
+            process = Process(
+                node="gpu-01",
+                gpu_indices=frozenset(range(8)),
+                sys_port=8081,
+                http_port=30000,
+                endpoint_mode="prefill",
+                endpoint_index=0,
+                node_rank=0,
+            )
+
+            mock_backend = MagicMock()
+            mock_backend.get_environment_for_mode.side_effect = config.backend.get_environment_for_mode
+            mock_backend.build_worker_command.return_value = ["echo", "test"]
+
+            with (
+                patch.object(worker_stage, "config") as mock_config,
+                patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+            ):
+                mock_config.backend = mock_backend
+                mock_config.profiling = config.profiling
+                mock_srun.return_value = MagicMock()
+                worker_stage.start_worker(process, [process])
+                return mock_srun.call_args.kwargs.get("env_to_set", {})
+
+    def test_worker_gets_quiet_dynamo_defaults(self, tmp_path):
+        """Dynamo's own defaults (info + ANSI colors) make worker logs unreadable."""
+        from srtctl.backends import SGLangProtocol
+
+        env_vars = self._start_worker_env(tmp_path, SGLangProtocol())
+
+        assert env_vars["DYN_LOG"] == "error"
+        assert env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] == "1"
+
+    def test_recipe_overrides_dynamo_defaults(self, tmp_path):
+        """Both the global environment block and per-mode env win over the defaults."""
+        from srtctl.backends import SGLangProtocol
+
+        env_vars = self._start_worker_env(
+            tmp_path,
+            SGLangProtocol(prefill_environment={"DYN_SDK_DISABLE_ANSI_LOGGING": "0"}),
+            environment={"DYN_LOG": "debug"},
+        )
+
+        assert env_vars["DYN_LOG"] == "debug"
+        assert env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] == "0"
+
 
 class TestInfraConfig:
     """Tests for InfraConfig dataclass."""
@@ -2048,6 +2147,119 @@ class TestVLLMDataParallelMode:
                 dp_launch_mode="per_node",
                 vllm_config=VLLMServerConfig(decode={"data-parallel-size": 8, "headless": True}),
             )
+
+    def test_direct_vllm_dp_mode_keeps_single_process(self):
+        """Direct vllm serve supervises local DP ranks from one process."""
+        from srtctl.backends import VLLMProtocol, VLLMServerConfig
+        from srtctl.core.topology import Endpoint
+
+        backend = VLLMProtocol(
+            vllm_config=VLLMServerConfig(
+                aggregated={"data-parallel-size": 8, "enable-expert-parallel": True},
+            )
+        )
+
+        endpoint = Endpoint(
+            mode="agg",
+            index=0,
+            nodes=("node0",),
+            gpu_indices=frozenset(range(8)),
+            gpus_per_node=8,
+        )
+
+        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm")
+
+        assert len(processes) == 1
+        assert processes[0].node == "node0"
+        assert processes[0].gpu_indices == frozenset(range(8))
+
+    def test_direct_vllm_command_preserves_current_main_device_binding(self):
+        """Direct vllm serve uses the public port and main's --device-ids binding."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.backends import VLLMProtocol, VLLMServerConfig
+        from srtctl.core.topology import Process
+
+        backend = VLLMProtocol(
+            vllm_config=VLLMServerConfig(
+                aggregated={
+                    "data-parallel-size": 4,
+                    "enable-expert-parallel": True,
+                }
+            )
+        )
+        process = Process(
+            node="node0",
+            gpu_indices=frozenset(range(4)),
+            sys_port=8081,
+            http_port=0,
+            endpoint_mode="agg",
+            endpoint_index=0,
+            node_rank=0,
+        )
+        runtime = MagicMock()
+        runtime.model_path = Path("/model")
+        runtime.is_hf_model = False
+        runtime.frontend_port = 9000
+
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+            cmd = backend.build_worker_command(
+                process=process,
+                endpoint_processes=[process],
+                runtime=runtime,
+                frontend_type="vllm",
+            )
+
+        assert cmd[:3] == ["vllm", "serve", "/model"]
+        assert cmd[cmd.index("--port") + 1] == "9000"
+        assert cmd[cmd.index("--device-ids") + 1] == "0,1,2,3"
+        assert "--request-plane" not in cmd
+        assert "dynamo.vllm" not in cmd
+
+    def test_direct_vllm_command_keeps_iteration_profiler_config(self):
+        """Direct vllm serve retains main's profiling-derived server option."""
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.backends import VLLMProtocol, VLLMServerConfig
+        from srtctl.core.topology import Process
+
+        backend = VLLMProtocol(vllm_config=VLLMServerConfig(aggregated={"tensor-parallel-size": 4}))
+        process = Process(
+            node="node0",
+            gpu_indices=frozenset(range(4)),
+            sys_port=8081,
+            http_port=0,
+            endpoint_mode="agg",
+            endpoint_index=0,
+            node_rank=0,
+        )
+        runtime = MagicMock()
+        runtime.model_path = Path("/model")
+        runtime.is_hf_model = False
+        runtime.frontend_port = 8000
+        profiling = MagicMock(is_nsys=True, is_nsys_time=False, is_nsys_manual=False)
+        profiling.profiles_mode.return_value = True
+        profiling._get_phase_config.return_value = SimpleNamespace(
+            start_step=10,
+            stop_step=25,
+            vllm_nsys_delay_iterations=10,
+            vllm_nsys_max_iterations=15,
+        )
+
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+            cmd = backend.build_worker_command(
+                process=process,
+                endpoint_processes=[process],
+                runtime=runtime,
+                frontend_type="vllm",
+                profiling=profiling,
+            )
+
+        profiler_config = json.loads(cmd[cmd.index("--profiler-config") + 1])
+        assert profiler_config == {"profiler": "cuda", "delay_iterations": 10, "max_iterations": 15}
 
     def test_dp_mode_allocates_unique_ports_for_multiple_endpoints_per_node(self):
         """Test DP endpoints sharing a node get non-colliding coordination ports."""
