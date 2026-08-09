@@ -72,23 +72,37 @@ python3 -m pip install --no-deps py-spy || echo "[pyspy] install failed, continu
 
 if command -v py-spy >/dev/null 2>&1; then
     mkdir -p /logs/pyspy
+    # Match on the process title vLLM actually sets -- set_process_title writes
+    # "VLLM::<name>" (system_utils.py), so the workers are VLLM::Worker_TP0 and
+    # so on. The first attempt matched "VllmWorker", which is the log prefix and
+    # not a process name, and caught nothing but this loop itself: pgrep -f sees
+    # our own command line, so the pattern matched a fresh subshell every cycle
+    # and every real worker was missed. PYSPY_SELF is how we exclude ourselves.
     nohup setsid bash -c '
       N=0
       while [ "$N" -lt 600 ]; do
         SLOT=$(( N % 30 ))
         rm -f "/logs/pyspy/slot${SLOT}_"*.txt 2>/dev/null || true
         STAMP=$(date -u +%H%M%S)
-        for pid in $(pgrep -f "VllmWorker|EngineCore" 2>/dev/null | head -24); do
+        K=0
+        for pid in $(pgrep -f "VLLM::" 2>/dev/null); do
+          if grep -qa PYSPY_SELF "/proc/${pid}/cmdline" 2>/dev/null; then continue; fi
+          TITLE=$(tr -d "\0" < "/proc/${pid}/cmdline" 2>/dev/null | cut -c1-40)
           timeout 25 py-spy dump --pid "$pid" --nonblocking \
             > "/logs/pyspy/slot${SLOT}_${STAMP}_pid${pid}.txt" 2>&1 || true
-          timeout 40 py-spy dump --pid "$pid" --nonblocking --native \
-            > "/logs/pyspy/slot${SLOT}_${STAMP}_pid${pid}_native.txt" 2>&1 || true
+          echo "$TITLE" >> "/logs/pyspy/slot${SLOT}_${STAMP}_pid${pid}.txt"
+          if [ "$K" -lt 3 ]; then
+            timeout 60 py-spy dump --pid "$pid" --nonblocking --native \
+              > "/logs/pyspy/slot${SLOT}_${STAMP}_pid${pid}_native.txt" 2>&1 || true
+          fi
+          K=$(( K + 1 ))
         done
+        echo "[pyspy] cycle $N slot $SLOT dumped $K process(es)" >> /logs/pyspy/dumper.log
         N=$(( N + 1 ))
         sleep 30
       done
-    ' </dev/null >/logs/pyspy/dumper.log 2>&1 &
-    echo "[pyspy] dumper started, writing to /logs/pyspy"
+    ' </dev/null >>/logs/pyspy/dumper.log 2>&1 &
+    echo "[pyspy] dumper started (PYSPY_SELF), writing to /logs/pyspy"
 else
     echo "[pyspy] py-spy not on PATH, no stack dumps this run"
 fi
