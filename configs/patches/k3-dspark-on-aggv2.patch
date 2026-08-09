@@ -149,6 +149,150 @@ index 6dd8fd3474..c1b62290a6 100644
 +    remainder = block_offsets % CP_INTERLEAVE
 +    local_offsets = rounds * CP_INTERLEAVE + remainder
 +    return tl.where(is_local, block_numbers * block_size + local_offsets, PAD_ID)
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3a174cba80..9d7e70eccf 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -35,7 +35,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, is_uniform_query_len
+ 
+ logger = init_logger(__name__)
+ 
+@@ -97,10 +97,13 @@ def get_uniform_token_count(
+     """
+     Return the uniform token count if batch is uniform, else None.
+     A batch is uniform if all requests have the same number of tokens.
++
++    This is a shape test, so it is only valid for batches whose requests are
++    known to be decoding by construction (e.g. dummy runs, or a drafter step
++    that emits a fixed number of tokens per request). Batches coming from a
++    scheduler step must go through `get_uniform_decode_token_count`.
+     """
+-    if (max_query_len == num_tokens // num_reqs) and (
+-        num_tokens == max_query_len * num_reqs
+-    ):
++    if is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+         return max_query_len
+     return None
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index bd85145617..05302347bc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -133,7 +133,12 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+ from vllm.v1.worker.gpu.states import RequestState
+ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
++from vllm.v1.worker.utils import (
++    KVBlockZeroer,
++    copy_kv_cache_blocks_inplace,
++    get_uniform_decode_token_count,
++    is_uniform_query_len,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1248,6 +1253,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+         )
+ 
++    def _get_uniform_token_count(
++        self,
++        scheduler_output: SchedulerOutput,
++        num_reqs: int,
++        num_tokens: int,
++        max_query_len: int,
++        dummy_run: bool,
++    ) -> int | None:
++        """Per-request token count of a uniform decode batch, or None.
++
++        Dummy batches (DP padding, memory profiling, warmup) are uniform by
++        construction and have no request state to consult, so they are
++        classified by shape alone. This mirrors `InputBatch.make_dummy`, which
++        marks every dummy request as not prefilling.
++        """
++        if dummy_run:
++            return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
++        # Shape first. This is the same test get_uniform_decode_token_count
++        # runs before it looks at any request state, and it rejects every
++        # mixed prefill/decode batch, which is most of them. Checking it here
++        # keeps the gather below off the hot path in that case.
++        if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++            return None
++        idx_mapping_np = np.fromiter(
++            map(
++                self.req_states.req_id_to_index.__getitem__,
++                scheduler_output.num_scheduled_tokens,
++            ),
++            dtype=np.intp,
++            count=num_reqs,
++        )
++        return get_uniform_decode_token_count(
++            num_reqs,
++            num_tokens,
++            max_query_len,
++            self.req_states.num_computed_prefill_tokens[idx_mapping_np],
++            self.req_states.prefill_len.np[idx_mapping_np],
++        )
++
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -1274,7 +1318,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
++        uniform_tok_count = self._get_uniform_token_count(
++            scheduler_output, num_reqs, num_toks, max_query_len, dummy_run
++        )
+ 
+         num_active_loras = 0
+         if self.lora_config:
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 7dbd811253..c34ddb0302 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -11,16 +11,14 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    BatchExecutionDescriptor,
+-    get_uniform_token_count,
+-)
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+ )
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -204,12 +202,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             # Use the actual number of tokens without padding added by
+             # the target model during FULL cudagraph.
+             input_batch.num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.prefill_cudagraph_manager,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
 index e59202c879..93dbb5aa14 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
@@ -313,6 +457,42 @@ index 333648637b..a05cafd652 100644
 +        CP_INTERLEAVE=cp_interleave,
          BLOCK_SIZE=BLOCK_SIZE,
      )
+diff --git a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index 4be22b4474..61d1c0003f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -12,9 +12,6 @@ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    get_uniform_token_count,
+-)
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+@@ -22,6 +19,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -190,10 +188,12 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.cudagraph_manager,
 diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
 index 69e0cc1091..80de83109b 100644
 --- a/vllm/v1/worker/gpu/spec_decode/speculator.py
@@ -337,3 +517,71 @@ index 69e0cc1091..80de83109b 100644
              max_seq_len=self.draft_max_seq_len,
              block_tables=block_tables,
              slot_mappings=slot_mappings,
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9d056cc67c..998d75eb44 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -601,6 +601,63 @@ def copy_kv_cache_blocks_inplace(
+         blocks[dst_indices] = blocks[src_indices]
+ 
+ 
++def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
++    """Whether every request in the batch has the same query length.
++
++    This tests the batch shape only. Callers classifying a scheduled batch as a
++    decode batch must use ``get_uniform_decode_token_count`` instead, because a
++    prompt chunk can have a decode batch's shape.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++    """
++    return num_reqs > 0 and num_tokens == max_query_len * num_reqs
++
++
++def get_uniform_decode_token_count(
++    num_reqs: int,
++    num_tokens: int,
++    max_query_len: int,
++    num_computed_tokens: np.ndarray,
++    prefill_lens: np.ndarray,
++) -> int | None:
++    """Per-request token count of a uniform decode batch, or None.
++
++    A batch is a uniform decode batch only if every request has the same query
++    length *and* no request is still prefilling. Query length alone is a shape
++    test that a prompt chunk satisfies by coincidence: a prompt chunk of
++    ``1 + num_speculative_tokens`` tokens has the shape of a spec-decode step,
++    and a 1-token chunk has the shape of a plain decode step. Classifying such
++    a batch as a decode batch replays a decode-captured cudagraph over prompt
++    tokens, whose captured kernels read per-request state that a prefill
++    metadata build does not refresh.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++        num_computed_tokens: Per-request tokens computed before this step, in
++            batch order. Must be exactly ``num_reqs`` long; a full
++            ``max_num_reqs`` state array would compare the wrong requests.
++        prefill_lens: Per-request prefill length, i.e. the prompt plus any
++            output tokens recomputed after preemption, in batch order. Same
++            length requirement.
++
++    Returns:
++        The shared per-request query length, or None if the batch is not a
++        uniform decode batch.
++    """
++    if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++        return None
++    # Equivalent to `InputBatch.is_prefilling_np.any()`, which the drafter's
++    # call site derives from the same two arrays.
++    if np.any(num_computed_tokens < prefill_lens):
++        return None
++    return max_query_len
++
++
+ def is_residual_scattered_for_sp(
+     vllm_config: VllmConfig, num_input_tokens: int
+ ) -> bool:

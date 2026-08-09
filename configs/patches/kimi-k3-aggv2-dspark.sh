@@ -12,7 +12,8 @@
 # before any GPU time is spent.
 #
 # WHAT IS PATCHED, and nothing else. From
-# mispa-ms/vllm@misunp/k3-dcp-dspark-v2, six files, +88/-19:
+# mispa-ms/vllm@misunp/k3-dcp-dspark-v2 -- our six files, the flatten switch
+# (default off), and vllm#50532:
 #
 #   config/speculative.py            drop the DSpark x DCP refusal
 #   kimi_k3/nvidia/mla.py            drop the RoPE x DCP assert (prefill-CP
@@ -146,6 +147,16 @@ assert chain is not None, 'forward_mqa has no if-chain containing the uneven-len
 bad = [ast.unparse(x.test)[:60] for x in chain if not reshapes_q(x.body)]
 assert not bad, f'these branches reach the kernel without reshaping q: {bad}'
 assert reshapes_q(chain[-1].orelse), 'the final else does not reshape q'
+
+# vllm#50532 is carried: MRV2 classified a batch as uniform decode from its
+# SHAPE alone, so a prompt chunk could be dispatched FULL and replay the
+# spec-verify decode graph. Measured at DCP=1 on GSM8K: 0.936 without it against
+# 0.948 no-spec, and 0.948 with it -- full recovery, FULL cudagraphs kept.
+assert 'get_uniform_decode_token_count' in read('v1/worker/gpu/model_runner.py'), (
+    'vllm#50532 missing -- the scheduler path still classifies uniform decode by '
+    'shape alone, which costs 1.2 GSM8K points at DCP=1 and 2.7 at DCP=8'
+)
+assert 'def is_uniform_query_len' in read('v1/worker/utils.py')
 
 # --- v2 itself must be untouched by all of the above ---
 for rel, marker, who in [
