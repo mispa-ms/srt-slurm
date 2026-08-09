@@ -76,13 +76,19 @@ profiling__start_profile_on_worker() {
 
     local -a start_paths=()
     case "${SRTCTL_FRONTEND_TYPE}" in
-        # Dynamo renamed the engine routes to a control/ prefix. A worker on a
-        # build carrying the new names logs
-        #   Registered engine routes: control/sleep, control/wake_up,
-        #   control/scale_elastic_ep, control/start_profile, control/stop_profile
-        # and 404s on /engine/start_profile. Try the current name first and fall
-        # back, so this works on either build.
-        dynamo) start_paths=("/control/start_profile" "/engine/start_profile") ;;
+        # The worker's system status server routes "/engine/{*path}" and looks
+        # the captured path up verbatim in the engine-route registry
+        # (system_status_server.rs). Dynamo now registers the profiling control
+        # under "control/start_profile", so the URL is the concatenation of the
+        # two -- "/engine/" plus "control/start_profile". Older builds
+        # registered a bare "start_profile"; try the current name first and fall
+        # back so this works on either.
+        #
+        # Both halves are easy to get wrong on their own: /engine/start_profile
+        # misses the control/ segment, /control/start_profile misses the mount
+        # point and hits the axum fallback. Either way the worker logs
+        # "[fallback handler] called" and returns 404.
+        dynamo) start_paths=("/engine/control/start_profile" "/engine/start_profile") ;;
         sglang|vllm) start_paths=("/start_profile") ;;
         *)
             echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'sglang', or 'vllm')" >&2
@@ -123,17 +129,27 @@ profiling__stop_profile_on_worker() {
         return 1
     fi
 
-    local stop_path=""
+    local -a stop_paths=()
     case "${SRTCTL_FRONTEND_TYPE}" in
-        dynamo) stop_path="/engine/stop_profile" ;;
-        sglang|vllm) stop_path="/stop_profile" ;;
+        # Same mount-point-plus-route-name split as the start side above.
+        dynamo) stop_paths=("/engine/control/stop_profile" "/engine/stop_profile") ;;
+        sglang|vllm) stop_paths=("/stop_profile") ;;
         *)
             echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'sglang', or 'vllm')" >&2
             return 1
             ;;
     esac
 
-    curl -sS -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null || true
+    # Best-effort by design: nsys is launched with --capture-range-end stop, so
+    # a missed stop costs a truncated trace, not a lost run. Still say so --
+    # a silent miss here looks exactly like a clean shutdown.
+    local stop_path
+    for stop_path in "${stop_paths[@]}"; do
+        if curl -sS -f -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null; then
+            return 0
+        fi
+    done
+    echo "Warning: failed to stop profiling on ${hostport} (tried: ${stop_paths[*]})" >&2
     return 0
 }
 
