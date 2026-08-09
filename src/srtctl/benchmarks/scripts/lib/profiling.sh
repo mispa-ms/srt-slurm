@@ -221,15 +221,26 @@ start_all_profiling() {
     IFS=',' read -r -a agg_endpoints <<< "${PROFILE_AGG_ENDPOINTS}"
 
     local ep
+    local failed=0
     for ep in "${prefill_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_PREFILL_START_STEP}" "${PROFILE_PREFILL_STOP_STEP}" "${prefill_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_PREFILL_START_STEP}" "${PROFILE_PREFILL_STOP_STEP}" "${prefill_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
     for ep in "${decode_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_DECODE_START_STEP}" "${PROFILE_DECODE_STOP_STEP}" "${decode_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_DECODE_START_STEP}" "${PROFILE_DECODE_STOP_STEP}" "${decode_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
     for ep in "${agg_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_AGG_START_STEP}" "${PROFILE_AGG_STOP_STEP}" "${agg_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_AGG_START_STEP}" "${PROFILE_AGG_STOP_STEP}" "${agg_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
+
+    # Propagate. Without this the per-worker return value is discarded and the
+    # caller cannot tell an armed run from an unarmed one, which is the whole
+    # failure mode: the benchmark runs to completion and writes no trace. A
+    # partial arm is a failure too -- in disaggregated mode a capture that is
+    # missing one phase is not worth the GPU hours to collect it.
+    if [[ "${failed}" -gt 0 ]]; then
+        echo "Error: failed to start profiling on ${failed} worker(s)" >&2
+        return 1
+    fi
 
     profiling__started=1
     echo ""
