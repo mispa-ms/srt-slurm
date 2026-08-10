@@ -112,6 +112,55 @@ def check(dcp: int) -> None:
         )
 
 
+def check_load_mask_not_shortened() -> None:
+    """The recv-side pool answers "present" to anything, so the exact-boundary
+    retry has no truth to check there. If it ran, load_mask would return a mask
+    for a shorter length while its caller keeps using the original token_len,
+    and process_tokens' trailing chunks would fall off the end of the mask --
+    those blocks stay uninitialized in the local KV pool. Silent, unlike -704.
+    """
+    groups = _groups(8)
+    block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=lcm(*block_sizes),
+        hash_block_size=HASH_BLOCK_SIZE,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    token_len = 61440  # 5 * 12288: block-aligned, as a validated hit must be
+    hashes = [
+        BlockHash(i.to_bytes(4, "big")) for i in range(token_len // HASH_BLOCK_SIZE)
+    ]
+    for block_size, mask in zip(block_sizes, coord.load_mask(hashes, token_len)):
+        assert len(mask) == token_len // block_size, (
+            f"load_mask shortened the group with block_size={block_size}: "
+            f"{len(mask)} chunks for {token_len} tokens"
+        )
+
+
+def check_mamba_only_lookup() -> None:
+    """Partial hits are enabled by a Mamba group alone, so the revalidation can
+    be reached with no FullAttention group present."""
+    groups = [_groups(1)[1]]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=MAMBA_BLOCK,
+        hash_block_size=HASH_BLOCK_SIZE,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    assert coord.enable_partial_hash_hits
+    hashes = [BlockHash(i.to_bytes(4, "big")) for i in range(12)]
+    coord.find_longest_cache_hit(
+        hashes,
+        max_length=MAMBA_BLOCK,
+        cached_block_pool=ExternalCachedBlockPool(
+            HASH_BLOCK_SIZE, {(0, bytes(hashes[11]))}
+        ),
+    )
+
+
 def main() -> int:
     """Plain driver: the framework image is not guaranteed to ship pytest, and a
     missing test dependency must not take down every arm of a sweep."""
@@ -123,6 +172,16 @@ def main() -> int:
         except AssertionError as e:
             failures += 1
             print(f"  FAIL  [dcp={dcp}]: {e}")
+    for name, fn in (
+        ("load_mask is not shortened by the retry", check_load_mask_not_shortened),
+        ("mamba-only lookup does not crash", check_mamba_only_lookup),
+    ):
+        try:
+            fn()
+            print(f"  ok    {name}")
+        except AssertionError as e:
+            failures += 1
+            print(f"  FAIL  {name}: {e}")
     if failures:
         print(f"\n{failures} mooncake DCP hit-boundary check(s) failed.")
         return 1
