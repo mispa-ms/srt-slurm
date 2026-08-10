@@ -25,8 +25,97 @@ index ca32c3345c..d94766f144 100644
          if unsupported:
              raise ValueError(
                  "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c846354..06e981a30a 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
+     KVCacheBlock,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     FullAttentionSpec,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -67,6 +68,7 @@ class MooncakeStoreCoordinator:
+         hash_block_size: int,
+         use_eagle: bool = False,
+         retention_interval: int | None = None,
++        dcp_world_size: int = 1,
+     ) -> None:
+         assert all(
+             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+@@ -83,7 +85,7 @@ class MooncakeStoreCoordinator:
+         self.hash_block_size = hash_block_size
+         self.lcm_block_size = scheduler_block_size
+         self.enable_partial_hash_hits = partial_hash_hits_enabled(
+-            kv_cache_groups, hash_block_size
++            kv_cache_groups, hash_block_size, dcp_world_size
+         )
+         self.use_eagle = use_eagle
+         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
+@@ -398,12 +400,38 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
+ 
+ 
+ def partial_hash_hits_enabled(
+-    kv_cache_groups: list[KVCacheGroupSpec], hash_block_size: int
++    kv_cache_groups: list[KVCacheGroupSpec],
++    hash_block_size: int,
++    dcp_world_size: int = 1,
+ ) -> bool:
+-    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``
+-    (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
++    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``.
+     Single copy on purpose — scheduler and coordinator must not disagree.
++
++    A hash-aligned hit length is only safe while every group that needs *every*
++    chunk can serve one: the store holds whole blocks, so a hit ending mid-block
++    asks for a key the producer never wrote. Off DCP that holds — the coarse
++    group is the Mamba one, which is tail-only, and attention runs at
++    ``hash_block_size``. Under DCP ``resolve_kv_cache_block_sizes`` scales the
++    attention block by ``dcp``, so attention becomes the coarse group and it
++    needs all of its chunks. Fall back to ``lcm_block_size`` alignment there.
++
++    No block-size test on the attention group: callers pass different lists —
++    the scheduler the raw config, the worker its DCP-scaled copy — and any size
++    comparison would answer differently for the two. ``block_size`` is always a
++    multiple of ``hash_block_size``, so under ``dcp > 1`` the effective
++    attention block always exceeds it and the presence of the group is the whole
++    condition. A Mamba-only layout is unaffected: DCP does not scale it.
++
++    Measured: without this, every load of the scaled group returns Mooncake
++    OBJECT_NOT_FOUND (-704) for its trailing chunk and ``recompute`` reschedules
++    the request forever -- 2,757,664 failures, all on the one scaled group,
++    while the unscaled groups in the same sub-batch succeeded.
+     """
++    if dcp_world_size > 1 and any(
++        isinstance(_unwrap_spec(g.kv_cache_spec), AttentionSpec)
++        for g in kv_cache_groups
++    ):
++        return False
+     return any(
+         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+         and spec.mamba_cache_mode == "align"
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 42c6f3fa99..b156d8e408 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -68,8 +68,12 @@ class MooncakeStoreScheduler:
+         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
+             kv_cache_config, vllm_config
+         )
++        # The raw groups carry the unscaled attention block size, so pass dcp and
++        # let the shared helper apply the same DCP rule the worker's databases do.
+         self.enable_partial_hash_hits = partial_hash_hits_enabled(
+-            kv_cache_config.kv_cache_groups, self._hash_block_size
++            kv_cache_config.kv_cache_groups,
++            self._hash_block_size,
++            vllm_config.parallel_config.decode_context_parallel_size,
+         )
+ 
+         # Per-request state
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index 762e5eba92..eb1fa7bbb9 100644
+index 762e5eba92..b91b38ced4 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 @@ -65,6 +65,7 @@ from vllm.v1.core.kv_cache_utils import (
@@ -99,3 +188,11 @@ index 762e5eba92..eb1fa7bbb9 100644
              ]
          self._kv_cache_groups: list[KVCacheGroupSpec] = groups
          spec_cfg = getattr(vllm_config, "speculative_config", None)
+@@ -1391,6 +1427,7 @@ class MooncakeStoreWorker:
+             hash_block_size=self.hash_block_size,
+             use_eagle=use_eagle,
+             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
++            dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
+         )
+         # One ChunkedTokenDatabase per group; addresses populated in
+         # register_kv_caches once the kv-cache layout is known. Each group's

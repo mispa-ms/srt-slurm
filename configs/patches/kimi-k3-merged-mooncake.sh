@@ -103,3 +103,17 @@ assert 'decode_context_parallel_size' in w
 
 print('=== Mooncake DCP-hybrid patch verified ===')
 "
+
+# The AST checks above prove the patch is present, not that it is right. Lifting
+# the refusal the first time passed every one of them and then livelocked with
+# 2,757,664 Mooncake OBJECT_NOT_FOUND (-704) failures -- the load path asked for
+# keys the save path had never written. This asserts the property that failure
+# violates, against the installed vllm, before any GPU time.
+#
+# It runs here rather than post-hoc because the accuracy gate cannot see it:
+# the GSM8K arms passed at 0.950/0.954/0.956 with an external hit rate of 0.0%,
+# never executing the connector's read path at all.
+# Plain python, not pytest: the framework image is not guaranteed to ship it,
+# and a missing test dependency must not take down every arm of a sweep.
+echo "=== mooncake DCP key-set tests ==="
+python3 /configs/patches/test_mooncake_dcp_keyset.py
