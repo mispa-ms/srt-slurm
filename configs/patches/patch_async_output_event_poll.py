@@ -49,6 +49,9 @@ src = path.read_text()
 
 HELPER = '''
 
+_COPY_STREAM_DEAD = False
+
+
 def _wait_copy_event(event) -> None:
     """Wait for a copy event without cudaEventBlockingSync. Returns False on timeout.
 
@@ -57,11 +60,25 @@ def _wait_copy_event(event) -> None:
     wedged copy stream is a fast loud failure instead of a silent hang that only
     surfaces as an unrelated RPC timeout half an hour later.
     """
-    timeout = float(os.environ.get("VLLM_ASYNC_OUTPUT_COPY_TIMEOUT_S", "120"))
+    # Once the stream has gone, it does not come back. Waiting the full timeout on
+    # every subsequent output is what crippled 61978073 -- the engine survived and
+    # the rescue path ran 112 times, but decode fell to 892 tok/s against a 2145
+    # baseline and never finished the capture window. Check once, then remember.
+    global _COPY_STREAM_DEAD
+    if _COPY_STREAM_DEAD:
+        return False
+
+    timeout = float(os.environ.get("VLLM_ASYNC_OUTPUT_COPY_TIMEOUT_S", "5"))
     start = time.monotonic()
     while not event.query():
         elapsed = time.monotonic() - start
         if elapsed > timeout:
+            _COPY_STREAM_DEAD = True
+            logger.warning(
+                "async output copy event did not complete in %.1fs; treating the "
+                "copy stream as dead and copying synchronously from here on",
+                timeout,
+            )
             return False
         if elapsed > 0.005:
             time.sleep(0.0005)
@@ -82,10 +99,6 @@ def _recopy_sync(obj) -> None:
     """
     import numpy as _np
 
-    logger.warning(
-        "async output copy event never completed; redoing the copies "
-        "synchronously on the current stream"
-    )
     so = getattr(obj, "sampler_output", None)
     if so is not None:
         with contextlib.suppress(Exception):
