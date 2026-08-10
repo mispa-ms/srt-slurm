@@ -99,6 +99,24 @@ def _recopy_sync(obj) -> None:
     """
     import numpy as _np
 
+    # Order against the producer before reading anything. The constructor does
+    # this with copy_stream.wait_stream(main_stream); we are on a different
+    # thread, where the current stream is the default one, and the sampler runs
+    # on the main stream -- so .cpu() here syncs the wrong stream and can read
+    # the buffer before the sampler has written it.
+    #
+    # 61992570 is what that looks like: the frontend logged 59 x
+    # "Streaming error: invalid value: integer `-1`, expected u32" starting one
+    # minute after the capture, i.e. the -1 padding read straight out of an
+    # unfinished buffer, and 38 of 376 requests failed -- 10.1% against a 10%
+    # threshold, which aborted the run.
+    #
+    # A device-wide sync is the blunt version of the right ordering and is safe
+    # here: the copy stream is the only wedged one, and every stack we have shows
+    # the main thread still producing iterations.
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+
     so = getattr(obj, "sampler_output", None)
     if so is not None:
         with contextlib.suppress(Exception):
