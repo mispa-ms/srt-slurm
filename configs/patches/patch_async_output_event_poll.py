@@ -50,7 +50,7 @@ src = path.read_text()
 HELPER = '''
 
 def _wait_copy_event(event) -> None:
-    """Wait for a copy event without cudaEventBlockingSync.
+    """Wait for a copy event without cudaEventBlockingSync. Returns False on timeout.
 
     Spin first, because the copy is normally already done by the time anyone
     asks; then sleep, so eight workers do not each hold a core; then raise, so a
@@ -62,12 +62,52 @@ def _wait_copy_event(event) -> None:
     while not event.query():
         elapsed = time.monotonic() - start
         if elapsed > timeout:
-            raise RuntimeError(
-                f"async output copy event did not complete in {timeout}s -- "
-                "the copy stream is wedged (seen after nsys capture teardown)"
-            )
+            return False
         if elapsed > 0.005:
             time.sleep(0.0005)
+    return True
+
+
+def _recopy_sync(obj) -> None:
+    """Redo the device-to-host copies on the current stream.
+
+    The copy stream is wedged but the GPU tensors are still held -- the class
+    keeps them on purpose, because the copies run on a stream other than the one
+    that produced them. The main thread is idle and healthy at this point, so a
+    fresh copy on the default stream is the one thing left that can rescue the
+    step instead of killing the engine.
+
+    Every field is guarded: this runs only when the alternative is a dead engine,
+    so a missing attribute must not make things worse.
+    """
+    import numpy as _np
+
+    logger.warning(
+        "async output copy event never completed; redoing the copies "
+        "synchronously on the current stream"
+    )
+    so = getattr(obj, "sampler_output", None)
+    if so is not None:
+        with contextlib.suppress(Exception):
+            obj.sampled_token_ids = so.sampled_token_ids.cpu().numpy()
+        with contextlib.suppress(Exception):
+            if so.num_nans is not None:
+                obj.num_nans = so.num_nans.cpu().numpy()
+        with contextlib.suppress(Exception):
+            if so.logprobs_tensors is not None:
+                obj.logprobs_tensors = so.logprobs_tensors.to_cpu_nonblocking()
+    with contextlib.suppress(Exception):
+        obj.num_sampled_tokens_np = obj.num_sampled_tokens.cpu().numpy()
+    with contextlib.suppress(Exception):
+        mro = obj.model_runner_output
+        obj.prompt_logprobs_dict = {
+            k: (v.cpu() if v is not None else None)
+            for k, v in mro.prompt_logprobs_dict.items()
+        }
+    with contextlib.suppress(Exception):
+        if getattr(obj, "pooler_output_cpu", None) is not None:
+            obj.pooler_output_cpu = obj.pooler_output.cpu()
+    _ = _np
 '''
 
 # ---- 1. imports --------------------------------------------------------------
@@ -76,7 +116,13 @@ if "import time" not in src.split("class ")[0]:
     if anchor not in src:
         print("[asyncevt] FATAL - import anchor not found", file=sys.stderr)
         raise SystemExit(1)
-    src = src.replace(anchor, "import contextlib\nimport os\nimport time\n", 1)
+    src = src.replace(
+        anchor,
+        "import contextlib\nimport os\nimport time\n\n"
+        "from vllm.logger import init_logger\n\n"
+        "logger = init_logger(__name__)\n",
+        1,
+    )
     print("[asyncevt] patched imports")
 else:
     print("[asyncevt] imports already patched")
@@ -110,7 +156,11 @@ else:
 # ---- 4. every synchronize -> polled wait -------------------------------------
 n = src.count("self.copy_event.synchronize()")
 if n:
-    src = src.replace("self.copy_event.synchronize()", "_wait_copy_event(self.copy_event)")
+    src = src.replace(
+        "self.copy_event.synchronize()",
+        "if not _wait_copy_event(self.copy_event):\n"
+        "            _recopy_sync(self)",
+    )
     print(f"[asyncevt] replaced {n} synchronize call(s)")
 else:
     print("[asyncevt] synchronize calls already replaced")
