@@ -1,0 +1,198 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index ca32c3345c..d94766f144 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -116,10 +116,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                 )
+         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+         dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
+-            unsupported.append(
+-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+-            )
++        # DCP with hybrid attention is supported: the worker now puts every
++        # group's block size into the scheduler's coordinate space -- attention
++        # groups scaled by dcp, Mamba groups not, the rule
++        # resolve_kv_cache_block_sizes states -- so ``starts // block_size`` in
++        # ChunkedTokenDatabase indexes the block_ids it is handed. The store key
++        # has always carried @dcp{rank}, so each rank's strided slice keys
++        # separately.
++        #
++        # PCP is a different sharding, is not mirrored by that scaling, and has
++        # not been measured, so it stays refused.
++        if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
++            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+         if unsupported:
+             raise ValueError(
+                 "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c846354..1eb5df965e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -37,6 +37,13 @@ class ExternalCachedBlockPool:
+         # determined and we just want each spec's manager to apply its own mask.
+         self._exists = exists
+         self.hash_block_size = hash_block_size
++        # False on the recv side, where the pool answers "present" to anything.
++        # The exact-boundary retry must not run against such a pool: it would
++        # shorten a hit that the lookup already validated, and load_mask's caller
++        # keeps using the original token_len, so process_tokens' trailing chunks
++        # would fall off the end of the mask and leave those blocks
++        # uninitialized -- silent corruption where -704 was at least loud.
++        self.tracks_existence = exists is not None
+         self.null_block = KVCacheBlock(block_id=0)
+         # Dummy ID 1 for present block for duck-typing.
+         self._present_block = KVCacheBlock(block_id=1)
+@@ -90,6 +97,14 @@ class MooncakeStoreCoordinator:
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+ 
++    @property
++    def cache_hit_alignment_tokens(self) -> int:
++        return (
++            self.hash_block_size
++            if self.enable_partial_hash_hits
++            else self.lcm_block_size
++        )
++
+     def align_lookup_length(self, length: int) -> int:
+         alignment = (
+             self.hash_block_size
+@@ -152,14 +167,56 @@ class MooncakeStoreCoordinator:
+         already reflects the eagle-pruned hit length and a second pop would
+         leave the trailing block unloaded.
+         """
+-        blocks_per_group, hit_length = self._find_hit_blocks(
+-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+-        )
+-        masks = tuple(
+-            [blk is not cached_block_pool.null_block for blk in blocks]
+-            for blocks in blocks_per_group
++        candidate_length = max_length
++        while True:
++            blocks_per_group, hit_length = self._find_hit_blocks(
++                block_hashes,
++                candidate_length,
++                cached_block_pool,
++                apply_eagle=apply_eagle,
++            )
++            masks = tuple(
++                [blk is not cached_block_pool.null_block for blk in blocks]
++                for blocks in blocks_per_group
++            )
++            if hit_length == 0 or self._exact_partial_hit_key_exists(
++                block_hashes, hit_length, cached_block_pool
++            ):
++                return masks, hit_length
++
++            candidate_length = max(0, hit_length - self.cache_hit_alignment_tokens)
++
++    def _exact_partial_hit_key_exists(
++        self,
++        block_hashes: Sequence[BlockHash],
++        hit_length: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> bool:
++        """Whether the reconciled partial FullAttention tail can be loaded."""
++        if not self.enable_partial_hash_hits:
++            return True
++        if not cached_block_pool.tracks_existence:
++            # Recv-side pool: it has no truth to check, and shortening the hit
++            # here would desynchronise the mask from its caller's token_len.
++            return True
++
++        # Attribute access, not tuple unpacking: SpecGroup carries manager_cls
++        # and use_eagle here, so the upstream 3-tuple unpack raises ValueError
++        # on the first lookup. git apply cannot see that -- it is a runtime
++        # arity mismatch, not a textual conflict.
++        group = self.attention_groups[0]
++        if not isinstance(group.spec, FullAttentionSpec):
++            # Nothing to revalidate: the defect needs an attention group coarser
++            # than hash granularity, and a recurrent group is tail-only. Upstream
++            # asserts FullAttentionSpec here, which crashes at the first lookup on
++            # a Mamba-only layout -- reachable, since partial hits are enabled by
++            # a Mamba group alone.
++            return True
++        hash_idx = hit_length // self.hash_block_size - 1
++        return (
++            cached_block_pool.get_cached_block(block_hashes[hash_idx], group.group_ids)
++            is not None
+         )
+-        return masks, hit_length
+ 
+     def load_mask(
+         self,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba92..eb1fa7bbb9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -65,6 +65,7 @@ from vllm.v1.core.kv_cache_utils import (
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -1364,19 +1365,54 @@ class MooncakeStoreWorker:
+             )
+             return
+ 
+-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+-        # self.block_size (= scheduler_block_size) so the coordinator's
+-        # ``block_size % hash_block_size == 0`` invariant holds.
++        # Put every group's block size into the scheduler's coordinate space.
++        #
++        # This connector indexes ``block_ids`` with GLOBAL token positions --
++        # ``starts // block_size`` and ``(spans + block_size - 1) // block_size``
++        # in ChunkedTokenDatabase.prepare_values. Under DCP a rank holds a
++        # strided 1/dcp slice, so one physical block of an ATTENTION group spans
++        # ``block_size * dcp`` global tokens, while a Mamba group's state is
++        # replicated per rank and still spans ``block_size``. That is the rule
++        # ``resolve_kv_cache_block_sizes`` states and the scheduler follows, so
++        # mirroring it keeps this connector in the same coordinates as the
++        # ``block_ids`` it is handed. Applying it per group is what lifts the
++        # hybrid + DCP refusal in connector.py.
++        #
++        # The single-group path is left exactly as it was. It substitutes
++        # scheduler_block_size wholesale, which for one ATTENTION group equals
++        # ``block_size * dcp`` and so agrees with the rule anyway -- but for one
++        # MAMBA group it does not, and that substitution is deliberate: it keeps
++        # the coordinator's ``block_size % hash_block_size`` invariant holding.
++        # Generalising over it would have changed a working path to open an
++        # unrelated one.
+         groups = list(kv_cache_config.kv_cache_groups)
+-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+-            g = groups[0]
++        if len(groups) == 1:
++            if groups[0].kv_cache_spec.block_size != self.block_size:
++                g = groups[0]
++                groups = [
++                    dataclasses.replace(
++                        g,
++                        kv_cache_spec=dataclasses.replace(
++                            g.kv_cache_spec, block_size=self.block_size
++                        ),
++                    )
++                ]
++        else:
++            # dcp only, exactly as resolve_kv_cache_block_sizes does. PCP is a
++            # different sharding, is still refused in connector.py, and folding
++            # it in here would be a scale nothing else agrees with.
++            dcp = vllm_config.parallel_config.decode_context_parallel_size
+             groups = [
+-                dataclasses.replace(
++                g
++                if not isinstance(g.kv_cache_spec, AttentionSpec) or dcp == 1
++                else dataclasses.replace(
+                     g,
+                     kv_cache_spec=dataclasses.replace(
+-                        g.kv_cache_spec, block_size=self.block_size
++                        g.kv_cache_spec,
++                        block_size=g.kv_cache_spec.block_size * dcp,
+                     ),
+                 )
++                for g in groups
+             ]
+         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+         spec_cfg = getattr(vllm_config, "speculative_config", None)
