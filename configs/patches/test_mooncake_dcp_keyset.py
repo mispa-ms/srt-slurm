@@ -1,16 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Does a Mooncake load ever ask for a key the save path never wrote?
+"""Is the hit length the lookup reports actually loadable from the store?
 
 Run against the *installed* vllm inside the framework container, before any GPU
-time, by kimi-k3-merged-mooncake.sh. A standalone copy of the tests added to
-tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py, because the image
-ships site-packages and not the test tree.
+time, by kimi-k3-merged-mooncake.sh.
 
-This is the check that was missing when the DCP + hybrid refusal was lifted. The
-gates that ran instead -- patch applied, GSM8K within 1 SE, FULL cudagraphs N/N
--- all passed on a build that then livelocked with 2,757,664 OBJECT_NOT_FOUND
-(-704) failures, because GSM8K's working set fits in GPU KV and never executed
-the connector's read path (external hit rate 0.0%).
+A Mooncake key is a whole block. The store therefore holds an object only at
+each group's block boundaries -- there is no object at a hash boundary in a
+block's interior. Core's fine-grained lookup deliberately extends a hit *into*
+the first non-full block (a local block is usable as a prefix; a remote object
+is not), and with EAGLE/DSpark it then subtracts exactly one hash unit, which
+lands mid-block by construction.
+
+Off DCP that gap is empty: the attention block equals hash_block_size. Scaling
+the attention block by dcp opens a block_size/hash_block_size-wide interior, and
+every hit landing there names a key nobody wrote. Measured on B300 c8 DCP=8:
+2,757,664 OBJECT_NOT_FOUND (-704), all on the one scaled group, the run stuck in
+warmup for four hours because kv_load_failure_policy=recompute retried forever.
+
+vllm#50359 revalidates the reconciled boundary and steps back until the key
+exists. This asserts the property that fix is for, over dcp in {1,2,4,8}: the
+reported hit must be an exact object boundary for EVERY group, not just the one
+upstream checks.
+
+The gates that ran instead of this could not see it -- GSM8K passed at
+0.950/0.954/0.956 with an external hit rate of 0.0%, never executing the
+connector's read path at all.
 """
 
 from math import lcm
@@ -18,12 +32,8 @@ from math import lcm
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+    ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
-    partial_hash_hits_enabled,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
-    ChunkedTokenDatabase,
-    KeyMetadata,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -34,10 +44,10 @@ from vllm.v1.kv_cache_interface import (
 
 HASH_BLOCK_SIZE = 128
 MAMBA_BLOCK = 1536
-# 64512 = 42 * 1536: aligned to the Mamba block and to hash_block_size, but not
-# to the dcp-scaled attention block (64512 / 12288 = 5.25 at dcp=8). The defect
-# is length-dependent -- dcp=2 divides it evenly and shows nothing.
-RAW_HIT = 64512
+# 64512 = 42 * 1536: a Mamba and hash boundary, but not a dcp-scaled attention
+# one (64512 / 12288 = 5.25 at dcp=8). The defect is length-dependent, which is
+# why one lucky length shows nothing.
+MAX_LENGTH = 64512
 
 
 def _groups(dcp: int):
@@ -65,16 +75,7 @@ def _groups(dcp: int):
     ]
 
 
-def _keys(block_size, token_len, hashes):
-    db = ChunkedTokenDatabase(
-        KeyMetadata("m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
-        block_size,
-        hash_block_size=HASH_BLOCK_SIZE,
-    )
-    return {bytes(h) for _, _, h in db.process_tokens(token_len, hashes)}
-
-
-def test_load_never_requests_a_key_the_producer_did_not_write(dcp):
+def check(dcp: int) -> None:
     groups = _groups(dcp)
     block_sizes = [g.kv_cache_spec.block_size for g in groups]
     coord = MooncakeStoreCoordinator(
@@ -82,68 +83,50 @@ def test_load_never_requests_a_key_the_producer_did_not_write(dcp):
         scheduler_block_size=lcm(*block_sizes),
         hash_block_size=HASH_BLOCK_SIZE,
         use_eagle=True,
-        dcp_world_size=dcp,
+        retention_interval=0,
     )
     hashes = [
-        BlockHash(i.to_bytes(4, "big")) for i in range(RAW_HIT // HASH_BLOCK_SIZE)
+        BlockHash(i.to_bytes(4, "big")) for i in range(MAX_LENGTH // HASH_BLOCK_SIZE)
     ]
-    # The producer floors its save to lcm_block_size (KVCacheStoreSendingThread);
-    # the consumer loads up to align_lookup_length(hit).
-    saved = RAW_HIT // coord.lcm_block_size * coord.lcm_block_size
-    loaded = coord.align_lookup_length(RAW_HIT)
 
-    for block_size in block_sizes:
-        missing = _keys(block_size, loaded, hashes) - _keys(block_size, saved, hashes)
-        assert not missing, (
-            f"dcp={dcp} block_size={block_size}: load would request "
-            f"{len(missing)} key(s) the producer never wrote "
-            f"(saved={saved}, loaded={loaded}) -> Mooncake -704"
-        )
+    # What the store actually holds: one object per group per block boundary.
+    exists: set[tuple[int, bytes]] = set()
+    for g_idx, block_size in enumerate(block_sizes):
+        for end in range(block_size, MAX_LENGTH + 1, block_size):
+            exists.add((g_idx, bytes(hashes[end // HASH_BLOCK_SIZE - 1])))
 
-
-def test_partial_hash_hits_off_when_dcp_scales_an_attention_group(dcp):
-    assert not partial_hash_hits_enabled(_groups(dcp), HASH_BLOCK_SIZE, dcp)
-    # Still on without DCP: the fix must not change a path that already worked.
-    assert partial_hash_hits_enabled(_groups(1), HASH_BLOCK_SIZE, 1)
-    # Mamba-only is unaffected -- DCP does not scale it.
-    mamba_only = [_groups(1)[1]]
-    assert partial_hash_hits_enabled(mamba_only, HASH_BLOCK_SIZE, dcp)
-
-
-def test_scheduler_and_worker_group_lists_agree(dcp):
-    """The scheduler passes the raw config, the worker its DCP-scaled copy.
-
-    A disagreement here is what makes the scheduler promise a hit length the
-    worker cannot serve.
-    """
-    raw = _groups(1)
-    scaled = _groups(dcp)
-    assert partial_hash_hits_enabled(raw, HASH_BLOCK_SIZE, dcp) == (
-        partial_hash_hits_enabled(scaled, HASH_BLOCK_SIZE, dcp)
+    _masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=MAX_LENGTH,
+        cached_block_pool=ExternalCachedBlockPool(HASH_BLOCK_SIZE, exists),
     )
+
+    if hit == 0:
+        return
+    for g_idx, block_size in enumerate(block_sizes):
+        key = bytes(hashes[hit // HASH_BLOCK_SIZE - 1])
+        assert (g_idx, key) in exists, (
+            f"dcp={dcp}: reported hit {hit} is not an object boundary for group "
+            f"{g_idx} (block_size={block_size}); loading it asks Mooncake for a "
+            f"key nobody wrote -> -704"
+        )
 
 
 def main() -> int:
     """Plain driver: the framework image is not guaranteed to ship pytest, and a
     missing test dependency must not take down every arm of a sweep."""
-    cases = [
-        (test_load_never_requests_a_key_the_producer_did_not_write, (1, 2, 4, 8)),
-        (test_partial_hash_hits_off_when_dcp_scales_an_attention_group, (2, 8)),
-        (test_scheduler_and_worker_group_lists_agree, (2, 8)),
-    ]
-    failures = []
-    for fn, dcps in cases:
-        for dcp in dcps:
-            try:
-                fn(dcp)
-                print(f"  ok    {fn.__name__}[dcp={dcp}]")
-            except AssertionError as e:
-                failures.append(f"{fn.__name__}[dcp={dcp}]: {e}")
-                print(f"  FAIL  {fn.__name__}[dcp={dcp}]: {e}")
+    failures = 0
+    for dcp in (1, 2, 4, 8):
+        try:
+            check(dcp)
+            print(f"  ok    reported hit is externally loadable [dcp={dcp}]")
+        except AssertionError as e:
+            failures += 1
+            print(f"  FAIL  [dcp={dcp}]: {e}")
     if failures:
-        print(f"\n{len(failures)} mooncake DCP key-set check(s) failed.")
+        print(f"\n{failures} mooncake DCP hit-boundary check(s) failed.")
         return 1
-    print("=== mooncake DCP key-set tests passed ===")
+    print("=== mooncake DCP hit-boundary tests passed ===")
     return 0
 
 

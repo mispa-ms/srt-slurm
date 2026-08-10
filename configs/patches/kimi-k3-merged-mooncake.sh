@@ -101,19 +101,36 @@ assert core_rule and all('dcp' in r for r in core_rule), (
 )
 assert 'decode_context_parallel_size' in w
 
+# --- vllm#50359's exact-boundary retry is now load-bearing ---
+coord = read(mc / 'coordinator.py')
+assert '_exact_partial_hit_key_exists' in coord, (
+    'vllm#50359 is missing: without the exact-boundary retry a fine-grained hit '
+    'lands inside a dcp-scaled attention block and every load of it is -704'
+)
+# Upstream unpacks attention_groups[0] as a 3-tuple; SpecGroup carries four
+# fields here, so that raises ValueError on the first lookup. A re-import of the
+# upstream form would pass `git apply` and fail at runtime -- catch it here.
+fn = next(n for n in ast.walk(ast.parse(coord))
+          if isinstance(n, ast.FunctionDef) and n.name == '_exact_partial_hit_key_exists')
+bad = [ast.unparse(n) for n in ast.walk(fn)
+       if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+       and 'attention_groups' in ast.unparse(n.value)]
+assert not bad, f'attention_groups[0] is tuple-unpacked, which is arity-fragile: {bad}'
+
 print('=== Mooncake DCP-hybrid patch verified ===')
 "
 
 # The AST checks above prove the patch is present, not that it is right. Lifting
 # the refusal the first time passed every one of them and then livelocked with
-# 2,757,664 Mooncake OBJECT_NOT_FOUND (-704) failures -- the load path asked for
-# keys the save path had never written. This asserts the property that failure
-# violates, against the installed vllm, before any GPU time.
+# 2,757,664 Mooncake OBJECT_NOT_FOUND (-704) failures -- the lookup reported a
+# hit length that no object existed at. This asserts the property that failure
+# violates, against the installed vllm, before any GPU time: the reported hit
+# must be an exact object boundary for every group.
 #
 # It runs here rather than post-hoc because the accuracy gate cannot see it:
 # the GSM8K arms passed at 0.950/0.954/0.956 with an external hit rate of 0.0%,
 # never executing the connector's read path at all.
 # Plain python, not pytest: the framework image is not guaranteed to ship it,
 # and a missing test dependency must not take down every arm of a sweep.
-echo "=== mooncake DCP key-set tests ==="
+echo "=== mooncake DCP hit-boundary tests ==="
 python3 /configs/patches/test_mooncake_dcp_keyset.py
