@@ -177,6 +177,24 @@ assert '_exact_partial_hit_key_exists' in guard[1][:400], (
 print('=== disagg DCP patch verified ===')
 "
 
+# Every assert above is a substring check, and a substring check cannot see a
+# name read before it is bound. Resolving Wei's conflicts turned upstream's
+# `accepted = u < rate` into `accepted &= ...` in the SYNTHETIC_MODE branch of
+# _rejection_kernel; 'draft_sampled < vocab_size' was present, so the gate went
+# green, and the run died twenty-five minutes later when Triton first compiled
+# that specialization at warmup. Only synthetic acceptance reaches it, which is
+# every throughput arm on this track.
+echo "=== unbound augmented assignment ==="
+python3 /configs/patches/check_unbound_augassign.py \
+    "$SITE"/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py \
+    "$SITE"/vllm/v1/core/sched/scheduler.py \
+    "$SITE"/vllm/v1/core/kv_cache_manager.py \
+    "$SITE"/vllm/v1/core/single_type_kv_cache_manager.py \
+    "$SITE"/vllm/v1/core/kv_cache_coordinator.py \
+    "$SITE"/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py \
+    "$SITE"/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py \
+    "$SITE"/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+
 # The replay fast path is new code on the lookup path, so re-run the hit-boundary
 # tests now that it is installed. The earlier run inside kimi-k3-merged-v3-mooncake.sh
 # happens before this patch and skips the replay check for want of anything to test.
