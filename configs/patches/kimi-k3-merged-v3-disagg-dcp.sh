@@ -79,3 +79,39 @@ for k in ('dcp_size', 'pcp_size'):
 
 print('=== disagg DCP patch verified ===')
 "
+
+# The client the workers end up with must be the version the master was started
+# from. vllm-container-deps-mooncake.sh launches the master from MOONCAKE_VERSION
+# and exits; kimi-k3-aggv2.sh, later in the chain, pins the wheel to 0.3.12.post1.
+# Left at the 0.3.11.post1 default those disagree, and the mismatch surfaces
+# fifteen minutes in as
+#   RPC call failed: invalid rpc arg
+#   mount_segment_to_master_failed ... error=RPC_FAIL
+#   Initialize MooncakeDistributedStore failed
+# which reads like a capacity problem and is not one -- the arm that works mounts
+# twice as much. Fail here instead, in a minute.
+echo "=== mooncake client/master version agreement ==="
+python3 - <<'PY'
+import importlib.metadata as md
+import os
+import sys
+
+want = os.environ.get("MOONCAKE_VERSION", "0.3.11.post1")
+for pkg in ("mooncake-transfer-engine-cuda13", "mooncake-transfer-engine"):
+    try:
+        got = md.version(pkg)
+    except md.PackageNotFoundError:
+        continue
+    print(f"  {pkg}: installed {got}, master started from {want}")
+    if got != want:
+        sys.exit(
+            f"mooncake client {got} != master {want}. The master is already "
+            f"running from {want}; segment mounts will be refused with "
+            f"'invalid rpc arg'. Set MOONCAKE_VERSION to the version the rest "
+            f"of the chain installs."
+        )
+    break
+else:
+    sys.exit("no mooncake wheel found after setup")
+print("=== mooncake versions agree ===")
+PY
