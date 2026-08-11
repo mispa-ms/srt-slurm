@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# k3-merged-v3 + Mooncake-under-DCP + vllm#45340, for the DISAGGREGATED probe.
+#
+# ONE QUESTION: does DCP stand up across a P/D split at all. Nothing here is
+# about throughput, and no arm from this script belongs on a curve yet.
+#
+# WHY #45340 IS NEEDED AND WHY IT IS NOT ENOUGH. MooncakeConnectorScheduler and
+# NixlConnectorScheduler do their token-to-block math with the raw
+# cache_config.block_size, but under DCP one block id covers block_size * dcp
+# tokens, so any length that is not a multiple of the scaled block over-counts.
+# #45340 (OPEN, 2026-06-12) routes both through resolve_kv_cache_block_sizes --
+# the same class of fix our AGG patch made one layer down, in the store
+# connector. It rebases onto our branch with two conflicts, both pure additions
+# (an import beside NULL_BLOCK_ID, and speculative_config beside the new
+# dcp_size/pcp_size layout keys); k3-disagg-dcp-45340.patch is the resolved form.
+#
+# It covers the ALIGNED case only -- prefill and decode at the same dcp. That is
+# the PR's own scope, and it is why the config sets decode-context-parallel-size
+# on both sides. Unaligned P/D needs remote-topology and block-position work that
+# is a different PR (#38433, also open).
+#
+# WHAT THIS SCRIPT CANNOT TELL YOU. Whether DCP is correct across the split. The
+# AGG track had the patch applying cleanly and every setup gate green for a full
+# day before -704 showed the lookup was asking for keys nobody wrote. Read the
+# worker log for transfer failures and the decode-side prefix cache hit rate
+# before believing any number from these arms.
+
+set -euo pipefail
+
+bash /configs/patches/kimi-k3-merged-v3-mooncake.sh
+
+SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
+FIX=/configs/patches/k3-disagg-dcp-45340.patch
+echo "=== k3-disagg-dcp-45340 ==="
+if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX" >/dev/null 2>&1; then
+    echo "already applied"
+else
+    patch -p1 --forward -d "$SITE" < "$FIX"
+fi
+
+python3 -c "
+import ast
+import pathlib
+import vllm
+
+root = pathlib.Path(vllm.__file__).parent
+read = lambda rel: (root / rel).read_text()
+
+# Both schedulers must resolve the block size rather than read it raw. Checking
+# the string alone would pass on a file that merely imports the helper, so pin
+# the assignment.
+for rel in ('distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py',
+            'distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py'):
+    src = read(rel)
+    assigns = [ast.unparse(n) for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.Assign)
+               and 'resolve_kv_cache_block_sizes' in ast.unparse(n.value)]
+    assert assigns, f'{rel} still takes its block size raw: #45340 did not apply'
+
+# The layout key P and D compare on must carry the CP sizes, or two instances at
+# different dcp would hand off KV that does not line up and never say so.
+meta = read('distributed/kv_transfer/kv_connector/v1/nixl/metadata.py')
+for k in ('dcp_size', 'pcp_size'):
+    assert f'\'{k}\'' in meta or f'\"{k}\"' in meta, f'{k} missing from the layout key'
+
+print('=== disagg DCP patch verified ===')
+"
