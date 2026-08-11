@@ -37,6 +37,14 @@ set -euo pipefail
 # which is exactly how the first six arms of this probe failed. The aggregated
 # arms hide this: there srtslurm renders the JSON from the config block, so the
 # setup script never had to.
+# Pin the wheel the master is launched from. This has to be exported here, not
+# set in the config's prefill/decode_environment: that env reaches the vLLM
+# worker, while the setup script runs earlier in a different context, so the
+# value never arrived and the master came up on the 0.3.11.post1 default while
+# kimi-k3-aggv2.sh later pinned the client to 0.3.12.post1. Same pattern as
+# kimi-k3-merged-v3.sh exporting FI_VER.
+export MOONCAKE_VERSION=0.3.12.post1
+
 bash /configs/patches/vllm-container-deps-k3-mooncake.sh
 
 # Then the v3 image marker, our Mooncake-under-DCP patch and its tests. Last, so
