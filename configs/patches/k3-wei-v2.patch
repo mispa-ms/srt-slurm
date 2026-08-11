@@ -1,0 +1,667 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index d94766f144..d4bde6be04 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -115,18 +115,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                     f"{cache_block_size} (mamba_cache_mode != 'align')"
+                 )
+         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+-        dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        # DCP with hybrid attention is supported: the worker now puts every
+-        # group's block size into the scheduler's coordinate space -- attention
+-        # groups scaled by dcp, Mamba groups not, the rule
+-        # resolve_kv_cache_block_sizes states -- so ``starts // block_size`` in
+-        # ChunkedTokenDatabase indexes the block_ids it is handed. The store key
+-        # has always carried @dcp{rank}, so each rank's strided slice keys
+-        # separately.
+-        #
+-        # PCP is a different sharding, is not mirrored by that scaling, and has
+-        # not been measured, so it stays refused.
+         if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
++            # DCP is supported on hybrid models: the worker rescales each group
++            # to its effective block size (attention sharded over the CP ranks
++            # and scaled, Mamba replicated and unscaled -- see
++            # ``effective_kv_block_size``), and the store keys already carry
++            # ``dcp_rank`` so every rank round-trips its own shard. The
++            # divisibility invariant the coordinator needs is enforced upstream
++            # by ``resolve_kv_cache_block_sizes``, which raises if a group's
++            # DCP-scaled block size is not a multiple of ``prefix_match_unit``.
++            #
++            # PCP remains unsupported: it expands the world size and shards the
++            # prefill differently, which this connector has never been run with.
+             unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+         if unsupported:
+             raise ValueError(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index 1eb5df965e..cbc7ebff2c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -113,6 +113,19 @@ class MooncakeStoreCoordinator:
+         )
+         return length // alignment * alignment
+ 
++    def get_replay_boundary(self, num_prompt_tokens: int) -> int:
++        """Mirror of ``KVCacheCoordinator.get_replay_boundary``.
++
++        The store's retention must name the same position the engine resumes
++        at; if the two disagree the store keeps state where nothing can reach
++        it. Model-level for the same reason: a hit is the shortest hit across
++        groups, so an EAGLE group's drop caps every group.
++        """
++        if not self.eagle_group_ids:
++            return num_prompt_tokens - 1
++        aligned = num_prompt_tokens // self.lcm_block_size * self.lcm_block_size
++        return max(aligned - self.lcm_block_size, 0)
++
+     def _verify_and_split_kv_cache_groups(self) -> None:
+         """Mirrors KVCacheCoordinator.verify_and_split_kv_cache_groups but
+         dispatches via spec_manager_map (we don't allocate managers).
+@@ -297,6 +310,13 @@ class MooncakeStoreCoordinator:
+             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+             f"{mask_alignment}"
+         )
++        # Model-level, so it is computed once and shared by every group (see
++        # KVCacheCoordinator.get_replay_boundary).
++        reachable_boundaries = (
++            ()
++            if num_prompt_tokens is None
++            else (self.get_replay_boundary(num_prompt_tokens),)
++        )
+         masks: list[list[bool] | None] = []
+         for g_idx, g in enumerate(self.kv_cache_groups):
+             spec = _unwrap_spec(g.kv_cache_spec)
+@@ -305,9 +325,6 @@ class MooncakeStoreCoordinator:
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             assert manager_cls is not None
+             use_eagle = g_idx in self.eagle_group_ids
+-            reachable_boundaries = (
+-                () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
+-            )
+             mask = manager_cls.reachable_block_mask(
+                 start_block=start_chunk,
+                 end_block=end_chunk,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 6daa1e82ea..96f29e5a8c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -283,7 +283,15 @@ class ChunkedTokenDatabase:
+         if not block_hashes:
+             return
+         assert token_len % self.hash_block_size == 0
+-        assert token_len // self.hash_block_size <= len(block_hashes)
++        # Speculative decoding advances token_len by up to num_spec_tokens per
++        # step, while block_hashes covers committed tokens only, so the tail
++        # can be unhashed. Save the covered prefix instead of raising out of
++        # KVCacheStoreSendingThread, which kills the decode worker. The load
++        # path already clamps identically -- see lookup()'s
++        # max_units = min(len(block_hashes), token_len // hash_block_size).
++        # Not persisting KV for not-yet-committed speculative tokens is also
++        # the correct behaviour: those tokens may still be rejected.
++        token_len = min(token_len, len(block_hashes) * self.hash_block_size)
+         start_chunk = max(0, cdiv(mask_num, self.block_size))
+         max_chunks = cdiv(token_len, self.block_size)
+         if chunk_mask is not None:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index eb1fa7bbb9..d4e7fbb648 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -61,11 +61,11 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
++    effective_kv_block_size,
+     maybe_convert_block_hash,
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
+-    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -1365,55 +1365,31 @@ class MooncakeStoreWorker:
+             )
+             return
+ 
+-        # Put every group's block size into the scheduler's coordinate space.
+-        #
+-        # This connector indexes ``block_ids`` with GLOBAL token positions --
+-        # ``starts // block_size`` and ``(spans + block_size - 1) // block_size``
+-        # in ChunkedTokenDatabase.prepare_values. Under DCP a rank holds a
+-        # strided 1/dcp slice, so one physical block of an ATTENTION group spans
+-        # ``block_size * dcp`` global tokens, while a Mamba group's state is
+-        # replicated per rank and still spans ``block_size``. That is the rule
+-        # ``resolve_kv_cache_block_sizes`` states and the scheduler follows, so
+-        # mirroring it keeps this connector in the same coordinates as the
+-        # ``block_ids`` it is handed. Applying it per group is what lifts the
+-        # hybrid + DCP refusal in connector.py.
+-        #
+-        # The single-group path is left exactly as it was. It substitutes
+-        # scheduler_block_size wholesale, which for one ATTENTION group equals
+-        # ``block_size * dcp`` and so agrees with the rule anyway -- but for one
+-        # MAMBA group it does not, and that substitution is deliberate: it keeps
+-        # the coordinator's ``block_size % hash_block_size`` invariant holding.
+-        # Generalising over it would have changed a working path to open an
+-        # unrelated one.
+-        groups = list(kv_cache_config.kv_cache_groups)
+-        if len(groups) == 1:
+-            if groups[0].kv_cache_spec.block_size != self.block_size:
+-                g = groups[0]
+-                groups = [
+-                    dataclasses.replace(
+-                        g,
+-                        kv_cache_spec=dataclasses.replace(
+-                            g.kv_cache_spec, block_size=self.block_size
+-                        ),
+-                    )
+-                ]
+-        else:
+-            # dcp only, exactly as resolve_kv_cache_block_sizes does. PCP is a
+-            # different sharding, is still refused in connector.py, and folding
+-            # it in here would be a scale nothing else agrees with.
+-            dcp = vllm_config.parallel_config.decode_context_parallel_size
+-            groups = [
+-                g
+-                if not isinstance(g.kv_cache_spec, AttentionSpec) or dcp == 1
+-                else dataclasses.replace(
++        # Under PCP/DCP the spec block_size is the *per-rank* size, while the
++        # coordinator reasons in tokens spanned across the CP ranks. Rescale
++        # each group to its effective span so the coordinator's invariants
++        # (``block_size % hash_block_size == 0`` and ``scheduler_block_size %
++        # block_size == 0``) hold. Attention groups are sharded over the CP
++        # ranks and scale; Mamba state is replicated and does not -- the same
++        # asymmetry ``resolve_kv_cache_block_sizes`` applies when it derives
++        # ``scheduler_block_size``. At cp == 1 this is a no-op, and for a
++        # single group it reproduces the previous behaviour of scaling the
++        # lone group up to ``scheduler_block_size``.
++        cp_world_size = (
++            vllm_config.parallel_config.decode_context_parallel_size
++            * vllm_config.parallel_config.prefill_context_parallel_size
++        )
++        groups = []
++        for g in kv_cache_config.kv_cache_groups:
++            eff = effective_kv_block_size(g.kv_cache_spec, cp_world_size)
++            if eff != g.kv_cache_spec.block_size:
++                g = dataclasses.replace(
+                     g,
+                     kv_cache_spec=dataclasses.replace(
+-                        g.kv_cache_spec,
+-                        block_size=g.kv_cache_spec.block_size * dcp,
++                        g.kv_cache_spec, block_size=eff
+                     ),
+                 )
+-                for g in groups
+-            ]
++            groups.append(g)
+         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+         spec_cfg = getattr(vllm_config, "speculative_config", None)
+         use_eagle = bool(
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 03ad01e1d9..bf7c2e9822 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -67,7 +67,15 @@ class DSparkMarkovHead(nn.Module):
+ 
+     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
+-        return self.markov_w1(token_ids)
++        # markov_w1 is replicated (see the class docstring), so it is the only
++        # token-id gather in a draft step with no range check: every other one
++        # goes through VocabParallelEmbedding, which masks ids outside the local
++        # shard to row 0 whenever tp_size > 1. token_ids is data -- its first
++        # entry per request is the target's last sampled token -- so a bad id
++        # trips `indexSelectSmallIndex: srcIndex < srcSelectDimSize` and kills
++        # the worker at the next event sync, far from the cause. ATen reads the
++        # index as `unsigned int`, so -1 fails that assert too; bound both ends.
++        return self.markov_w1(token_ids.clamp(0, self.markov_w1.num_embeddings - 1))
+ 
+     def bias(
+         self,
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index cc0232ec42..f47f93ffc7 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -270,6 +270,28 @@ class KVCacheCoordinator(ABC):
+             for manager in self.single_type_managers
+         )
+ 
++    def get_replay_boundary(self, request: Request) -> int:
++        """Return the position a later request replaying this prompt resumes at.
++
++        A cache hit is the shortest hit across all groups, so this is a
++        model-level position: every group has to retain state here, whether or
++        not it is the group that drops. Groups differ only in how much they
++        keep around it -- EAGLE groups also keep the block above, which they
++        match and drop back from (see ``reachable_block_mask``).
++
++        Under EAGLE that block must exist, so the boundary sits one alignment
++        unit below the prompt's last aligned position; every group's block size
++        divides the alignment, so the block above always fits in the prompt.
++        """
++        if not self.eagle_group_ids:
++            return request.num_prompt_tokens - 1
++        aligned = (
++            request.num_prompt_tokens
++            // self.scheduler_block_size
++            * self.scheduler_block_size
++        )
++        return max(aligned - self.scheduler_block_size, 0)
++
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         """
+         Cache the blocks for the request.
+@@ -280,11 +302,13 @@ class KVCacheCoordinator(ABC):
+                 that need to be cached
+                 (including tokens that are already cached).
+         """
++        replay_boundary = self.get_replay_boundary(request)
+         for manager in self.single_type_managers:
+             manager.cache_blocks(
+                 request,
+                 num_computed_tokens,
+                 retention_interval=self.retention_interval,
++                replay_boundary=replay_boundary,
+             )
+ 
+     def free(self, request_id: str) -> None:
+@@ -669,6 +693,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 // self.scheduler_block_size
+                 * self.scheduler_block_size
+             )
++        replay_boundary = self.get_replay_boundary(request)
+         for manager in self.single_type_managers:
+             num_tokens_to_cache = aligned_num_computed_tokens
+             # EAGLE groups match one block past each aligned boundary and drop
+@@ -686,6 +711,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 request,
+                 num_tokens_to_cache,
+                 retention_interval=self.retention_interval,
++                replay_boundary=replay_boundary,
+             )
+ 
+     def find_longest_cache_hit(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 770dffa4f2..4d05ec9c62 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -603,6 +603,21 @@ def hash_block_tokens(
+     )
+ 
+ 
++def effective_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
++    """Tokens one block of this group spans across the DCP ranks.
++
++    Attention blocks are sharded over the DCP ranks, so one logical block
++    spans ``block_size * dcp``. Mamba/linear-attention state is replicated on
++    every rank and never sharded (``MambaSpec.max_num_blocks_per_req`` returns
++    the unscaled value), so it keeps ``block_size``. Scaling every group is a
++    no-op at ``dcp == 1``, which is why the distinction only shows up on hybrid
++    models under DCP.
++    """
++    if isinstance(spec, AttentionSpec):
++        return spec.block_size * dcp_world_size
++    return spec.block_size
++
++
+ def resolve_kv_cache_block_sizes(
+     kv_cache_config: KVCacheConfig,
+     vllm_config: VllmConfig,
+@@ -631,10 +646,7 @@ def resolve_kv_cache_block_sizes(
+         return bs, bs
+ 
+     group_block_sizes = [
+-        g.kv_cache_spec.block_size * dcp
+-        if isinstance(g.kv_cache_spec, AttentionSpec)
+-        else g.kv_cache_spec.block_size
+-        for g in groups
++        effective_kv_block_size(g.kv_cache_spec, dcp) for g in groups
+     ]
+     scheduler_block_size = math.lcm(*group_block_sizes)
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 0ec3721475..eb2c0cd194 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -415,6 +415,11 @@ class Scheduler(SchedulerInterface):
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        if tail_boundary and self.use_eagle:
++            # Eagle matches one hash unit past the candidate and drops it, so
++            # nothing proves the prompt's own last hash boundary. Materialize
++            # the state one unit lower, where the hit can actually land.
++            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+@@ -1083,9 +1088,16 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 if pad_spec_decode:
+-                    scheduled_spec_decode_tokens[request_id] = [
+-                        -1
+-                    ] * self.num_spec_tokens
++                    # `num_new_tokens` can still shrink after the padding
++                    # decision above (long_prefill_token_threshold, encoder
++                    # inputs, _mamba_block_aligned_split), so derive the
++                    # placeholder count from the final value. Scheduling more
++                    # draft tokens than query tokens makes the worker's logits
++                    # window (query_end - num_logits) start before this
++                    # request's own query slice.
++                    num_pad_spec = num_new_tokens - self.num_sampled_tokens_per_step
++                    if num_pad_spec > 0:
++                        scheduled_spec_decode_tokens[request_id] = [-1] * num_pad_spec
+                 # Only track requests that will still be prefilling after this chunk.
+                 if num_computed_tokens + num_new_tokens < request.num_tokens:
+                     self._inflight_prefills.add(request)
+@@ -2802,57 +2814,57 @@ class Scheduler(SchedulerInterface):
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
++            # get_block_ids returns one block-id list per KV-cache group.
++            # Hybrid models (e.g. Mamba + attention) expose several groups; in
++            # align mode they share the scheduler block_size and block count,
++            # and block_ids are globally unique. Scan by logical position and
++            # treat a position as invalid if ANY group's block there failed to
++            # load, truncating the request at the earliest such position.
++            #
++            # Replaces our own conservative branch, which on any hybrid model
++            # reset num_computed_tokens to 0 and evicted the request's whole
++            # prefix on a single failed block. Under kv_load_failure_policy
++            # recompute that turned each residual -704 into a full-prompt
++            # recompute.
++            block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+             )
+ 
+-            if len(req_block_id_groups) != 1:
+-                # Mooncake reports load failures as physical block IDs without
+-                # identifying the hybrid KV group. Attention and Mamba groups
+-                # can use different logical block sizes, so there is no safe
+-                # common token boundary at which to truncate them. Conservatively
+-                # recompute the complete prefix for every matching hybrid request.
+-                # This is a rare eviction-race path and preserves correctness.
+-                req_hybrid_block_ids = {
+-                    block_id
+-                    for group_block_ids in req_block_id_groups
+-                    for block_id in group_block_ids
+-                }
+-                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
+-                    continue
+-
+-                request.num_computed_tokens = 0
+-                total_affected_tokens += max(req_num_computed_tokens, 0)
+-                if evict_blocks:
+-                    blocks_to_evict.update(req_hybrid_block_ids)
+-                affected_req_ids.add(req_id)
+-                continue
+-
+-            (req_block_ids,) = req_block_id_groups
+-
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+-                if block_id not in invalid_block_ids:
++            for idx in range(req_num_computed_blocks):
++                invalid_here = [
++                    group_block_ids[idx]
++                    for group_block_ids in block_ids_per_group
++                    if idx < len(group_block_ids)
++                    and group_block_ids[idx] in invalid_block_ids
++                ]
++                if not invalid_here:
+                     continue
+ 
+                 is_affected = True
+ 
+-                if block_id in marked_invalid_block_ids:
+-                    # This invalid block is shared with a previous request
+-                    # and was already marked for recomputation.
+-                    # This means this request can still consider this block
+-                    # as computed when rescheduled.
++                # A position is "shared" only if every invalid block at it was
++                # already marked by a previous request (which will recompute
++                # it), so this request can still treat it as computed.
++                new_invalid = [
++                    block_id
++                    for block_id in invalid_here
++                    if block_id not in marked_invalid_block_ids
++                ]
++                marked_invalid_block_ids.update(invalid_here)
++
++                if not new_invalid:
++                    # All invalid blocks here are shared with a previous request
++                    # and already marked for recomputation.
+                     # Currently this only applies to sync loading; Async
+-                    # loading does not yet support block sharing
++                    # loading does not yet support block sharing.
+                     continue
+ 
+-                marked_invalid_block_ids.add(block_id)
+-
+                 if marked_invalid_block:
+                     # This request has already marked an invalid block for
+                     # recomputation and updated its num_computed_tokens.
+@@ -2866,9 +2878,11 @@ class Scheduler(SchedulerInterface):
+                 )
+                 total_affected_tokens += num_affected_tokens
+ 
+-                # collect invalid block and all downstream dependent blocks
++                # collect invalid block and all downstream dependent blocks,
++                # across every group
+                 if evict_blocks:
+-                    blocks_to_evict.update(req_block_ids[idx:])
++                    for group_block_ids in block_ids_per_group:
++                        blocks_to_evict.update(group_block_ids[idx:])
+ 
+             if is_affected:
+                 if not marked_invalid_block:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f4f4..f1ba187271 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -110,7 +110,6 @@ class SingleTypeKVCacheManager(ABC):
+         # aligned segment (SWA). Initialized lazily by the coordinator after
+         # determining the attention groups.
+         self.use_eagle = False
+-
+         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
+         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
+@@ -429,6 +428,8 @@ class SingleTypeKVCacheManager(ABC):
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         """
+         Cache the blocks for the request.
+@@ -451,7 +452,7 @@ class SingleTypeKVCacheManager(ABC):
+         # Token boundaries whose reachable tail must be retained under sparse
+         # retention: the replay boundary (``num_prompt - 1``, capped by
+         # ``get_computed_blocks``) and any detected shared-prefix junction.
+-        reachable_boundaries = [request.num_prompt_tokens - 1]
++        reachable_boundaries = [replay_boundary]
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
+@@ -781,8 +782,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
++        super().cache_blocks(
++            request,
++            num_tokens,
++            retention_interval=retention_interval,
++            replay_boundary=replay_boundary,
++        )
+         hash_block_size = self.block_pool.hash_block_size
+         if self.block_size == hash_block_size:
+             return
+@@ -1677,9 +1685,16 @@ class MambaManager(SingleTypeKVCacheManager):
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
++        super().cache_blocks(
++            request,
++            num_tokens,
++            retention_interval=retention_interval,
++            replay_boundary=replay_boundary,
++        )
+         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+         if self.mamba_cache_mode == "align":
+             partial_hash = self._cache_partial_tail_block(request, num_tokens)
+@@ -1715,6 +1730,12 @@ class MambaManager(SingleTypeKVCacheManager):
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
++        if self.use_eagle:
++            # Eagle groups match one hash unit past the candidate and drop it,
++            # so register the tail one unit lower.
++            latest_prompt_hash_boundary = max(
++                latest_prompt_hash_boundary - hash_block_size, 0
++            )
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 
+@@ -1772,6 +1793,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         # We do not cache blocks for cross-attention to be shared between
+         # requests, so this method is not relevant.
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 8a952aa043..50367ad208 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -516,13 +516,22 @@ def _post_update_kernel(
+         )
+ 
+         if output_bin_counts_ptr is not None:
+-            token_ptr = (
+-                output_bin_counts_ptr
+-                + req_state_idx * output_bin_counts_stride
+-                + token_id
+-            )
+-            count = tl.load(token_ptr)
+-            tl.store(token_ptr, count + 1)
++            # token_id is the only index in this kernel bounded by a data
++            # value rather than by a shape, and output_bin_counts_stride is
++            # vocab_size, the tightest row bound here. An id outside
++            # [0, vocab_size) either lands in a neighbouring request's row
++            # (silently corrupting its penalty counts) or leaves the
++            # allocation entirely (illegal memory access). There is no bin for
++            # such an id, so skip it. Same hazard class the rejection sampler
++            # guards with `draft_sampled = tl.maximum(0, draft_sampled)`.
++            if 0 <= token_id and token_id < output_bin_counts_stride:
++                token_ptr = (
++                    output_bin_counts_ptr
++                    + req_state_idx * output_bin_counts_stride
++                    + token_id
++                )
++                count = tl.load(token_ptr)
++                tl.store(token_ptr, count + 1)
+ 
+     if query_start_loc_ptr is None:
+         query_len = 0
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 05302347bc..2d2aeeb3b5 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1027,6 +1027,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+             num_logits = num_draft_tokens_per_req + num_bonus_tokens
++            # Each request samples from the tail of its own query slice
++            # (logits_start = query_end - num_logits), so a logits window wider
++            # than the query reads the preceding request's tokens and makes
++            # post_update's computed_delta negative.
++            assert (num_logits <= num_scheduled_tokens).all(), (
++                f"num_logits {num_logits} exceeds num_scheduled_tokens "
++                f"{num_scheduled_tokens}"
++            )
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 13c7644315..076bfd665e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -36,6 +36,22 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             if speculative_config.kv_cache_dtype is not None
+             else vllm_config.cache_config
+         ),
++        # The draft inherits the target's load_config. With
++        # load_format="fastsafetensors" that breaks single-shard draft weights
++        # under data parallelism: fastsafetensors hands tensors over as DLPack
++        # capsules, which may only be consumed once, and the DP ranks racing on
++        # the one shard hit
++        #   RuntimeError: from_dlpack received an invalid capsule
++        # Deterministic on TP8-prefill + DEP16-decode disagg (3/3 runs, always a
++        # decode rank). Use the standard loader for the DRAFT only -- it is a
++        # single shard so the cost is negligible, while the multi-shard target
++        # keeps fastsafetensors (195 s vs 40+ min serial).
++        load_config=(
++            replace(vllm_config.load_config, load_format="auto")
++            if getattr(vllm_config.load_config, "load_format", None)
++            == "fastsafetensors"
++            else vllm_config.load_config
++        ),
+     )
+     # VllmConfig post-init restores the target's quant config because the target
+     # config is retained for DSpark's target-layer metadata, so we must override it.
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 3ea9f35ee8..b5cf812b68 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -532,6 +532,7 @@ def _rejection_kernel(
+     # [num_logits, num_blocks]
+     local_residual_mass_ptr,
+     local_residual_mass_stride,
++    vocab_size,
+     vocab_num_blocks,
+     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+@@ -555,9 +556,15 @@ def _rejection_kernel(
+         logit_idx = start_idx + i
+         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+         # -1 is used for placeholder draft token ids that should be rejected.
+-        is_valid_draft = draft_sampled >= 0
++        # Bounded above as well as below. Upstream guards only against the -1
++        # padding, but under synthetic acceptance draft_sampled is stored
++        # verbatim as an output token id rather than compared against
++        # target_argmax, so an out-of-vocab id survives to index the embedding
++        # table and trips `srcIndex < srcSelectDimSize` far from here. Every
++        # throughput arm on this track runs synthetic acceptance.
++        is_valid_draft = (draft_sampled >= 0) & (draft_sampled < vocab_size)
+         # Avoid possible OOB ptr access.
+-        draft_sampled = tl.maximum(0, draft_sampled)
++        draft_sampled = tl.minimum(tl.maximum(0, draft_sampled), vocab_size - 1)
+         if not is_greedy:
+             # A -1 placeholder ends verification. Greedy is excluded because it
+             # stores the target argmax upon first rejection, so it rejects the
+@@ -1123,6 +1130,7 @@ def rejection_sample(
+         cumulative_log_p,
+         local_residual_mass,
+         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
++        vocab_size,
+         vocab_num_blocks,
+         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+         HAS_DRAFT_LOGITS=has_draft_logits,

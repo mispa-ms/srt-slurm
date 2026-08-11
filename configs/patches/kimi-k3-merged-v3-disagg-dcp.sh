@@ -52,39 +52,30 @@ bash /configs/patches/vllm-container-deps-k3-mooncake.sh
 bash /configs/patches/kimi-k3-merged-v3-mooncake.sh
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
-# wzhao18/vllm@cdcc7eae38 "fix disagg dspark", which neither our branch nor the
-# v3 image carries. Its load-bearing line is in ChunkedTokenDatabase:
-# speculative decoding advances token_len by up to num_spec_tokens per step
-# while block_hashes covers committed tokens only, so the unhashed tail raised
-# an assert out of KVCacheStoreSendingThread and killed the decode worker. The
-# rest bound token ids that reach an unmasked gather -- markov_w1 (Kimi-K3's
-# draft imports DSparkMarkovHead from qwen3_dspark), the penalty bin-count
-# kernel, and the rejection sampler's synthetic-acceptance path, where
-# draft_sampled is stored verbatim as an output id rather than compared against
-# target_argmax.
-WEI=/configs/patches/k3-wei-disagg-dspark.patch
-echo "=== k3-wei-disagg-dspark ==="
+# wzhao18/vllm@wzhao/kimi-k3-agentx-v2 -- the branch that produced the
+# 1xDCP8 + 1xDCP8 / dram-mooncake curve we are reproducing. Four commits our
+# tree lacked, as one patch:
+#
+#   cdcc7eae38  ChunkedTokenDatabase clamps token_len instead of asserting on a
+#               speculative tail the block hashes do not cover, plus bounds on
+#               token ids reaching an unmasked gather (markov_w1, the penalty
+#               bin-count kernel, the rejection sampler).
+#   5a6b8f38a9  A failed external load truncates the request at the earliest bad
+#               position across groups. Our own hybrid fix reset
+#               num_computed_tokens to 0 and threw away the whole prefix, so
+#               under kv_load_failure_policy recompute each residual -704 cost a
+#               full prompt.
+#   fd3e230e7   One model-level get_replay_boundary on the coordinator, threaded
+#               into every cache_blocks. Replaces d87cdf5ce4, which we carried
+#               for two days before finding the chart branch does not have it --
+#               Wei rewrote it three days later and this is the rewrite.
+#   e4008bfc0a  effective_kv_block_size shared with resolve_kv_cache_block_sizes.
+WEI=/configs/patches/k3-wei-v2.patch
+echo "=== k3-wei-v2 ==="
 if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$WEI" >/dev/null 2>&1; then
     echo "already applied"
 else
     patch -p1 --forward -d "$SITE" < "$WEI"
-fi
-
-# wzhao18/vllm@d87cdf5ce4, the other half: fine-grained PMU under EAGLE
-# drafting. EAGLE rewinds a fine-grained attention hit by one hash unit, so the
-# Mamba recurrent state has to exist at that rewound boundary rather than at the
-# latest prompt-tail boundary. Four pieces move together -- MambaManager caches
-# there, the hybrid coordinator turns that on when eagle and partial hits are
-# both live, the scheduler stops a prefill chunk there so the state is actually
-# materialized, and the Mooncake coordinator resumes there on lookup. Required
-# to pair DSpark with prefix-match-unit 128; without it the drafter's rewound
-# hit has no recurrent state behind it.
-PMU=/configs/patches/k3-wei-pmu-eagle.patch
-echo "=== k3-wei-pmu-eagle ==="
-if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$PMU" >/dev/null 2>&1; then
-    echo "already applied"
-else
-    patch -p1 --forward -d "$SITE" < "$PMU"
 fi
 
 FIX=/configs/patches/k3-disagg-dcp-45340.patch
@@ -137,42 +128,46 @@ assert 'draft_sampled < vocab_size' in rej, (
     'embedding table'
 )
 
-# d87cdf5ce4's four pieces, checked where they have to agree rather than by
-# their diff text. The two boundaries are computed in different files from the
-# same inputs; if they drift, the state is materialized at one position and read
-# at another, which is a silent Mamba miss rather than an error.
-sched = read('v1/core/sched/scheduler.py')
-assert 'speculative_replay_boundary' in sched, (
-    'the scheduler never stops a prefill chunk at the EAGLE replay boundary, so '
-    'no recurrent state is materialized there for the drafter to resume from'
+# fd3e230e7's pieces, checked where they have to agree rather than by diff
+# text. get_replay_boundary is computed on the coordinator and consumed by every
+# SingleTypeKVCacheManager; if a subclass does not accept the kwarg it is a
+# TypeError on the first cached request, which a substring check cannot see.
+import inspect
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+from vllm.v1.core import single_type_kv_cache_manager as stkcm
+
+assert hasattr(KVCacheCoordinator, 'get_replay_boundary'), (
+    'fd3e230e7 is missing: nothing computes the model-level replay boundary'
 )
-assert 'self.use_eagle and not self.mamba_partial_cache_hit' in sched, (
-    'the scheduler still backs off a full block under eagle; with a finer PMU '
-    'eagle only rewinds one hash unit and the block boundary is lost'
+missing = [
+    cls.__name__
+    for cls in vars(stkcm).values()
+    if inspect.isclass(cls)
+    and 'cache_blocks' in vars(cls)
+    and 'replay_boundary' not in inspect.signature(cls.cache_blocks).parameters
+]
+assert not missing, (
+    f'cache_blocks overrides without the replay_boundary kwarg: {missing}. The '
+    f'coordinator passes it by keyword, so these raise TypeError on the first '
+    f'cached request.'
 )
-mgr = read('v1/core/single_type_kv_cache_manager.py')
-assert 'cache_speculative_replay_tail' in mgr, (
-    'MambaManager still caches at the latest prompt hash boundary, one hash '
-    'unit past where the drafter resumes'
+assert not hasattr(stkcm.MambaManager, 'cache_speculative_replay_tail'), (
+    'the reverted d87cdf5ce4 flag is back alongside fd3e230e7; carrying both '
+    'materializes recurrent state at two different positions'
 )
-coord = read('v1/core/kv_cache_coordinator.py')
-assert 'cache_speculative_replay_tail' in coord, (
-    'nothing turns the MambaManager flag on: the field exists but is always '
-    'False, so the whole change is inert'
+
+# A failed external load must truncate at the bad position, not discard the
+# prefix. The conservative branch we replaced is recognisable by this reset.
+sched_src = read('v1/core/sched/scheduler.py')
+assert 'block_ids_per_group' in sched_src, (
+    '5a6b8f38a9 is missing: the invalid-block scan still unpacks a single group'
 )
-mc = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py')
-assert 'replay_boundary' in mc, 'the Mooncake lookup does not resume at the replay boundary'
-assert 'eagle_attn_group_indices' not in mc, (
-    'the source branch names the attribute eagle_attn_group_indices; here it is '
-    'eagle_group_ids, and left unrenamed the fast path raises AttributeError on '
-    'the first lookup'
+assert 'request.num_computed_tokens = 0' not in sched_src, (
+    'the conservative hybrid branch survives: one failed block still discards '
+    'the whole prefix'
 )
-guard = mc.split('replay_hit == replay_boundary')
-assert len(guard) == 2, 'the replay fast path is not shaped as expected; the check below cannot read it'
-assert '_exact_partial_hit_key_exists' in guard[1][:400], (
-    'the replay fast path returns without revalidating that the key exists -- '
-    'that is the -704 livelock of vllm#50359 reached by a new path'
-)
+
+from vllm.v1.core.kv_cache_utils import effective_kv_block_size  # noqa: F401
 
 print('=== disagg DCP patch verified ===')
 "

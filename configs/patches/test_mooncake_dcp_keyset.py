@@ -167,150 +167,75 @@ def check_mamba_only_lookup() -> None:
     )
 
 
-def check_replay_boundary_is_loadable(dcp: int) -> None:
-    """The EAGLE replay-boundary fast path must obey the same object-boundary
-    rule as the ordinary lookup.
+def check_replay_boundary_agreement() -> None:
+    """The store must retain state at the position the engine resumes at.
 
-    wzhao18/vllm@d87cdf5ce4 lets a fine-grained EAGLE producer resume directly
-    at ``latest_boundary - hash_block_size`` instead of taking a lookahead
-    snapshot. That boundary is a hash multiple by construction, so it lands in a
-    dcp-scaled attention block's interior. It is loadable only because the
-    producer's partial-tail offload wrote an object there; if it did not, or did
-    so for only some groups, returning it is the -704 livelock again by a new
-    path. The fast path is therefore gated on the same revalidation as the loop.
+    wzhao18/vllm@fd3e230e7 computes one model-level replay boundary on
+    KVCacheCoordinator and mirrors it on MooncakeStoreCoordinator. The two are
+    separate implementations of the same formula over the same inputs, in
+    different files, and nothing makes them agree. If they drift the store keeps
+    state where nothing can reach it -- silent, and it looks like a cold cache.
 
-    The invariant is not "the hit is block aligned" -- under a partial-tail
-    offload it deliberately is not -- but "the hit's key exists for every
-    group", which is what a load actually requires.
-
-    Two stores, because each alone is weak. With the tail written, the fast path
-    fires and must return it; the run is asserted non-vacuous, since a store
-    that never triggers the fast path would pass while testing nothing. With the
-    tail written for only the Mamba group, the fast path must refuse it -- that
-    is the case the gate exists for.
+    Core divides by ``scheduler_block_size``; the mirror divides by
+    ``lcm_block_size``. Those are the same number today, which is precisely why
+    a rename or a change of unit on one side would go unnoticed.
     """
-    # d87cdf5ce4 is applied by the disagg setup script only, so on an AGG run
-    # there is no fast path to exercise and the vacuity assert below would fire
-    # with nothing wrong. Probe rather than assume.
-    if "replay_boundary" not in inspect.getsource(
-        MooncakeStoreCoordinator.find_longest_cache_hit
-    ):
-        raise Skipped("no EAGLE replay fast path in this build")
+    from types import SimpleNamespace
 
-    groups = _groups(dcp)
-    block_sizes = [g.kv_cache_spec.block_size for g in groups]
-    coord = MooncakeStoreCoordinator(
-        groups,
-        scheduler_block_size=lcm(*block_sizes),
-        hash_block_size=HASH_BLOCK_SIZE,
-        use_eagle=True,
-        retention_interval=0,
-    )
-    hashes = [
-        BlockHash(i.to_bytes(4, "big")) for i in range(MAX_LENGTH // HASH_BLOCK_SIZE)
-    ]
+    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 
-    def store(tail_groups: tuple[int, ...]) -> set[tuple[int, bytes]]:
-        exists: set[tuple[int, bytes]] = set()
-        for g_idx, block_size in enumerate(block_sizes):
-            for end in range(block_size, MAX_LENGTH + 1, block_size):
-                exists.add((g_idx, bytes(hashes[end // HASH_BLOCK_SIZE - 1])))
-        for length in range(MAMBA_BLOCK, MAX_LENGTH + 1, MAMBA_BLOCK):
-            replay = length // HASH_BLOCK_SIZE * HASH_BLOCK_SIZE - HASH_BLOCK_SIZE
-            if replay > 0:
-                for g_idx in tail_groups:
-                    exists.add((g_idx, bytes(hashes[replay // HASH_BLOCK_SIZE - 1])))
-        return exists
-
-    all_groups = tuple(range(len(block_sizes)))
-    for label, tail_groups in (("all groups", all_groups), ("mamba only", (1,))):
-        exists = store(tail_groups)
-        pool = ExternalCachedBlockPool(HASH_BLOCK_SIZE, exists)
-        fired = 0
-        for max_length in range(MAMBA_BLOCK, MAX_LENGTH + 1, MAMBA_BLOCK):
-            _masks, hit = coord.find_longest_cache_hit(
-                hashes, max_length=max_length, cached_block_pool=pool
-            )
-            if hit == 0:
-                continue
-            replay = max_length // HASH_BLOCK_SIZE * HASH_BLOCK_SIZE - HASH_BLOCK_SIZE
-            fired += hit == replay
-            key = bytes(hashes[hit // HASH_BLOCK_SIZE - 1])
-            for g_idx, block_size in enumerate(block_sizes):
-                assert (g_idx, key) in exists, (
-                    f"dcp={dcp} max_length={max_length} tail={label}: hit {hit} "
-                    f"names a key group {g_idx} (block_size={block_size}) never "
-                    f"wrote -> -704"
-                )
-        # Only the positive store proves the path is live. In the mamba-only
-        # store an ungated fast path is caught by the key-exists assertion
-        # above, so there is nothing further to assert here.
-        if tail_groups == all_groups:
-            assert fired, (
-                f"dcp={dcp}: the EAGLE replay fast path never fired even with the "
-                f"partial tail written for every group -- this check is vacuous "
-                f"and would pass with the revalidation gate removed"
-            )
-
-
-def check_core_coordinator_constructs() -> None:
-    """Construct the real HybridKVCacheCoordinator the way the engine does.
-
-    d87cdf5ce4 sets ``cache_speculative_replay_tail`` on every MambaManager when
-    eagle and fine-grained hits are both live. On the source branch that ran
-    inside ``verify_and_split_kv_cache_groups``; here ``enable_partial_hash_hits``
-    is assigned *after* that call, so the same placement reads an attribute that
-    does not exist yet. ``git apply`` reports a clean application either way, and
-    a substring check for the flag passes on the broken file -- it is present,
-    just unreachable. The engine finds out eight minutes in, at KVCacheManager
-    construction, with the model already loaded.
-
-    So build it rather than read it, and assert the flag actually landed: a
-    constructor that merely stops raising would otherwise pass while the whole
-    patch is inert.
-    """
-    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+    if not hasattr(KVCacheCoordinator, "get_replay_boundary"):
+        raise Skipped("fd3e230e7 is not applied in this build")
 
     dcp = 8
     groups = _groups(dcp)
     block_sizes = [g.kv_cache_spec.block_size for g in groups]
-    config = KVCacheConfig(
-        num_blocks=64,
-        kv_cache_tensors=[
-            KVCacheTensor(size=1024, shared_by=[name])
-            for g in groups
-            for name in g.layer_names
-        ],
-        kv_cache_groups=groups,
-    )
-    coord = get_kv_cache_coordinator(
-        config,
-        max_model_len=MAX_LENGTH,
-        max_in_flight_tokens=MAX_LENGTH,
-        use_eagle=True,
-        enable_caching=True,
-        enable_kv_cache_events=False,
-        dcp_world_size=dcp,
-        pcp_world_size=1,
-        scheduler_block_size=lcm(*block_sizes),
+    scheduler_block_size = lcm(*block_sizes)
+    store = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=scheduler_block_size,
         hash_block_size=HASH_BLOCK_SIZE,
+        use_eagle=True,
+        retention_interval=0,
     )
-    if not hasattr(coord, "single_type_managers"):
-        raise Skipped("not a hybrid coordinator in this build")
-    mambas = [m for m in coord.single_type_managers if isinstance(m, MambaManager)]
-    assert mambas, "no MambaManager built for the hybrid K3 layout"
-    if not hasattr(mambas[0], "cache_speculative_replay_tail"):
-        raise Skipped("d87cdf5ce4 is not applied in this build")
-    assert coord.enable_partial_hash_hits, (
-        "partial hash hits are off for the K3 dcp8 layout, so this check cannot "
-        "see whether the replay-tail flag is wired"
+    if not hasattr(store, "get_replay_boundary"):
+        raise Skipped("the Mooncake mirror of get_replay_boundary is absent")
+
+    # Call core's real implementation rather than restating its formula, which
+    # would only test this file against itself. get_replay_boundary reads
+    # scheduler_block_size and eagle_group_ids off self and nothing else, so an
+    # unbound call with a stub runs the actual code without an engine.
+    core = KVCacheCoordinator.get_replay_boundary
+    coord = SimpleNamespace(
+        scheduler_block_size=scheduler_block_size, eagle_group_ids={0}
     )
-    assert all(m.cache_speculative_replay_tail for m in mambas), (
-        "the replay-tail flag never reached MambaManager: eagle and fine-grained "
-        "hits are both on, so d87cdf5ce4 applied but is inert"
+
+    for n in range(scheduler_block_size, 12 * scheduler_block_size, MAMBA_BLOCK):
+        want = core(coord, SimpleNamespace(num_prompt_tokens=n))
+        got = store.get_replay_boundary(n)
+        assert got == want, (
+            f"num_prompt_tokens={n}: the store retains at {got} but the engine "
+            f"resumes at {want}"
+        )
+
+    # Non-eagle takes the other branch on both sides; without this the check
+    # only ever exercises one of the two.
+    coord_noeagle = SimpleNamespace(
+        scheduler_block_size=scheduler_block_size, eagle_group_ids=set()
     )
+    store_noeagle = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=HASH_BLOCK_SIZE,
+        use_eagle=False,
+        retention_interval=0,
+    )
+    for n in (scheduler_block_size, 5 * scheduler_block_size + 128):
+        want = core(coord_noeagle, SimpleNamespace(num_prompt_tokens=n))
+        got = store_noeagle.get_replay_boundary(n)
+        assert got == want, (
+            f"no-eagle num_prompt_tokens={n}: store {got} != engine {want}"
+        )
 
 
 def main() -> int:
@@ -324,18 +249,10 @@ def main() -> int:
         except AssertionError as e:
             failures += 1
             print(f"  FAIL  [dcp={dcp}]: {e}")
-        try:
-            check_replay_boundary_is_loadable(dcp)
-            print(f"  ok    EAGLE replay boundary is loadable [dcp={dcp}]")
-        except Skipped as e:
-            print(f"  skip  EAGLE replay boundary [dcp={dcp}]: {e}")
-        except AssertionError as e:
-            failures += 1
-            print(f"  FAIL  replay boundary [dcp={dcp}]: {e}")
     for name, fn in (
         ("load_mask is not shortened by the retry", check_load_mask_not_shortened),
         ("mamba-only lookup does not crash", check_mamba_only_lookup),
-        ("core coordinator constructs", check_core_coordinator_constructs),
+        ("replay boundary agrees with core", check_replay_boundary_agreement),
     ):
         try:
             fn()
