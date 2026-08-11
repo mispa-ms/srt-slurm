@@ -27,6 +27,7 @@ The gates that ran instead of this could not see it -- GSM8K passed at
 connector's read path at all.
 """
 
+import inspect
 from math import lcm
 
 import torch
@@ -41,6 +42,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+
+
+class Skipped(Exception):
+    """The build under test does not carry the code a check is for."""
+
 
 HASH_BLOCK_SIZE = 128
 MAMBA_BLOCK = 1536
@@ -161,6 +167,92 @@ def check_mamba_only_lookup() -> None:
     )
 
 
+def check_replay_boundary_is_loadable(dcp: int) -> None:
+    """The EAGLE replay-boundary fast path must obey the same object-boundary
+    rule as the ordinary lookup.
+
+    wzhao18/vllm@d87cdf5ce4 lets a fine-grained EAGLE producer resume directly
+    at ``latest_boundary - hash_block_size`` instead of taking a lookahead
+    snapshot. That boundary is a hash multiple by construction, so it lands in a
+    dcp-scaled attention block's interior. It is loadable only because the
+    producer's partial-tail offload wrote an object there; if it did not, or did
+    so for only some groups, returning it is the -704 livelock again by a new
+    path. The fast path is therefore gated on the same revalidation as the loop.
+
+    The invariant is not "the hit is block aligned" -- under a partial-tail
+    offload it deliberately is not -- but "the hit's key exists for every
+    group", which is what a load actually requires.
+
+    Two stores, because each alone is weak. With the tail written, the fast path
+    fires and must return it; the run is asserted non-vacuous, since a store
+    that never triggers the fast path would pass while testing nothing. With the
+    tail written for only the Mamba group, the fast path must refuse it -- that
+    is the case the gate exists for.
+    """
+    # d87cdf5ce4 is applied by the disagg setup script only, so on an AGG run
+    # there is no fast path to exercise and the vacuity assert below would fire
+    # with nothing wrong. Probe rather than assume.
+    if "replay_boundary" not in inspect.getsource(
+        MooncakeStoreCoordinator.find_longest_cache_hit
+    ):
+        raise Skipped("no EAGLE replay fast path in this build")
+
+    groups = _groups(dcp)
+    block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=lcm(*block_sizes),
+        hash_block_size=HASH_BLOCK_SIZE,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    hashes = [
+        BlockHash(i.to_bytes(4, "big")) for i in range(MAX_LENGTH // HASH_BLOCK_SIZE)
+    ]
+
+    def store(tail_groups: tuple[int, ...]) -> set[tuple[int, bytes]]:
+        exists: set[tuple[int, bytes]] = set()
+        for g_idx, block_size in enumerate(block_sizes):
+            for end in range(block_size, MAX_LENGTH + 1, block_size):
+                exists.add((g_idx, bytes(hashes[end // HASH_BLOCK_SIZE - 1])))
+        for length in range(MAMBA_BLOCK, MAX_LENGTH + 1, MAMBA_BLOCK):
+            replay = length // HASH_BLOCK_SIZE * HASH_BLOCK_SIZE - HASH_BLOCK_SIZE
+            if replay > 0:
+                for g_idx in tail_groups:
+                    exists.add((g_idx, bytes(hashes[replay // HASH_BLOCK_SIZE - 1])))
+        return exists
+
+    all_groups = tuple(range(len(block_sizes)))
+    for label, tail_groups in (("all groups", all_groups), ("mamba only", (1,))):
+        exists = store(tail_groups)
+        pool = ExternalCachedBlockPool(HASH_BLOCK_SIZE, exists)
+        fired = 0
+        for max_length in range(MAMBA_BLOCK, MAX_LENGTH + 1, MAMBA_BLOCK):
+            _masks, hit = coord.find_longest_cache_hit(
+                hashes, max_length=max_length, cached_block_pool=pool
+            )
+            if hit == 0:
+                continue
+            replay = max_length // HASH_BLOCK_SIZE * HASH_BLOCK_SIZE - HASH_BLOCK_SIZE
+            fired += hit == replay
+            key = bytes(hashes[hit // HASH_BLOCK_SIZE - 1])
+            for g_idx, block_size in enumerate(block_sizes):
+                assert (g_idx, key) in exists, (
+                    f"dcp={dcp} max_length={max_length} tail={label}: hit {hit} "
+                    f"names a key group {g_idx} (block_size={block_size}) never "
+                    f"wrote -> -704"
+                )
+        # Only the positive store proves the path is live. In the mamba-only
+        # store an ungated fast path is caught by the key-exists assertion
+        # above, so there is nothing further to assert here.
+        if tail_groups == all_groups:
+            assert fired, (
+                f"dcp={dcp}: the EAGLE replay fast path never fired even with the "
+                f"partial tail written for every group -- this check is vacuous "
+                f"and would pass with the revalidation gate removed"
+            )
+
+
 def main() -> int:
     """Plain driver: the framework image is not guaranteed to ship pytest, and a
     missing test dependency must not take down every arm of a sweep."""
@@ -172,6 +264,14 @@ def main() -> int:
         except AssertionError as e:
             failures += 1
             print(f"  FAIL  [dcp={dcp}]: {e}")
+        try:
+            check_replay_boundary_is_loadable(dcp)
+            print(f"  ok    EAGLE replay boundary is loadable [dcp={dcp}]")
+        except Skipped as e:
+            print(f"  skip  EAGLE replay boundary [dcp={dcp}]: {e}")
+        except AssertionError as e:
+            failures += 1
+            print(f"  FAIL  replay boundary [dcp={dcp}]: {e}")
     for name, fn in (
         ("load_mask is not shortened by the retry", check_load_mask_not_shortened),
         ("mamba-only lookup does not crash", check_mamba_only_lookup),

@@ -70,6 +70,23 @@ else
     patch -p1 --forward -d "$SITE" < "$WEI"
 fi
 
+# wzhao18/vllm@d87cdf5ce4, the other half: fine-grained PMU under EAGLE
+# drafting. EAGLE rewinds a fine-grained attention hit by one hash unit, so the
+# Mamba recurrent state has to exist at that rewound boundary rather than at the
+# latest prompt-tail boundary. Four pieces move together -- MambaManager caches
+# there, the hybrid coordinator turns that on when eagle and partial hits are
+# both live, the scheduler stops a prefill chunk there so the state is actually
+# materialized, and the Mooncake coordinator resumes there on lookup. Required
+# to pair DSpark with prefix-match-unit 128; without it the drafter's rewound
+# hit has no recurrent state behind it.
+PMU=/configs/patches/k3-wei-pmu-eagle.patch
+echo "=== k3-wei-pmu-eagle ==="
+if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$PMU" >/dev/null 2>&1; then
+    echo "already applied"
+else
+    patch -p1 --forward -d "$SITE" < "$PMU"
+fi
+
 FIX=/configs/patches/k3-disagg-dcp-45340.patch
 echo "=== k3-disagg-dcp-45340 ==="
 if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX" >/dev/null 2>&1; then
@@ -120,8 +137,51 @@ assert 'draft_sampled < vocab_size' in rej, (
     'embedding table'
 )
 
+# d87cdf5ce4's four pieces, checked where they have to agree rather than by
+# their diff text. The two boundaries are computed in different files from the
+# same inputs; if they drift, the state is materialized at one position and read
+# at another, which is a silent Mamba miss rather than an error.
+sched = read('v1/core/sched/scheduler.py')
+assert 'speculative_replay_boundary' in sched, (
+    'the scheduler never stops a prefill chunk at the EAGLE replay boundary, so '
+    'no recurrent state is materialized there for the drafter to resume from'
+)
+assert 'self.use_eagle and not self.mamba_partial_cache_hit' in sched, (
+    'the scheduler still backs off a full block under eagle; with a finer PMU '
+    'eagle only rewinds one hash unit and the block boundary is lost'
+)
+mgr = read('v1/core/single_type_kv_cache_manager.py')
+assert 'cache_speculative_replay_tail' in mgr, (
+    'MambaManager still caches at the latest prompt hash boundary, one hash '
+    'unit past where the drafter resumes'
+)
+coord = read('v1/core/kv_cache_coordinator.py')
+assert 'cache_speculative_replay_tail' in coord, (
+    'nothing turns the MambaManager flag on: the field exists but is always '
+    'False, so the whole change is inert'
+)
+mc = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py')
+assert 'replay_boundary' in mc, 'the Mooncake lookup does not resume at the replay boundary'
+assert 'eagle_attn_group_indices' not in mc, (
+    'the source branch names the attribute eagle_attn_group_indices; here it is '
+    'eagle_group_ids, and left unrenamed the fast path raises AttributeError on '
+    'the first lookup'
+)
+guard = mc.split('replay_hit == replay_boundary')
+assert len(guard) == 2, 'the replay fast path is not shaped as expected; the check below cannot read it'
+assert '_exact_partial_hit_key_exists' in guard[1][:400], (
+    'the replay fast path returns without revalidating that the key exists -- '
+    'that is the -704 livelock of vllm#50359 reached by a new path'
+)
+
 print('=== disagg DCP patch verified ===')
 "
+
+# The replay fast path is new code on the lookup path, so re-run the hit-boundary
+# tests now that it is installed. The earlier run inside kimi-k3-merged-v3-mooncake.sh
+# happens before this patch and skips the replay check for want of anything to test.
+echo "=== mooncake DCP hit-boundary tests (with replay fast path) ==="
+python3 /configs/patches/test_mooncake_dcp_keyset.py
 
 # The client the workers end up with must be the version the master was started
 # from. vllm-container-deps-mooncake.sh launches the master from MOONCAKE_VERSION

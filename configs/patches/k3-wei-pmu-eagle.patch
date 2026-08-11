@@ -1,0 +1,175 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index 1eb5df965e..4292b6bf06 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -167,6 +167,33 @@ class MooncakeStoreCoordinator:
+         already reflects the eagle-pruned hit length and a second pop would
+         leave the trailing block unloaded.
+         """
++        # A producer with fine-grained EAGLE caching persists the already
++        # reconciled replay boundary (one hash unit back), so resume there
++        # instead of taking a redundant lookahead snapshot.
++        if apply_eagle and self.enable_partial_hash_hits and self.eagle_group_ids:
++            latest_boundary = max_length // self.hash_block_size * self.hash_block_size
++            replay_boundary = latest_boundary - self.hash_block_size
++            if replay_boundary > 0:
++                replay_blocks, replay_hit = self._find_hit_blocks(
++                    block_hashes,
++                    replay_boundary,
++                    cached_block_pool,
++                    apply_eagle=False,
++                )
++                # Revalidate exactly as the loop below does: a hash-unit
++                # boundary is not a block boundary and Mooncake keys whole
++                # blocks, so returning here unchecked reintroduces -704.
++                if replay_hit == replay_boundary and self._exact_partial_hit_key_exists(
++                    block_hashes, replay_hit, cached_block_pool
++                ):
++                    return (
++                        tuple(
++                            [blk is not cached_block_pool.null_block for blk in blocks]
++                            for blocks in replay_blocks
++                        ),
++                        replay_hit,
++                    )
++
+         candidate_length = max_length
+         while True:
+             blocks_per_group, hit_length = self._find_hit_blocks(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index eb1fa7bbb9..faec03edb0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -565,8 +565,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         return True
+ 
+     def _maybe_offload_partial_tail(self, req_meta: ReqMeta) -> bool:
+-        """Offload the request's sub-block partial tail (its last prompt hash
+-        boundary) so a later request can hit the sub-block prefix.
++        """Offload a request's selected sub-block PMU boundary so a later
++        request can hit the sub-block prefix.
+ 
+         Covers every block from the normal save's lcm floor to the boundary:
+         the normal save floors to ``lcm_block_size``, so a smaller-block
+diff --git a/vllm/envs.py b/vllm/envs.py
+index c2314891cb..627a5c8076 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1113,12 +1113,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         if "VLLM_PLUGINS" not in os.environ
+         else os.environ["VLLM_PLUGINS"].split(",")
+     ),
+-    # Retain local sliding-window KV checkpoints for prefix caching.
++    # Retain sparse hybrid KV checkpoints for prefix caching.
+     # Unset (default) preserves the dense local checkpointing behavior. `0`
+-    # retains only the latest completed prompt boundary. Positive values retain
+-    # checkpoints at the specified interval boundaries (rounded up to the
+-    # prefix-cache alignment).
+-    # Applies to sliding-window attention for now but not yet Mamba/linear attention.
++    # retains only replay-reachable checkpoints. Positive values also retain
++    # checkpoints at the specified interval boundaries. Fine-grained PMU tail
++    # snapshots are retained separately when partial prefix hits are enabled.
++    # Applies to sliding-window attention and Mamba/linear attention.
+     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
+         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
+         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index cc0232ec42..82c8081b14 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
++    MambaManager,
+     SingleTypeKVCacheManager,
+     get_manager_for_kv_cache_spec,
+ )
+@@ -655,6 +656,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 for gid in group.group_ids:
+                     self.single_type_managers[gid].use_eagle = True
+ 
++        # The drafting attention group rewinds a fine-grained hit by one hash
++        # unit. Mamba has no draft layer of its own, but its recurrent state
++        # must still exist at that reconciled replay boundary.
++        if self.eagle_group_ids and self.enable_partial_hash_hits:
++            for manager in self.single_type_managers:
++                if isinstance(manager, MambaManager):
++                    manager.cache_speculative_replay_tail = True
++
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         if self.enable_partial_hash_hits:
+             aligned_num_computed_tokens = num_computed_tokens
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 6ae275a8cb..1475e99009 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -387,11 +387,12 @@ class Scheduler(SchedulerInterface):
+             return num_new_tokens
+ 
+         block_size = self.cache_config.block_size
+-        # The last block-aligned position whose state can be cached. With
+-        # Eagle, FullAttn prunes the last matching block, so back off one
+-        # block to avoid a Mamba cache miss.
++        # The last block-aligned position whose state can be cached. Without
++        # fine-grained hits, Eagle prunes the last matching block, so back off
++        # one block to avoid a Mamba cache miss. With a finer PMU, Eagle only
++        # rewinds one hash unit; keep the normal block boundary materialized.
+         last_cache_position = request.num_tokens - request.num_tokens % block_size
+-        if self.use_eagle:
++        if self.use_eagle and not self.mamba_partial_cache_hit:
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+@@ -415,12 +416,25 @@ class Scheduler(SchedulerInterface):
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        speculative_replay_boundary = (
++            tail_boundary - self.hash_block_size
++            if self.use_eagle and tail_boundary >= self.hash_block_size
++            else 0
++        )
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+             next_block_boundary if start % block_size != 0 else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
++            # EAGLE-family drafting rewinds a fine-grained attention hit by
++            # one hash unit. Materialize the matching recurrent state before
++            # proceeding to the latest prompt-tail boundary.
++            speculative_replay_boundary
++            if last_cache_position
++            < speculative_replay_boundary
++            < request.num_prompt_tokens
++            else 0,
+             # Fine-grained hits: the prompt's partial-tail entry can only be
+             # registered by a chunk ending exactly at its last hash boundary.
+             tail_boundary
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f4f4..0c33447ab6 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1263,6 +1263,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         self.block_size = kv_cache_spec.block_size
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
++        self.cache_speculative_replay_tail = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1715,7 +1716,12 @@ class MambaManager(SingleTypeKVCacheManager):
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
+-        if num_tokens != latest_prompt_hash_boundary:
++        cacheable_boundary = (
++            latest_prompt_hash_boundary - hash_block_size
++            if self.cache_speculative_replay_tail
++            else latest_prompt_hash_boundary
++        )
++        if num_tokens != cacheable_boundary:
+             return None
+ 
+         block_idx = num_tokens // self.block_size
