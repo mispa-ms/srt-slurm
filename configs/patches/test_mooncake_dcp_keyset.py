@@ -253,6 +253,66 @@ def check_replay_boundary_is_loadable(dcp: int) -> None:
             )
 
 
+def check_core_coordinator_constructs() -> None:
+    """Construct the real HybridKVCacheCoordinator the way the engine does.
+
+    d87cdf5ce4 sets ``cache_speculative_replay_tail`` on every MambaManager when
+    eagle and fine-grained hits are both live. On the source branch that ran
+    inside ``verify_and_split_kv_cache_groups``; here ``enable_partial_hash_hits``
+    is assigned *after* that call, so the same placement reads an attribute that
+    does not exist yet. ``git apply`` reports a clean application either way, and
+    a substring check for the flag passes on the broken file -- it is present,
+    just unreachable. The engine finds out eight minutes in, at KVCacheManager
+    construction, with the model already loaded.
+
+    So build it rather than read it, and assert the flag actually landed: a
+    constructor that merely stops raising would otherwise pass while the whole
+    patch is inert.
+    """
+    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+    dcp = 8
+    groups = _groups(dcp)
+    block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[
+            KVCacheTensor(size=1024, shared_by=[name])
+            for g in groups
+            for name in g.layer_names
+        ],
+        kv_cache_groups=groups,
+    )
+    coord = get_kv_cache_coordinator(
+        config,
+        max_model_len=MAX_LENGTH,
+        max_in_flight_tokens=MAX_LENGTH,
+        use_eagle=True,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=dcp,
+        pcp_world_size=1,
+        scheduler_block_size=lcm(*block_sizes),
+        hash_block_size=HASH_BLOCK_SIZE,
+    )
+    if not hasattr(coord, "single_type_managers"):
+        raise Skipped("not a hybrid coordinator in this build")
+    mambas = [m for m in coord.single_type_managers if isinstance(m, MambaManager)]
+    assert mambas, "no MambaManager built for the hybrid K3 layout"
+    if not hasattr(mambas[0], "cache_speculative_replay_tail"):
+        raise Skipped("d87cdf5ce4 is not applied in this build")
+    assert coord.enable_partial_hash_hits, (
+        "partial hash hits are off for the K3 dcp8 layout, so this check cannot "
+        "see whether the replay-tail flag is wired"
+    )
+    assert all(m.cache_speculative_replay_tail for m in mambas), (
+        "the replay-tail flag never reached MambaManager: eagle and fine-grained "
+        "hits are both on, so d87cdf5ce4 applied but is inert"
+    )
+
+
 def main() -> int:
     """Plain driver: the framework image is not guaranteed to ship pytest, and a
     missing test dependency must not take down every arm of a sweep."""
@@ -275,10 +335,13 @@ def main() -> int:
     for name, fn in (
         ("load_mask is not shortened by the retry", check_load_mask_not_shortened),
         ("mamba-only lookup does not crash", check_mamba_only_lookup),
+        ("core coordinator constructs", check_core_coordinator_constructs),
     ):
         try:
             fn()
             print(f"  ok    {name}")
+        except Skipped as e:
+            print(f"  skip  {name}: {e}")
         except AssertionError as e:
             failures += 1
             print(f"  FAIL  {name}: {e}")

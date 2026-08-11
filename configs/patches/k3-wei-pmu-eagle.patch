@@ -74,7 +74,7 @@ index c2314891cb..627a5c8076 100755
          int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
          if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index cc0232ec42..82c8081b14 100644
+index cc0232ec42..d6587eb5f3 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
@@ -85,9 +85,9 @@ index cc0232ec42..82c8081b14 100644
      SingleTypeKVCacheManager,
      get_manager_for_kv_cache_spec,
  )
-@@ -655,6 +656,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
-                 for gid in group.group_ids:
-                     self.single_type_managers[gid].use_eagle = True
+@@ -594,6 +595,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             for g in kv_cache_config.kv_cache_groups
+         )
  
 +        # The drafting attention group rewinds a fine-grained hit by one hash
 +        # unit. Mamba has no draft layer of its own, but its recurrent state
@@ -97,9 +97,9 @@ index cc0232ec42..82c8081b14 100644
 +                if isinstance(manager, MambaManager):
 +                    manager.cache_speculative_replay_tail = True
 +
-     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-         if self.enable_partial_hash_hits:
-             aligned_num_computed_tokens = num_computed_tokens
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+         # Fine-grained partial hits may return hash-block-aligned lengths;
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index 6ae275a8cb..1475e99009 100644
 --- a/vllm/v1/core/sched/scheduler.py
