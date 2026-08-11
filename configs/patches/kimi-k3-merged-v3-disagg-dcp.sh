@@ -27,6 +27,20 @@
 
 set -euo pipefail
 
+# The Mooncake store half FIRST. This installs the wheel, writes
+# /tmp/mooncake_config.json and launches mooncake_master -- and nothing else
+# does. The disagg arms point MOONCAKE_CONFIG_PATH at that file through
+# prefill/decode_environment rather than carrying a mooncake_kv_store block for
+# srtslurm to render, so replacing this script with one that only patches vLLM
+# leaves the path dangling and every worker dies with
+#   [Errno 2] No such file or directory: '/tmp/mooncake_config.json'
+# which is exactly how the first six arms of this probe failed. The aggregated
+# arms hide this: there srtslurm renders the JSON from the config block, so the
+# setup script never had to.
+bash /configs/patches/vllm-container-deps-k3-mooncake.sh
+
+# Then the v3 image marker, our Mooncake-under-DCP patch and its tests. Last, so
+# its pins win over anything the deps scripts above reinstall.
 bash /configs/patches/kimi-k3-merged-v3-mooncake.sh
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
