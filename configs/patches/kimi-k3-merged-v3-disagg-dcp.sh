@@ -52,6 +52,24 @@ bash /configs/patches/vllm-container-deps-k3-mooncake.sh
 bash /configs/patches/kimi-k3-merged-v3-mooncake.sh
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
+# wzhao18/vllm@cdcc7eae38 "fix disagg dspark", which neither our branch nor the
+# v3 image carries. Its load-bearing line is in ChunkedTokenDatabase:
+# speculative decoding advances token_len by up to num_spec_tokens per step
+# while block_hashes covers committed tokens only, so the unhashed tail raised
+# an assert out of KVCacheStoreSendingThread and killed the decode worker. The
+# rest bound token ids that reach an unmasked gather -- markov_w1 (Kimi-K3's
+# draft imports DSparkMarkovHead from qwen3_dspark), the penalty bin-count
+# kernel, and the rejection sampler's synthetic-acceptance path, where
+# draft_sampled is stored verbatim as an output id rather than compared against
+# target_argmax.
+WEI=/configs/patches/k3-wei-disagg-dspark.patch
+echo "=== k3-wei-disagg-dspark ==="
+if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$WEI" >/dev/null 2>&1; then
+    echo "already applied"
+else
+    patch -p1 --forward -d "$SITE" < "$WEI"
+fi
+
 FIX=/configs/patches/k3-disagg-dcp-45340.patch
 echo "=== k3-disagg-dcp-45340 ==="
 if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$FIX" >/dev/null 2>&1; then
@@ -84,6 +102,23 @@ for rel in ('distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector
 meta = read('distributed/kv_transfer/kv_connector/v1/nixl/metadata.py')
 for k in ('dcp_size', 'pcp_size'):
     assert f'\'{k}\'' in meta or f'\"{k}\"' in meta, f'{k} missing from the layout key'
+
+# Wei's clamp must be in place of the assert, or a speculative decode step whose
+# tail is unhashed takes down the decode worker mid-run.
+data = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py')
+assert 'token_len = min(token_len, len(block_hashes)' in data, (
+    'wzhao18@cdcc7eae38 is missing: process_tokens still asserts on an unhashed '
+    'speculative tail instead of saving the covered prefix'
+)
+assert 'assert token_len // self.hash_block_size <= len(block_hashes)' not in data, (
+    'the old assert survives alongside the clamp'
+)
+rej = read('v1/worker/gpu/spec_decode/rejection_sampler_utils.py')
+assert 'draft_sampled < vocab_size' in rej, (
+    'the rejection sampler bounds draft ids below but not above; under synthetic '
+    'acceptance an out-of-vocab id is emitted verbatim and later indexes the '
+    'embedding table'
+)
 
 print('=== disagg DCP patch verified ===')
 "
