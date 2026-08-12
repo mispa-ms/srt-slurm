@@ -30,6 +30,26 @@ set -euo pipefail
 export MOONCAKE_VERSION=0.3.12.post1
 export FI_VER=${FI_VER:-0.6.16.post3}
 
+# Mooncake host-DRAM segment, per rank. vllm-container-deps-mooncake.sh derives
+# it as TOTAL_CPU_DRAM_GB / MOONCAKE_TP, and both defaults are bia's: 1500 GB
+# against that host's 2014 GiB, divided by TP8 because a bia node holds all
+# eight ranks. A lyris tray holds four GPUs, so four ranks reserve
+# 4 x 187 = 748 GB on a node -- which is what OOM-killed the first tep8dcp8 run
+# (4 oom_kill events, SLURM step 2673272.7).
+#
+# 100 GB/rank is the value SA's GB300 mooncake recipe uses, and its comment
+# gives the arithmetic: four segments reserve 400 GB on each 4-GPU tray. Set
+# TOTAL_CPU_DRAM_GB and MOONCAKE_TP so the existing division lands there rather
+# than hard-coding past it.
+#
+# Forced, not defaulted. The arms still carry TOTAL_CPU_DRAM_GB=1500 in their
+# prefill/decode_environment for the B300 track, and if that reaches this
+# context a ':-' fallback would silently restore 187 GB/rank -- the same shape
+# as the MOONCAKE_VERSION pin that was set in the worker env and never arrived.
+# This script only ever runs on GB300, so it decides.
+export TOTAL_CPU_DRAM_GB=400
+export MOONCAKE_TP=4
+
 # hfshim first -- the model has to resolve before anything else matters -- then
 # the Mooncake wheel, config and master. Both scripts source
 # vllm-container-deps.sh themselves; apt/pip are idempotent.
