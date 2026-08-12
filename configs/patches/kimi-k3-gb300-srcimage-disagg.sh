@@ -50,6 +50,14 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 export TOTAL_CPU_DRAM_GB=400
 export MOONCAKE_TP=4
 
+# lyris keeps the K3 weights on a shared path, not in a per-account HF cache:
+#   /lustre/share/coreai_comparch_inferencex/models/kimi-k3   (Hanjie Qiu, 07-27)
+# vllm-container-deps-k3-hfshim.sh defaults K3_STAGED_DIR to bia's staging dir
+# and refuses to continue when it is absent, so this has to be set here. Note
+# the path sits under /lustre/share and only carries inferencex in its name --
+# it does not follow SLURM_PPP, so it resolves for either account.
+export K3_STAGED_DIR=${K3_STAGED_DIR:-/lustre/share/coreai_comparch_inferencex/models/kimi-k3}
+
 # hfshim first -- the model has to resolve before anything else matters -- then
 # the Mooncake wheel, config and master. Both scripts source
 # vllm-container-deps.sh themselves; apt/pip are idempotent.
