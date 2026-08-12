@@ -163,7 +163,14 @@ for rel, marker, who in [
     ('v1/worker/gpu/model_runner.py', 'kv_shard_count = 1 if isinstance(spec, MambaSpec)', 'ours/v2'),
     ('models/kimi_k3/nvidia/kda_metadata.py', 'def _check_block_table_width', 'ours/v2'),
     ('v1/simple_kv_offload/manager.py', 'def _group_block_size', 'ours/v2'),
-    ('v1/core/sched/scheduler.py', 'req_hybrid_block_ids = {', 'ours/v2'),
+    # Two accepted forms. The hybrid invalid-block path started as our
+    # conservative branch (req_hybrid_block_ids: discard the whole prefix on any
+    # failed block) and is now wzhao18@5a6b8f38a9's per-position scan
+    # (block_ids_per_group: truncate at the earliest bad position). Which one is
+    # present depends on the image: the v3 image predates the swap and gets the
+    # patch later in the chain, while an image source-built from k3-wei-v2 already
+    # carries the new form. Demanding the old one alone failed all 23 GB300 jobs.
+    ('v1/core/sched/scheduler.py', ('req_hybrid_block_ids = {', 'block_ids_per_group'), 'ours/v2'),
     ('v1/core/kv_cache_coordinator.py',
      'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size', '#50493'),
     ('v1/attention/ops/dcp_utils.py', 'class MLADCPManager', '#50484'),

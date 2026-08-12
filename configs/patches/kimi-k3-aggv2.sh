@@ -84,10 +84,20 @@ for rel, marker, who in [
     ('v1/simple_kv_offload/manager.py', 'def _group_block_size', 'ours'),
     ('v1/worker/gpu/model_runner.py', 'kv_shard_count = 1 if isinstance(spec, MambaSpec)', 'ours'),
     ('models/kimi_k3/nvidia/kda_metadata.py', 'def _check_block_table_width', 'ours'),
-    ('v1/core/sched/scheduler.py', 'req_hybrid_block_ids = {', 'ours'),
+    # Two accepted forms. The hybrid invalid-block path started as our
+    # conservative branch (req_hybrid_block_ids: discard the whole prefix on any
+    # failed block) and is now wzhao18@5a6b8f38a9's per-position scan
+    # (block_ids_per_group: truncate at the earliest bad position). Which one is
+    # present depends on the image: the v3 image predates the swap and gets the
+    # patch later in the chain, while an image source-built from k3-wei-v2 already
+    # carries the new form. Demanding the old one alone failed all 23 GB300 jobs.
+    ('v1/core/sched/scheduler.py', ('req_hybrid_block_ids = {', 'block_ids_per_group'), 'ours'),
 ]:
     src = (root / rel).read_text()
-    assert marker in src, f'{who}: missing in {rel}: {marker}'
+    alts = marker if isinstance(marker, tuple) else (marker,)
+    assert any(a in src for a in alts), (
+        f'{who}: none of {alts} found in {rel}'
+    )
 
 k3 = (root / 'models/kimi_k3/nvidia/mla.py').read_text()
 assert 'does not support context parallelism.' not in k3, 'the blanket CP assert is still in mla.py'
