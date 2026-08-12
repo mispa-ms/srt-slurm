@@ -103,3 +103,36 @@ assert not missing, (
 print('AGG v2 image verified:', root)
 print('direct DCP ops present; VLLM_USE_DIRECT_DCP_* selects the path per arm')
 "
+
+# ── The Rust frontend must stay off ──────────────────────────────────────────
+# It is opt-in (envs.py: VLLM_USE_RUST_FRONTEND / VLLM_USE_RUST_BENCH, both
+# default "0"), and it must stay that way on this track: with it enabled the
+# interactivity numbers come out wrong, and interactivity is the x axis of every
+# chart in this report. A run that silently used it would not fail -- it would
+# produce a plausible number on the wrong axis, which is the worst kind.
+#
+# Checked here rather than in any one arm's script because this file is the
+# common root of every setup on the track. It guards against three things: an
+# arm adding the variable to its `aggregated_environment`, a base image shipping
+# it in the environment, and upstream changing the default.
+python3 - <<'PY'
+import os
+
+enabled = [name for name in ("VLLM_USE_RUST_FRONTEND", "VLLM_USE_RUST_BENCH")
+           if os.environ.get(name, "0") not in ("0", "", "false", "False")]
+assert not enabled, (
+    f"{enabled} is set. The Rust frontend distorts the interactivity metric this "
+    "track plots on the x axis; unset it rather than reading the numbers."
+)
+
+# The default is what makes the check above sufficient. If upstream ever flips
+# it, the variables above would be unset and the frontend still active.
+import vllm.envs as envs
+
+assert envs.VLLM_RUST_FRONTEND_PATH is None, (
+    f"vLLM resolved a Rust frontend binary ({envs.VLLM_RUST_FRONTEND_PATH}) with "
+    "neither opt-in variable set, so the upstream default has changed. Pin "
+    "VLLM_USE_RUST_FRONTEND=0 explicitly and re-check the interactivity metric."
+)
+print("=== Rust frontend off (Python frontend) ===")
+PY
