@@ -46,6 +46,9 @@ readonly PINNED_SHA=3ee2df3033
 readonly PATCH=/configs/patches/k3-ours8-nightly.patch
 
 export FI_VER=0.6.16.post3
+# Our commits are applied below, after this returns, so the deps script must
+# not assert them yet.
+export K3_EXPECT_OURS=0
 bash "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-aggv2.sh"
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
@@ -120,6 +123,19 @@ params = list(inspect.signature(get_uniform_decode_token_count).parameters)
 assert params[-1] == "has_prefill", (
     f"get_uniform_decode_token_count takes {params}, not upstream #51865's form"
 )
+# The markers kimi-k3-aggv2.sh skipped via K3_EXPECT_OURS=0, checked here now
+# that the patch is on. Same list, same file paths -- if it ever diverges from
+# that script's OURS list, one of the two is wrong.
+for rel, mark, who in [
+    ("v1/core/kv_cache_coordinator.py",
+     "dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size", "#50493"),
+    ("v1/simple_kv_offload/manager.py", "def _group_block_size", "ours"),
+    ("v1/worker/gpu/model_runner.py",
+     "kv_shard_count = 1 if isinstance(spec, MambaSpec)", "ours"),
+    ("models/kimi_k3/nvidia/kda_metadata.py", "def _check_block_table_width", "ours"),
+    ("v1/core/sched/scheduler.py", "req_hybrid_block_ids = {", "ours"),
+]:
+    assert mark in (root / rel).read_text(), f"{who}: missing in {rel} after the patch"
 print("=== k3-ours8-nightly verified ===")
 PY
 

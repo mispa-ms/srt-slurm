@@ -74,18 +74,40 @@ import vllm
 
 root = pathlib.Path(vllm.__file__).parent
 
-for rel, marker, who in [
+# Two lists, because this script now has two kinds of caller.
+#
+# UPSTREAM: things the base image must already carry whoever calls us. #50484
+# is upstream as of 63ac04a61e, so every image and every nightly from 08-11 on
+# has it.
+#
+# OURS: things that only exist once our commits are in. An image built from one
+# of our branches has them here; a stock nightly does not, and the caller
+# applies them as a runtime patch AFTER this script returns. Asserting them
+# unconditionally made this script fail on exactly the path it was added to
+# support, so the nightly callers set K3_EXPECT_OURS=0 and check the same
+# markers themselves once the patch is on.
+import os
+
+UPSTREAM = [
     ('models/kimi_k3/nvidia/mla.py', 'self.dcp_manager: MLADCPManager | None = None', '#50484'),
     ('v1/attention/ops/dcp_utils.py', 'class MLADCPManager', '#50484'),
     ('v1/attention/ops/common.py', 'sequence_indices = torch.searchsorted(', '#50484'),
     ('envs.py', 'VLLM_USE_DIRECT_DCP_A2A', '#50484'),
+]
+OURS = [
     ('v1/core/kv_cache_coordinator.py',
      'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size', '#50493'),
     ('v1/simple_kv_offload/manager.py', 'def _group_block_size', 'ours'),
     ('v1/worker/gpu/model_runner.py', 'kv_shard_count = 1 if isinstance(spec, MambaSpec)', 'ours'),
     ('models/kimi_k3/nvidia/kda_metadata.py', 'def _check_block_table_width', 'ours'),
     ('v1/core/sched/scheduler.py', 'req_hybrid_block_ids = {', 'ours'),
-]:
+]
+expect_ours = os.environ.get('K3_EXPECT_OURS', '1') not in ('0', '', 'false', 'False')
+checks = UPSTREAM + (OURS if expect_ours else [])
+if not expect_ours:
+    print('K3_EXPECT_OURS=0: the caller applies our commits after this script;',
+          'checking only what the base image must already have')
+for rel, marker, who in checks:
     src = (root / rel).read_text()
     assert marker in src, f'{who}: missing in {rel}: {marker}'
 
