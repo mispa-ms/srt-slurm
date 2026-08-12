@@ -92,13 +92,27 @@ assert 'pcp > 1' in conn, 'the PCP refusal was dropped; it is not covered by thi
 w = read(mc / 'worker.py')
 tree = ast.parse(w)
 scaled = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == 'block_size']
-assert 'AttentionSpec' in w, 'AttentionSpec is not imported; the isinstance test cannot select groups'
-
-# The single-group substitution must still be there, byte for byte in intent:
-# one group whose spec.block_size differs from scheduler_block_size is replaced.
-assert 'if len(groups) == 1:' in w, (
-    'the single-group path was folded into the general rule; that changes '
-    'single-Mamba + dcp>1 from scheduler_block_size to spec.block_size'
+# Two shapes of the same rule, and the tree may hold either.
+#
+#   ours (20f61816)  isinstance(spec, AttentionSpec) inline, plus a separate
+#                    single-group branch substituting scheduler_block_size.
+#   wzhao18@e4008bfc0a  the same asymmetry moved into effective_kv_block_size()
+#                    and shared with resolve_kv_cache_block_sizes; the
+#                    single-group branch is gone, which for a lone Mamba group
+#                    means spec.block_size rather than scheduler_block_size.
+#                    Kimi-K3 is hybrid and never reaches that path.
+#
+# The v3 image carries the first and gets the second later in this chain; an
+# image source-built from misunp/k3-wei-v2 already has the second. Demanding the
+# first alone failed every GB300 job.
+folded = 'effective_kv_block_size' in w
+assert folded or 'AttentionSpec' in w, (
+    'neither form of the group scaling is present: no effective_kv_block_size '
+    'and no AttentionSpec to select attention groups with'
+)
+assert folded or 'if len(groups) == 1:' in w, (
+    'the single-group substitution is gone but effective_kv_block_size did not '
+    'replace it; single-Mamba + dcp>1 would silently take spec.block_size'
 )
 
 # And the multi-group rule must be dcp-only, matching resolve_kv_cache_block_sizes.
@@ -109,13 +123,23 @@ core_fn = next(
     n for n in ast.walk(ast.parse(read(root / 'v1/core/kv_cache_utils.py')))
     if isinstance(n, ast.FunctionDef) and n.name == 'resolve_kv_cache_block_sizes'
 )
+# Two shapes again: the rule was an inline conditional expression, and
+# wzhao18@e4008bfc0a moved it into effective_kv_block_size(spec, dcp). Either
+# way it must still take dcp.
+core_src = ast.unparse(core_fn)
 core_rule = [
     ast.unparse(n) for n in ast.walk(core_fn)
     if isinstance(n, ast.IfExp) and 'AttentionSpec' in ast.unparse(n)
 ]
-assert core_rule and all('dcp' in r for r in core_rule), (
-    'resolve_kv_cache_block_sizes no longer scales attention groups by dcp; '
-    f'this patch mirrors a rule that changed: {core_rule}'
+helper = [
+    ast.unparse(n) for n in ast.walk(core_fn)
+    if isinstance(n, ast.Call) and getattr(n.func, 'id', '') == 'effective_kv_block_size'
+]
+assert (core_rule and all('dcp' in r for r in core_rule)) or (
+    helper and all('dcp' in h for h in helper)
+), (
+    'resolve_kv_cache_block_sizes no longer scales attention groups by dcp, in '
+    f'either form; inline={core_rule} helper={helper}'
 )
 assert 'decode_context_parallel_size' in w
 

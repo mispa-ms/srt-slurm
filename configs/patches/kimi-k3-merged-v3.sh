@@ -27,13 +27,32 @@ import pathlib
 import vllm
 
 root = pathlib.Path(vllm.__file__).parent
-rel, mark = "v1/worker/mamba_utils.py", "_memcpy_u64_tiled"
-path = root / rel
-assert path.exists() and mark in path.read_text(), (
-    f"wrong image: expected k3-merged-v3, but {rel} is missing or does not "
-    f"contain {mark!r}. That file arrives with vllm#49436 and is absent from "
-    "k3-merged-v2, so this is a v2 image."
+
+# Reject a k3-merged-v2 image. Two accepted images, because the aarch64 build
+# for GB300 is source-built from misunp/k3-wei-v2 rather than being the v3
+# image plus runtime patches:
+#
+#   v3        vllm#49436's _memcpy_u64_tiled in v1/worker/mamba_utils.py.
+#             Upstream has since renamed that helper to batch_memcpy, so the
+#             symbol identifies the v3 image specifically and is absent from
+#             anything newer -- which is how it failed every GB300 job.
+#   k3-wei-v2 fd3e230e7's get_replay_boundary on the coordinator. Present in
+#             neither v2 nor v3, so it cannot let a v2 image through.
+CANDIDATES = [
+    ("v1/worker/mamba_utils.py", "_memcpy_u64_tiled", "k3-merged-v3"),
+    ("v1/core/kv_cache_coordinator.py", "def get_replay_boundary", "k3-wei-v2"),
+]
+found = [
+    who for rel, mark, who in CANDIDATES
+    if (root / rel).exists() and mark in (root / rel).read_text()
+]
+assert found, (
+    "wrong image: none of "
+    + "; ".join(f"{mark!r} in {rel} ({who})" for rel, mark, who in CANDIDATES)
+    + ". Both k3-merged-v3 and a source build of misunp/k3-wei-v2 are accepted; "
+    "a k3-merged-v2 image has neither."
 )
+print(f"=== image identified as {'/'.join(found)} ===")
 import flashinfer  # noqa: E402
 print(f"=== v3 image verified; flashinfer {flashinfer.__version__} ===")
 PY
