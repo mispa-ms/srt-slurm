@@ -157,14 +157,29 @@ assert not hasattr(stkcm.MambaManager, 'cache_speculative_replay_tail'), (
 )
 
 # A failed external load must truncate at the bad position, not discard the
-# prefix. The conservative branch we replaced is recognisable by this reset.
-sched_src = read('v1/core/sched/scheduler.py')
-assert 'block_ids_per_group' in sched_src, (
-    '5a6b8f38a9 is missing: the invalid-block scan still unpacks a single group'
+# prefix. Scope this to the scanning function: _preempt_request resets
+# num_computed_tokens legitimately, and on the branch we are reproducing too, so
+# searching the whole file for that assignment rejects a correct tree -- which is
+# exactly what it did to 62233054 and 62233056.
+sched_tree = ast.parse(read('v1/core/sched/scheduler.py'))
+scan = next(
+    (n for n in ast.walk(sched_tree)
+     if isinstance(n, ast.FunctionDef) and 'block_ids_per_group' in ast.unparse(n)),
+    None,
 )
-assert 'request.num_computed_tokens = 0' not in sched_src, (
-    'the conservative hybrid branch survives: one failed block still discards '
-    'the whole prefix'
+assert scan is not None, (
+    '5a6b8f38a9 is missing: no function scans block_ids_per_group, so the '
+    'invalid-block path still unpacks a single KV group'
+)
+resets = [
+    n for n in ast.walk(scan)
+    if isinstance(n, ast.Assign)
+    and ast.unparse(n) == 'request.num_computed_tokens = 0'
+]
+assert not resets, (
+    f'{scan.name} still discards the whole prefix on a failed block '
+    f'(line {resets[0].lineno}); under kv_load_failure_policy recompute every '
+    f'-704 costs a full prompt'
 )
 
 from vllm.v1.core.kv_cache_utils import effective_kv_block_size  # noqa: F401
