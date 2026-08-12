@@ -47,7 +47,12 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 # context a ':-' fallback would silently restore 187 GB/rank -- the same shape
 # as the MOONCAKE_VERSION pin that was set in the worker env and never arrived.
 # This script only ever runs on GB300, so it decides.
-export TOTAL_CPU_DRAM_GB=400
+#
+# 2026-08-12: raised to Wei's value once his config could finally be read. His
+# mooncake_kv_store block sets global_segment_size 150GB per rank, so four ranks
+# reserve 600 GB on a tray rather than the 400 the SA recipe implied -- and his
+# runs do not OOM at that. Still expressed through the existing division.
+export TOTAL_CPU_DRAM_GB=600
 export MOONCAKE_TP=4
 
 # lyris keeps the K3 weights on a shared path, not in a per-account HF cache:
