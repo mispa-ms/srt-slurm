@@ -158,11 +158,27 @@ import vllm
 root = pathlib.Path(vllm.__file__).parent
 read = lambda rel: (root / rel).read_text()
 
-# --- this is the source-built image, not k3-merged-v2 or v3 ---
+# --- this is the k3-wei-v3 source-built image ---
+# get_replay_boundary alone no longer identifies the image: k3-wei-v2 has it too,
+# so once v3 existed this check stopped telling the two apart and would have let
+# a stale image through in silence. Pin the identity to a marker only v3 carries
+# -- wzhao18/vllm@fa92f83038, which fixed the partial-hit CoW by recording the
+# block at the index rather than the last of a different list. v2 predates it and
+# is the tree that hit the resulting AssertionError in pipeline 62444698.
 coord = read('v1/core/kv_cache_coordinator.py')
 assert 'def get_replay_boundary' in coord, (
-    'wrong image: no get_replay_boundary, so this is not built from '
-    'misunp/k3-wei-v2. Use kimi-k3-merged-v3-disagg-dcp.sh for the v3 image.'
+    'wrong image: no get_replay_boundary, so this is not a source-built K3 image. '
+    'Use kimi-k3-merged-v3-disagg-dcp.sh for the merged-v3 image.'
+)
+stkcm_src = read('v1/core/single_type_kv_cache_manager.py')
+assert '(block_idx, req_blocks[block_idx])' in stkcm_src, (
+    'this is k3-wei-v2, not k3-wei-v3: the partial-hit CoW still records '
+    'new_computed_blocks[-1], so req_blocks[block_idx] is not that block and '
+    'allocate_new_blocks dies on a bare AssertionError under load.'
+)
+assert 'block_hash_num_tokens' in stkcm_src, (
+    'k3-wei-v3 expected: _has_partial_local_hit does not verify that the block '
+    'at the index really is the partial tail'
 )
 
 # --- fd3e230e7: one model-level boundary, threaded as a required kwarg ---
