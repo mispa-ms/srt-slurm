@@ -104,6 +104,55 @@ python3 -m pip install --no-deps --force-reinstall \
     "flashinfer-jit-cache==${FI_VER}+${FI_CUDA}" || \
     echo "WARNING: flashinfer-jit-cache ${FI_VER}+${FI_CUDA} not installed; JIT will compile on demand"
 
+
+# --- KV connectors, the way the image that works installs them -------------
+# The stock nightly's NIXL cannot register VRAM on this stack:
+#   ucx_utils.cpp:622  4 NVIDIA GPU(s) were detected, but UCX CUDA support was
+#                      not found! GPU memory is not supported.
+#   nixl_agent.cpp:468 registerMem: registration failed ... all potential backends
+#   nixl_cu13._bindings.nixlBackendError: NIXL_ERR_BACKEND
+# and UCX confirms it by ignoring UCX_MEMTYPE_REG_WHOLE, which only exists in a
+# CUDA-enabled build. Our source-built images never hit this: AIB builds them
+# with INSTALL_KV_CONNECTORS=true, and vLLM's Dockerfile then does two steps --
+# install requirements/kv_connectors.txt (which pins nixl==1.3.1), then
+# force-reinstall nixl-cu<major> over it, with the comment "so the correct
+# nixl_ep_cpp.so is installed". Doing only the second is not equivalent.
+#
+# Mirror .buildkite/scripts/install-kv-connectors.sh, which is what that
+# Dockerfile branch actually runs. Two things matter and neither is optional:
+#   1. install the generic `nixl` first -- it carries the version the cuXX wheel
+#      must match;
+#   2. remove BOTH cuda variants before installing the matching one. Upstream:
+#      "nixl>=1.1.0 can install multiple CUDA wheel variants. Keep only the
+#      variant matching this CI image so nixl_ep_cpp links against the available
+#      libcudart." That is the same shape as the mooncake cu12/cu13 shadowing
+#      that cost us a day: two distributions, one import, undefined winner.
+echo "=== installing KV connectors the way the working image does ==="
+python3 -m pip install --no-cache-dir "nixl==${NIXL_VER:-1.3.1}"
+KV_META=$(python3 -c "
+import importlib.metadata as md
+import torch
+cuda = torch.version.cuda
+if cuda is None:
+    raise SystemExit('torch.version.cuda is not set')
+print(cuda.split('.', 1)[0], md.version('nixl'))
+")
+read -r CU_MAJOR NIXL_VERSION <<<"${KV_META}"
+python3 -m pip uninstall -y nixl-cu12 nixl-cu13 >/dev/null 2>&1 || true
+python3 -m pip install --no-cache-dir --no-deps "nixl-cu${CU_MAJOR}==${NIXL_VERSION}"
+python3 -c "
+import importlib.metadata as md
+import pathlib
+import nixl
+present = sorted('%s==%s' % (d.metadata['Name'], d.version)
+                 for d in md.distributions()
+                 if (d.metadata['Name'] or '').startswith('nixl'))
+print('  nixl distributions:', present)
+print('  imported from:', pathlib.Path(nixl.__file__).parent)
+cu = [p for p in present if p.startswith('nixl-cu')]
+assert len(cu) == 1, 'expected exactly one nixl-cuXX variant, found %s' % cu
+"
+
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
 echo "site-packages: $SITE"
 
