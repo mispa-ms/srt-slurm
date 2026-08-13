@@ -48,12 +48,53 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 # as the MOONCAKE_VERSION pin that was set in the worker env and never arrived.
 # This script only ever runs on GB300, so it decides.
 #
-# 2026-08-12: raised to Wei's value once his config could finally be read. His
-# mooncake_kv_store block sets global_segment_size 150GB per rank, so four ranks
-# reserve 600 GB on a tray rather than the 400 the SA recipe implied -- and his
-# runs do not OOM at that. Still expressed through the existing division.
-export TOTAL_CPU_DRAM_GB=600
+# 2026-08-12: briefly raised to 600 (150 GB/rank) on the reading that Wei's
+# config runs at that. It does not. His file sets global_segment_size 150GB with
+# this comment two lines above it:
+#
+#   # Per TP/DP rank, not per node: 4 ranks/node x 150 GB = 480 GB of the
+#   # node's 918 GB. 150 GB here OOM-killed the workers on this cluster.
+#
+# The arithmetic does not match the value -- 4 x 150 is 600, and 480 is what
+# 120 GB/rank gives -- so the comment was written for a lower number and the
+# value moved without it. Either way it records that 150 OOM-kills here, which
+# is what happened to us: 4 oom_kill events on theia0217, prefill_0 dead before
+# the engine came up (SLURM 2678074, pipeline 62448615).
+#
+# It survived once at 150 only because mooncake 0.3.9 was silently installed and
+# never committed the segment. With the wheel fix the reservation is real, so
+# the number now has to be one a tray can actually hold.
+#
+# Back to 400 -- 100 GB/rank, SA's GB300 recipe value, and the one our own clean
+# GB300 ladder ran at (pipeline 62405731). Raise it only against a measurement.
+export TOTAL_CPU_DRAM_GB=400
 export MOONCAKE_TP=4
+
+# Check it against the tray before the run rather than after. Because
+# PER_RANK_GB = TOTAL_CPU_DRAM_GB / MOONCAKE_TP and MOONCAKE_TP is exactly the
+# ranks on this node, TOTAL_CPU_DRAM_GB *is* the node-wide reservation -- it can
+# be compared to MemTotal directly.
+#
+# The ceiling is bracketed by measurement, not chosen: 400 GB of a 918 GB tray
+# runs (62405731), 600 GB OOM-kills (62448615), and 748 GB OOM-killed before
+# that (SLURM 2673272). So the tray needs somewhere north of a third of itself
+# for weights, host-side CUDA allocations, the frontend and checkpoint page
+# cache. 55% admits the known-good and rejects both known-bad values.
+MEM_TOTAL_GB=$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
+if [ -n "${MEM_TOTAL_GB}" ] && [ "${MEM_TOTAL_GB}" -gt 0 ]; then
+    MC_CEILING_GB=$(( MEM_TOTAL_GB * ${MOONCAKE_NODE_FRACTION_PCT:-55} / 100 ))
+    echo "[mooncake] node MemTotal ${MEM_TOTAL_GB} GB, reserving ${TOTAL_CPU_DRAM_GB} GB" \
+         "across ${MOONCAKE_TP} ranks ($(( TOTAL_CPU_DRAM_GB / MOONCAKE_TP )) GB each)," \
+         "ceiling ${MC_CEILING_GB} GB"
+    if [ "${TOTAL_CPU_DRAM_GB}" -gt "${MC_CEILING_GB}" ]; then
+        echo "[mooncake] FATAL: ${TOTAL_CPU_DRAM_GB} GB exceeds ${MC_CEILING_GB} GB." \
+             "Mooncake commits this segment for real, so the run would be OOM-killed" \
+             "~40 minutes in, at engine startup, with a bare 'Out Of Memory' from srun." >&2
+        exit 1
+    fi
+else
+    echo "[mooncake] WARN: /proc/meminfo unreadable -- cannot check ${TOTAL_CPU_DRAM_GB} GB against the tray"
+fi
 
 # lyris keeps the K3 weights on a shared path, not in a per-account HF cache:
 #   /lustre/share/coreai_comparch_inferencex/models/kimi-k3   (Hanjie Qiu, 07-27)
