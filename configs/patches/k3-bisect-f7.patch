@@ -1,0 +1,2395 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index fa8c282007..2a64f8e448 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1020,16 +1020,6 @@ class SpeculativeConfig:
+                 if self.method in ("dflash", "dspark"):
+                     self.parallel_drafting = True
+ 
+-                if (
+-                    self.method == "dspark"
+-                    and "K3DSparkModel" in self.draft_model_config.architectures
+-                    and self.target_parallel_config.decode_context_parallel_size > 1
+-                ):
+-                    raise ValueError(
+-                        "MLA DSpark does not currently support decode context "
+-                        "parallelism; set decode_context_parallel_size=1."
+-                    )
+-
+                 if self.num_speculative_tokens is not None and hasattr(
+                     self.draft_model_config.hf_config, "num_lookahead_tokens"
+                 ):
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index ca32c3345c..d94766f144 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -116,10 +116,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                 )
+         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+         dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
+-            unsupported.append(
+-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+-            )
++        # DCP with hybrid attention is supported: the worker now puts every
++        # group's block size into the scheduler's coordinate space -- attention
++        # groups scaled by dcp, Mamba groups not, the rule
++        # resolve_kv_cache_block_sizes states -- so ``starts // block_size`` in
++        # ChunkedTokenDatabase indexes the block_ids it is handed. The store key
++        # has always carried @dcp{rank}, so each rank's strided slice keys
++        # separately.
++        #
++        # PCP is a different sharding, is not mirrored by that scaling, and has
++        # not been measured, so it stays refused.
++        if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
++            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+         if unsupported:
+             raise ValueError(
+                 "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c846354..1eb5df965e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -37,6 +37,13 @@ class ExternalCachedBlockPool:
+         # determined and we just want each spec's manager to apply its own mask.
+         self._exists = exists
+         self.hash_block_size = hash_block_size
++        # False on the recv side, where the pool answers "present" to anything.
++        # The exact-boundary retry must not run against such a pool: it would
++        # shorten a hit that the lookup already validated, and load_mask's caller
++        # keeps using the original token_len, so process_tokens' trailing chunks
++        # would fall off the end of the mask and leave those blocks
++        # uninitialized -- silent corruption where -704 was at least loud.
++        self.tracks_existence = exists is not None
+         self.null_block = KVCacheBlock(block_id=0)
+         # Dummy ID 1 for present block for duck-typing.
+         self._present_block = KVCacheBlock(block_id=1)
+@@ -90,6 +97,14 @@ class MooncakeStoreCoordinator:
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+ 
++    @property
++    def cache_hit_alignment_tokens(self) -> int:
++        return (
++            self.hash_block_size
++            if self.enable_partial_hash_hits
++            else self.lcm_block_size
++        )
++
+     def align_lookup_length(self, length: int) -> int:
+         alignment = (
+             self.hash_block_size
+@@ -152,14 +167,56 @@ class MooncakeStoreCoordinator:
+         already reflects the eagle-pruned hit length and a second pop would
+         leave the trailing block unloaded.
+         """
+-        blocks_per_group, hit_length = self._find_hit_blocks(
+-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+-        )
+-        masks = tuple(
+-            [blk is not cached_block_pool.null_block for blk in blocks]
+-            for blocks in blocks_per_group
++        candidate_length = max_length
++        while True:
++            blocks_per_group, hit_length = self._find_hit_blocks(
++                block_hashes,
++                candidate_length,
++                cached_block_pool,
++                apply_eagle=apply_eagle,
++            )
++            masks = tuple(
++                [blk is not cached_block_pool.null_block for blk in blocks]
++                for blocks in blocks_per_group
++            )
++            if hit_length == 0 or self._exact_partial_hit_key_exists(
++                block_hashes, hit_length, cached_block_pool
++            ):
++                return masks, hit_length
++
++            candidate_length = max(0, hit_length - self.cache_hit_alignment_tokens)
++
++    def _exact_partial_hit_key_exists(
++        self,
++        block_hashes: Sequence[BlockHash],
++        hit_length: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> bool:
++        """Whether the reconciled partial FullAttention tail can be loaded."""
++        if not self.enable_partial_hash_hits:
++            return True
++        if not cached_block_pool.tracks_existence:
++            # Recv-side pool: it has no truth to check, and shortening the hit
++            # here would desynchronise the mask from its caller's token_len.
++            return True
++
++        # Attribute access, not tuple unpacking: SpecGroup carries manager_cls
++        # and use_eagle here, so the upstream 3-tuple unpack raises ValueError
++        # on the first lookup. git apply cannot see that -- it is a runtime
++        # arity mismatch, not a textual conflict.
++        group = self.attention_groups[0]
++        if not isinstance(group.spec, FullAttentionSpec):
++            # Nothing to revalidate: the defect needs an attention group coarser
++            # than hash granularity, and a recurrent group is tail-only. Upstream
++            # asserts FullAttentionSpec here, which crashes at the first lookup on
++            # a Mamba-only layout -- reachable, since partial hits are enabled by
++            # a Mamba group alone.
++            return True
++        hash_idx = hit_length // self.hash_block_size - 1
++        return (
++            cached_block_pool.get_cached_block(block_hashes[hash_idx], group.group_ids)
++            is not None
+         )
+-        return masks, hit_length
+ 
+     def load_mask(
+         self,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba92..eb1fa7bbb9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -65,6 +65,7 @@ from vllm.v1.core.kv_cache_utils import (
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -1364,19 +1365,54 @@ class MooncakeStoreWorker:
+             )
+             return
+ 
+-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+-        # self.block_size (= scheduler_block_size) so the coordinator's
+-        # ``block_size % hash_block_size == 0`` invariant holds.
++        # Put every group's block size into the scheduler's coordinate space.
++        #
++        # This connector indexes ``block_ids`` with GLOBAL token positions --
++        # ``starts // block_size`` and ``(spans + block_size - 1) // block_size``
++        # in ChunkedTokenDatabase.prepare_values. Under DCP a rank holds a
++        # strided 1/dcp slice, so one physical block of an ATTENTION group spans
++        # ``block_size * dcp`` global tokens, while a Mamba group's state is
++        # replicated per rank and still spans ``block_size``. That is the rule
++        # ``resolve_kv_cache_block_sizes`` states and the scheduler follows, so
++        # mirroring it keeps this connector in the same coordinates as the
++        # ``block_ids`` it is handed. Applying it per group is what lifts the
++        # hybrid + DCP refusal in connector.py.
++        #
++        # The single-group path is left exactly as it was. It substitutes
++        # scheduler_block_size wholesale, which for one ATTENTION group equals
++        # ``block_size * dcp`` and so agrees with the rule anyway -- but for one
++        # MAMBA group it does not, and that substitution is deliberate: it keeps
++        # the coordinator's ``block_size % hash_block_size`` invariant holding.
++        # Generalising over it would have changed a working path to open an
++        # unrelated one.
+         groups = list(kv_cache_config.kv_cache_groups)
+-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+-            g = groups[0]
++        if len(groups) == 1:
++            if groups[0].kv_cache_spec.block_size != self.block_size:
++                g = groups[0]
++                groups = [
++                    dataclasses.replace(
++                        g,
++                        kv_cache_spec=dataclasses.replace(
++                            g.kv_cache_spec, block_size=self.block_size
++                        ),
++                    )
++                ]
++        else:
++            # dcp only, exactly as resolve_kv_cache_block_sizes does. PCP is a
++            # different sharding, is still refused in connector.py, and folding
++            # it in here would be a scale nothing else agrees with.
++            dcp = vllm_config.parallel_config.decode_context_parallel_size
+             groups = [
+-                dataclasses.replace(
++                g
++                if not isinstance(g.kv_cache_spec, AttentionSpec) or dcp == 1
++                else dataclasses.replace(
+                     g,
+                     kv_cache_spec=dataclasses.replace(
+-                        g.kv_cache_spec, block_size=self.block_size
++                        g.kv_cache_spec,
++                        block_size=g.kv_cache_spec.block_size * dcp,
+                     ),
+                 )
++                for g in groups
+             ]
+         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+         spec_cfg = getattr(vllm_config, "speculative_config", None)
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index 90e983653e..9915255a84 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -426,6 +426,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
+     PlatformEnum.XPU: [
+         XPUFp8BlockScaledMMKernel,
+         TritonFp8BlockScaledMMKernel,
++        BlockWiseTorchFP8ScaledMMLinearKernel,
+     ],
+ }
+ 
+diff --git a/vllm/model_executor/kernels/linear/zentorch_utils.py b/vllm/model_executor/kernels/linear/zentorch_utils.py
+index 310aed579e..17ab28f422 100644
+--- a/vllm/model_executor/kernels/linear/zentorch_utils.py
++++ b/vllm/model_executor/kernels/linear/zentorch_utils.py
+@@ -4,11 +4,32 @@
+ 
+ from __future__ import annotations
+ 
++import logging
++from typing import TYPE_CHECKING
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+ 
+-__all__ = ["has_zentorch_op"]
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
++
++__all__ = [
++    "has_zentorch_op",
++    "is_zentorch_moe_config_supported",
++    "is_zentorch_moe_supported",
++    "_ZENTORCH_MOE_ACTIVATIONS",
++]
++
++
++_ZENTORCH_MOE_ACTIVATIONS = frozenset({"gelu", "gelu_tanh", "silu", "swigluoai"})
++
++
++def _moe_activation_to_str(activation: object) -> str:
++    """Normalize activation to a lowercase string (enum-safe)."""
++    if hasattr(activation, "value"):
++        return str(activation.value).lower()
++    return str(activation).lower()
+ 
+ 
+ def has_zentorch_op(op_names: list[str]) -> bool:
+@@ -21,3 +42,44 @@ def has_zentorch_op(op_names: list[str]) -> bool:
+     if ns is None:
+         return False
+     return all(hasattr(ns, op_name) for op_name in op_names)
++
++
++def is_zentorch_moe_config_supported(moe_config: FusedMoEConfig) -> bool:
++    if not has_zentorch_op(["zentorch_fused_moe"]):
++        return False
++    if not moe_config.is_act_and_mul:
++        return False
++    act = _moe_activation_to_str(moe_config.activation)
++    return act in _ZENTORCH_MOE_ACTIVATIONS
++
++
++def is_zentorch_moe_supported(layer: torch.nn.Module) -> bool:
++    if not has_zentorch_op(["zentorch_fused_moe"]):
++        logging.debug(
++            "Skipping zentorch fused-MoE: not a Zen CPU or "
++            "zentorch not loaded; using default MoE."
++        )
++        return False
++    moe_config = getattr(layer, "moe_config", None)
++    if moe_config is not None and not moe_config.is_act_and_mul:
++        logging.debug(
++            "Skipping zentorch fused-MoE: layer is not a gated "
++            "(act-and-mul, e.g. SwiGLU) MLP, the only structure supported."
++        )
++        return False
++    activation = getattr(layer, "activation", None)
++    if activation is None:
++        logging.debug(
++            "Skipping zentorch fused-MoE: layer has no 'activation' "
++            "attribute, so the activation can't be verified."
++        )
++        return False
++    act = str(getattr(activation, "value", activation)).lower()
++    if act not in _ZENTORCH_MOE_ACTIVATIONS:
++        logging.debug(
++            "Skipping zentorch fused-MoE: activation %r unsupported (supported: %s).",
++            act,
++            _ZENTORCH_MOE_ACTIVATIONS,
++        )
++        return False
++    return True
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index b21f967732..0b59956543 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1705,11 +1705,7 @@ def align_mla_chunked_context_workspace_size(
+             parallel_config.decode_context_parallel_size
+             * parallel_config.cp_kv_cache_interleave_size,
+         )
+-    workspace_size = max(
+-        workspace_size,
+-        vllm_config.scheduler_config.max_num_seqs * alignment,
+-    )
+-    return round_up(workspace_size, alignment)
++    return round_up(max(workspace_size, alignment), alignment)
+ 
+ 
+ def build_mla_chunked_context_metadata(
+@@ -2574,7 +2570,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+                 # FP8 path: gather cache without dequantization
+                 ops.cp_gather_cache(
+                     src_cache=kv_c_and_k_pe_cache,
+-                    dst=workspace,
++                    dst=workspace[:toks],
+                     block_table=block_table,
+                     cu_seq_lens=chunk.cu_seq_lens,
+                     batch_size=chunk.num_requests,
+@@ -2683,7 +2679,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+             else:
+                 ops.cp_gather_cache(
+                     src_cache=kv_c_and_k_pe_cache,
+-                    dst=workspace,
++                    dst=workspace[:toks],
+                     block_table=block_table,
+                     cu_seq_lens=padded_local_cu_seq_lens,
+                     batch_size=chunk.num_requests,
+diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+index 132bb5f920..a619b74035 100644
+--- a/vllm/model_executor/layers/attention/sparse_mla_attention.py
++++ b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+@@ -196,10 +196,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
+             64 * 1024,
+             scheduler_config.max_num_seqs * topk_tokens,
+         )
+-        workspace_size = max(
+-            workspace_size,
+-            scheduler_config.max_num_seqs * cache_config.block_size,
+-        )
++        workspace_size = max(workspace_size, cache_config.block_size)
+         if vllm_config.parallel_config.decode_context_parallel_size > 1:
+             return align_mla_chunked_context_workspace_size(vllm_config, workspace_size)
+         return workspace_size
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+index 0353d81b3d..846dc9f372 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+@@ -20,6 +20,10 @@ from vllm._custom_ops import (
+     cpu_prepack_moe_weight_int8,
+     fused_experts_cpu,
+ )
++from vllm.model_executor.kernels.linear.zentorch_utils import (
++    is_zentorch_moe_config_supported,
++    is_zentorch_moe_supported,
++)
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -214,6 +218,7 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         self.renormalize = False
+         self.scoring_func = "softmax"
+         self.custom_routing_function: Callable | None = None
++        self._use_zentorch = False
+ 
+     @property
+     def expects_unquantized_inputs(self) -> bool:
+@@ -240,6 +245,8 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+         return cpu_cls._supports_grouped_gemm(moe_config)
+ 
+@@ -287,11 +294,14 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         return True
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        self._pad_moe_intermediate(layer)
+         self.use_grouped_topk = layer.use_grouped_topk
+         self.renormalize = layer.renormalize
+         self.scoring_func = layer.scoring_func
+         self.custom_routing_function = layer.custom_routing_function
++        self._use_zentorch = is_zentorch_moe_supported(layer)
++        if self._use_zentorch:
++            return
++        self._pad_moe_intermediate(layer)
+         replace_parameter(
+             layer, "w13_weight", cpu_prepack_moe_weight(layer.w13_weight, self.isa)
+         )
+@@ -388,6 +398,22 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+             )
+             hidden_states.mul_(topk_weights.to(hidden_states.dtype))
+ 
++        if self._use_zentorch:
++            output = torch.empty_like(hidden_states)
++            torch.ops.zentorch.zentorch_fused_moe(
++                output,
++                hidden_states,
++                w1,
++                w2,
++                self.w1_bias,
++                self.w2_bias,
++                topk_weights,
++                topk_ids,
++                apply_router_weight_on_input,
++                str(activation.value).lower(),
++            )
++            return output
++
+         return cpu_fused_moe(
+             hidden_states,
+             w1,
+@@ -430,6 +456,8 @@ class X86CPUUnquantizedExperts(CPUUnquantizedExperts):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         if moe_config.in_dtype != torch.bfloat16:
+             return False, "kernel requires bfloat16 activations"
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+@@ -464,6 +492,8 @@ class ArmCPUUnquantizedExperts(CPUUnquantizedExperts):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         if moe_config.in_dtype != torch.bfloat16:
+             return False, "kernel requires bfloat16 activations"
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 3722528c21..edb54bcf40 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -651,6 +651,12 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
+         # which would inflate weights and OOM.
+         intermediate_size = round_up(intermediate_size, 128)
+         hidden_size = round_up(hidden_size, 128)
++    elif (
++        backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and activation == MoEActivation.SILU
++    ):
++        # AITER's A16W4 SiLU kernel handles native dimensions aligned to 128.
++        intermediate_size = round_up(intermediate_size, 128)
++        hidden_size = round_up(hidden_size, 128)
+     elif backend == Mxfp4MoeBackend.EMULATION:
+         # Emulation has no kernel tile; it only needs OCP MX block alignment so the
+         # per-block scale buffers (`dim // OCP_MX_BLOCK_SIZE`) aren't floor-truncated
+diff --git a/vllm/model_executor/models/keye.py b/vllm/model_executor/models/keye.py
+index aa5ca77bff..fd8cf4cbda 100644
+--- a/vllm/model_executor/models/keye.py
++++ b/vllm/model_executor/models/keye.py
+@@ -1466,6 +1466,14 @@ class BaseKeyeModule(nn.Module, SupportsMultiModal):
+             tower_model="visual.",
+         )
+ 
++    def get_num_mm_encoder_tokens(self, num_image_tokens: int) -> int:
++        merge_size = self.config.vision_config.spatial_merge_size
++        return num_image_tokens * merge_size**2
++
++    def get_num_mm_connector_tokens(self, num_vision_tokens: int) -> int:
++        merge_size = self.config.vision_config.spatial_merge_size
++        return num_vision_tokens // merge_size**2
++
+ 
+ @MULTIMODAL_REGISTRY.register_processor(
+     KeyeMultiModalProcessor,
+diff --git a/vllm/model_executor/models/transformers/base.py b/vllm/model_executor/models/transformers/base.py
+index cb5d9dde59..1d0bbb71a6 100644
+--- a/vllm/model_executor/models/transformers/base.py
++++ b/vllm/model_executor/models/transformers/base.py
+@@ -279,14 +279,8 @@ class Base(
+         )(cls)
+ 
+     def _decorate_for_torch_compile(self):
+-        """
+-        Decorate the model's decoder class to indicate to vLLM that it supports torch
+-        compile if `can_enable_torch_compile` is True.
+-
+-        Args:
+-            kwargs: The kwargs to create the model, which are needed to get the decoder
+-                class.
+-        """
++        """Decorate the model's decoder class to indicate to vLLM that it
++        supports torch compile if `can_enable_torch_compile` is True."""
+         self._decorate_cls_for_torch_compile(
+             cls=self._pre_trained_model_classes.decoder,
+             # Applied to a PreTrainedModel so the batch dimension will exist
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 7c232fe9e5..9b38409d1f 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -372,6 +372,10 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
+ 
+ 
+ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
++    # Keep fused multi-step decode disabled until update_draft_decode_metadata()
++    # also refreshes the ROCm-specific ragged SWA indices and indptrs.
++    supports_draft_decode_metadata_update = False
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 0bb4864d29..0c729bef91 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -246,6 +246,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         assert isinstance(self.kv_cache_spec, MambaSpec)
++        self._check_block_table_width(m.block_table_tensor.shape[1])
+         # Equivalent PyTorch "align" path:
+         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
+         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
+@@ -485,6 +486,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
+ 
++    def _check_block_table_width(self, width: int) -> None:
++        """Fail at startup if the block table cannot hold the slot we index.
++
++        ``_get_aligned_state_indices_kernel`` reads column
++        ``(seq_lens - 1) // spec.block_size`` and its mask bounds only the row,
++        so a table narrower than ``max_num_blocks_per_req`` reads off the end of
++        the row and yields an arbitrary block id. That surfaces far away, either
++        as an index-out-of-bounds assert in whichever consumer touches the state
++        cache first or, when the stray id happens to be in range, as silently
++        wrong recurrent state. Neither names this as the cause, so check it once
++        where the contract is stated.
++        """
++        if getattr(self, "_block_table_width_checked", False):
++            return
++        self._block_table_width_checked = True
++        required = self.kv_cache_spec.max_num_blocks_per_req(
++            self.vllm_config, self.vllm_config.model_config.max_model_len
++        )
++        if width < required:
++            raise ValueError(
++                f"KDA block table is {width} columns but the state slot is "
++                f"indexed over {required} (max_model_len="
++                f"{self.vllm_config.model_config.max_model_len}, block_size="
++                f"{self.kv_cache_spec.block_size}). Mamba state is replicated "
++                f"across DCP ranks, so its block table must not be scaled by "
++                f"decode_context_parallel_size="
++                f"{self.vllm_config.parallel_config.decode_context_parallel_size}."
++            )
++
+ 
+ class KimiK3KDAAttentionBackend(GDNAttentionBackend):
+     @staticmethod
+diff --git a/vllm/models/kimi_k3/nvidia/mla.py b/vllm/models/kimi_k3/nvidia/mla.py
+index 654f83b452..b4383de36a 100644
+--- a/vllm/models/kimi_k3/nvidia/mla.py
++++ b/vllm/models/kimi_k3/nvidia/mla.py
+@@ -320,11 +320,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
+             "parallelism."
+         )
+         self.dcp_world_size = parallel_config.decode_context_parallel_size
+-        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
+-            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
+-            "context parallelism because gathered queries require gathered "
+-            "positions."
+-        )
+         self.dcp_manager: MLADCPManager | None = None
+         if self.dcp_world_size > 1:
+             query_dtype = (
+diff --git a/vllm/multimodal/processing/processor.py b/vllm/multimodal/processing/processor.py
+index 8fafccc3e7..d35856e04f 100644
+--- a/vllm/multimodal/processing/processor.py
++++ b/vllm/multimodal/processing/processor.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from collections.abc import Callable, Generator, ItemsView, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field, replace
+ from enum import Enum
+@@ -706,91 +706,191 @@ class PlaceholderFeaturesInfo:
+         )
+ 
+ 
+-_MatchToApply = tuple[tuple[str, int], tuple[PromptTargetMatch, int]]
++class _MatchedUpdate(NamedTuple):
++    """A resolved update selected for a match in the original prompt."""
+ 
++    priority: int
++    """The original item order used to preserve match tie-breaking."""
+ 
+-def _find_matches(
+-    prompt: _S,
++    update: ResolvedPromptUpdate
++    """The selected update for the multimodal item."""
++
++    update_idx: int
++    """The selected update's index within the item's alternatives."""
++
++    match: PromptTargetMatch
++    """The target range in the original prompt."""
++
++
++_UpdateQueue: TypeAlias = deque[tuple[int, Sequence[ResolvedPromptUpdate]]]
++"""
++Items with the same ordered match rules, stored as `(priority, alternatives)`.
++"""
++
++_QueueMatch: TypeAlias = tuple[_UpdateQueue, PromptTargetMatch, int]
++"""A queue together with its next match and selected alternative index."""
++
++
++def _target_key(target: UpdateTarget) -> tuple[str, object]:
++    """Return a hashable key that preserves target matching semantics."""
++    if isinstance(target, PromptIndex):
++        return ("index", id(target))
++    if isinstance(target, str):
++        return ("text", target)
++
++    return ("tokens", tuple(target))
++
++
++def _compile_prompt_update_queues(
+     mm_prompt_updates: "MultiModalPromptUpdates",
++) -> dict[
++    tuple[tuple[UpdateMode, tuple[str, object]], ...],
++    _UpdateQueue,
++]:
++    """Group items with identical match rules into ordered queues."""
++    queues_by_signature = dict[
++        tuple[tuple[UpdateMode, tuple[str, object]], ...],
++        _UpdateQueue,
++    ]()
++    priority = 0
++
++    for modality_updates in mm_prompt_updates.values():
++        for updates in modality_updates:
++            signature = tuple(
++                (update.mode, _target_key(update.target)) for update in updates
++            )
++            queues_by_signature.setdefault(signature, deque()).append(
++                (priority, updates)
++            )
++            priority += 1
++
++    return queues_by_signature
++
++
++def _find_queue_match(
++    queue: _UpdateQueue,
++    prompt: _S,
+     tokenizer: TokenizerLike | None,
+     *,
+-    prev_end_idx: int = 0,
+-    current_result: "MultiModalPromptUpdatesApplyResult",
+-) -> tuple[UpdateMode | None, list[_MatchToApply]]:
+-    mode: UpdateMode | None = None
+-    mm_matches = dict[tuple[str, int], tuple[PromptTargetMatch, int]]()
+-
+-    # Items commonly share the same target object (a static PromptUpdate
+-    # target resolves to the same object for every item); scan the prompt once
+-    # per distinct target instead of once per item. The cache is keyed by
+-    # object identity: it implies value equality, costs O(1) per lookup
+-    # (hashing a long target value per lookup would defeat the point), and the
+-    # target objects are kept alive by `mm_prompt_updates` for the duration of
+-    # this call. Items with equal-valued but distinct target objects simply
+-    # miss the cache and scan independently.
+-    # NOTE: ResolvedPromptUpdate.iter_matches depends only on the target,
+-    # prompt, tokenizer and start_idx, so updates sharing a target share the
+-    # same first match within this invocation. Revisit this cache if matching
+-    # ever depends on other update attributes.
+-    first_match_by_target_id = dict[int, PromptTargetMatch | None]()
+-
+-    def get_first_match(update: "ResolvedPromptUpdate") -> PromptTargetMatch | None:
+-        target = update.target
+-        if isinstance(target, PromptIndex):  # Matches are not cacheable
+-            return next(
+-                update.iter_matches(prompt, tokenizer, start_idx=prev_end_idx),
+-                None,
+-            )
++    start_idx: int,
++    mode: UpdateMode | None = None,
++) -> tuple[PromptTargetMatch, int] | None:
++    """Find the first matching alternative for the next queued item."""
++    _, updates = queue[0]
++    for update_idx, update in enumerate(updates):
++        if mode is not None and update.mode != mode:
++            continue
++
++        match = next(
++            update.iter_matches(prompt, tokenizer, start_idx=start_idx),
++            None,
++        )
++        if match is not None:
++            return match, update_idx
+ 
+-        key = id(target)
+-        if key not in first_match_by_target_id:
+-            first_match_by_target_id[key] = next(
+-                update.iter_matches(prompt, tokenizer, start_idx=prev_end_idx),
+-                None,
+-            )
++    return None
+ 
+-        return first_match_by_target_id[key]
+ 
+-    for modality, modality_updates in mm_prompt_updates.items():
+-        for item_idx, item_updates in enumerate(modality_updates):
+-            if current_result[modality][item_idx] is not None:
+-                continue  # Updates have already been applied for this item
++def _next_priority(queue: _UpdateQueue) -> int:
++    """Return the original priority of the next queued item."""
++    priority, _ = queue[0]
++    return priority
+ 
+-            for update_idx, update in enumerate(item_updates):
+-                if (modality, item_idx) in mm_matches:
+-                    break  # Already found a match for this item
+ 
+-                match = get_first_match(update)
+-                if match is None:
+-                    continue
++def _plan_prompt_updates(
++    prompt: _S,
++    mm_prompt_updates: "MultiModalPromptUpdates",
++    tokenizer: TokenizerLike | None,
++) -> tuple[list[_MatchedUpdate], "MultiModalPromptUpdatesApplyResult"]:
++    """Plan non-overlapping prompt updates before rendering the output."""
++    queues = list(_compile_prompt_update_queues(mm_prompt_updates).values())
++    result: MultiModalPromptUpdatesApplyResult = {
++        modality: [None] * len(items) for modality, items in mm_prompt_updates.items()
++    }
++    planned_updates = list[_MatchedUpdate]()
++    prev_end_idx = 0
+ 
+-                # All matches should share the same mode
+-                if mode is None:
+-                    mode = update.mode
+-                elif mode != update.mode:
+-                    continue
++    while queues:
++        first_matches = list[_QueueMatch]()
++        for queue in queues:
++            queue_match = _find_queue_match(
++                queue,
++                prompt,
++                tokenizer,
++                start_idx=prev_end_idx,
++            )
++            if queue_match is not None:
++                prompt_match, update_idx = queue_match
++                first_matches.append((queue, prompt_match, update_idx))
+ 
+-                mm_matches[(modality, item_idx)] = match, update_idx
++        if not first_matches:
++            break
+ 
+-    # Prioritize earlier matches
+-    matches_to_apply = sorted(mm_matches.items(), key=lambda item: item[1][0])
++        mode_queue, _, mode_update_idx = min(
++            first_matches,
++            key=lambda item: _next_priority(item[0]),
++        )
++        _, mode_updates = mode_queue[0]
++        mode = mode_updates[mode_update_idx].mode
+ 
+-    # To avoid conflicts, only replace one non-empty item at a time
+-    if mode == UpdateMode.REPLACE:
+-        matches_to_apply_ = list[_MatchToApply]()
+-        has_non_empty_matches = False
++        mode_matches = list[_QueueMatch]()
++        for queue, prompt_match, first_update_idx in first_matches:
++            if queue[0][1][first_update_idx].mode == mode:
++                mode_matches.append((queue, prompt_match, first_update_idx))
++                continue
++
++            queue_match = _find_queue_match(
++                queue,
++                prompt,
++                tokenizer,
++                start_idx=prev_end_idx,
++                mode=mode,
++            )
++            if queue_match is not None:
++                prompt_match, update_idx = queue_match
++                mode_matches.append((queue, prompt_match, update_idx))
++
++        updates_to_apply = list[_MatchedUpdate]()
++        non_empty_replacements = list[_QueueMatch]()
++        for queue, match, update_idx in mode_matches:
++            if mode == UpdateMode.REPLACE and match.start_idx != match.end_idx:
++                non_empty_replacements.append((queue, match, update_idx))
++            else:
++                while queue:
++                    priority, updates = queue.popleft()
++                    updates_to_apply.append(
++                        _MatchedUpdate(
++                            priority=priority,
++                            update=updates[update_idx],
++                            update_idx=update_idx,
++                            match=match,
++                        )
++                    )
+ 
+-        for item in matches_to_apply:
+-            _, (match, _) = item
+-            if match.start_idx == match.end_idx:
+-                matches_to_apply_.append(item)
+-            elif not has_non_empty_matches:
+-                has_non_empty_matches = True
+-                matches_to_apply_.append(item)
++        if non_empty_replacements:
++            queue, match, update_idx = min(
++                non_empty_replacements,
++                key=lambda item: (item[1], _next_priority(item[0])),
++            )
++            priority, updates = queue.popleft()
++            updates_to_apply.append(
++                _MatchedUpdate(
++                    priority=priority,
++                    update=updates[update_idx],
++                    update_idx=update_idx,
++                    match=match,
++                )
++            )
+ 
+-        matches_to_apply = matches_to_apply_
++        updates_to_apply.sort(key=lambda item: (item.match, item.priority))
++        for matched_update in updates_to_apply:
++            update = matched_update.update
++            result[update.modality][update.item_idx] = matched_update.update_idx
++            prev_end_idx = matched_update.match.end_idx
++        planned_updates.extend(updates_to_apply)
++        queues = [queue for queue in queues if queue]
+ 
+-    return mode, matches_to_apply
++    return planned_updates, result
+ 
+ 
+ def _all_items_found(
+@@ -808,65 +908,37 @@ def _apply_matches(
+     mm_prompt_updates: "MultiModalPromptUpdates",
+     tokenizer: TokenizerLike | None,
+ ) -> tuple[list[_S], "MultiModalPromptUpdatesApplyResult"]:
+-    mm_item_counts = {m: len(items) for m, items in mm_prompt_updates.items()}
+-
+     out_seqs = list[str | list[int]]()
+-    out_result: MultiModalPromptUpdatesApplyResult = {
+-        m: [None] * len(items) for m, items in mm_prompt_updates.items()
+-    }
+-
+-    # Early exit if no items to find
+-    mm_found_counts = {
+-        m: sum(r is not None for r in res) for m, res in out_result.items()
+-    }
+-    if _all_items_found(mm_item_counts, mm_found_counts):
+-        return [prompt], out_result
++    matched_updates, result = _plan_prompt_updates(
++        prompt,
++        mm_prompt_updates,
++        tokenizer,
++    )
+ 
+     prev_end_idx = 0
+-    while True:
+-        mode, matches_to_apply = _find_matches(
+-            prompt,
+-            mm_prompt_updates,
+-            tokenizer,
+-            prev_end_idx=prev_end_idx,
+-            current_result=out_result,
+-        )
+-
+-        if mode is None:
+-            break  # No more matches to find
+-
+-        for (modality, item_idx), (match, update_idx) in matches_to_apply:
+-            matched_update = mm_prompt_updates[modality][item_idx][update_idx]
+-            matched_content = matched_update.content.full
+-
+-            if mode == UpdateMode.INSERT:
+-                end_idx_to_insert = match.end_idx
+-            elif mode == UpdateMode.REPLACE:
+-                end_idx_to_insert = match.start_idx
+-            else:
+-                assert_never(mode)
+-
+-            out_seqs.append(prompt[prev_end_idx:end_idx_to_insert])
+-            out_seqs.append(
+-                _seq2text(tokenizer, matched_content)
+-                if isinstance(prompt, str)
+-                else _seq2tokens(tokenizer, matched_content)
+-            )
+-            out_result[modality][item_idx] = update_idx
+-
+-            # Exclude overlapping matches
+-            prev_end_idx = match.end_idx
++    for matched_update in matched_updates:
++        update = matched_update.update
++        match = matched_update.match
++        matched_content = update.content.full
++
++        if update.mode == UpdateMode.INSERT:
++            end_idx_to_insert = match.end_idx
++        elif update.mode == UpdateMode.REPLACE:
++            end_idx_to_insert = match.start_idx
++        else:
++            assert_never(update.mode)
+ 
+-        # Early exit if all items found
+-        mm_found_counts = {
+-            m: sum(r is not None for r in res) for m, res in out_result.items()
+-        }
+-        if _all_items_found(mm_item_counts, mm_found_counts):
+-            break
++        out_seqs.append(prompt[prev_end_idx:end_idx_to_insert])
++        out_seqs.append(
++            _seq2text(tokenizer, matched_content)
++            if isinstance(prompt, str)
++            else _seq2tokens(tokenizer, matched_content)
++        )
++        prev_end_idx = match.end_idx
+ 
+     out_seqs.append(prompt[prev_end_idx:])
+ 
+-    return cast(list[_S], out_seqs), out_result
++    return cast(list[_S], out_seqs), result
+ 
+ 
+ def apply_token_matches(
+diff --git a/vllm/profiler/wrapper.py b/vllm/profiler/wrapper.py
+index 6e3403708b..bbdec955a0 100644
+--- a/vllm/profiler/wrapper.py
++++ b/vllm/profiler/wrapper.py
+@@ -150,10 +150,11 @@ class WorkerProfiler(ABC):
+         return nullcontext()
+ 
+ 
+-TorchProfilerActivity = Literal["CPU", "CUDA", "XPU"]
++TorchProfilerActivity = Literal["CPU", "CUDA", "PrivateUse1", "XPU"]
+ TorchProfilerActivityMap = {
+     "CPU": torch.profiler.ProfilerActivity.CPU,
+     "CUDA": torch.profiler.ProfilerActivity.CUDA,
++    "PrivateUse1": torch.profiler.ProfilerActivity.PrivateUse1,
+     "XPU": torch.profiler.ProfilerActivity.XPU,
+ }
+ 
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index d4698520f1..32e932e3b8 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -633,6 +633,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+     supports_update_block_table: bool = False
+     # Whether the builder constructor requires the block-table width.
+     requires_block_table_width: ClassVar[bool] = False
++    # Whether all step-dependent draft decode metadata can be updated in place,
++    # allowing one metadata build to be reused across autoregressive draft steps.
++    supports_draft_decode_metadata_update: bool = False
+ 
+     @abstractmethod
+     def __init__(
+@@ -757,6 +760,16 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+             fast_build=True,
+         )
+ 
++    def update_draft_decode_metadata(self, metadata: M) -> None:
++        """Update step-dependent draft decode metadata in place.
++
++        The fused draft loop may call this method during full CUDA graph
++        capture. CUDA graph replay does not run this Python method, so
++        implementations must emit capture-safe operations and keep replayed
++        tensor state in persistent storage.
++        """
++        raise NotImplementedError
++
+     def use_cascade_attention(
+         self,
+         common_prefix_len: int,
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 97f30736fd..acdb1661dc 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -370,6 +370,57 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+     ) -> AttentionCGSupport:
+         return cls._cudagraph_support
+ 
++    def _get_scheduler_metadata(
++        self,
++        *,
++        aot_schedule: bool,
++        batch_size: int,
++        cu_query_lens: torch.Tensor,
++        max_query_len: int,
++        seqlens: torch.Tensor,
++        max_seq_len: int,
++        causal: bool | torch.Tensor,
++        max_num_splits: int,
++    ) -> torch.Tensor | None:
++        if not aot_schedule:
++            return None
++
++        cache_dtype = self.cache_config.cache_dtype
++        if is_quantized_kv_cache(cache_dtype):
++            qkv_dtype = current_platform.fp8_dtype()
++        else:
++            qkv_dtype = self.kv_cache_dtype
++        return get_scheduler_metadata(
++            batch_size=batch_size,
++            max_seqlen_q=max_query_len,
++            max_seqlen_k=max_seq_len,
++            num_heads_q=self.num_heads_q * self.dcp_world_size,
++            num_heads_kv=self.num_heads_kv,
++            headdim=self.headdim,
++            cache_seqlens=seqlens,
++            qkv_dtype=qkv_dtype,
++            cu_seqlens_q=cu_query_lens,
++            page_size=self.block_size,
++            causal=causal,
++            window_size=_maybe_symmetrize_window(self.aot_sliding_window, causal),
++            num_splits=max_num_splits,
++        )
++
++    def _store_scheduler_metadata(
++        self, scheduler_metadata: torch.Tensor | None
++    ) -> torch.Tensor | None:
++        if self.use_full_cuda_graph and scheduler_metadata is not None:
++            n = scheduler_metadata.shape[0]
++            assert self.scheduler_metadata is not None
++            self.scheduler_metadata[:n] = scheduler_metadata
++            # NOTE(woosuk): We should zero out the rest of the scheduler
++            # metadata to guarantee the correctness. Otherwise, some thread
++            # blocks may use the invalid scheduler metadata and overwrite the
++            # output buffer.
++            self.scheduler_metadata[n:] = 0
++            return self.scheduler_metadata[:n]
++        return scheduler_metadata
++
+     def __init__(
+         self,
+         kv_cache_spec: AttentionSpec,
+@@ -405,6 +456,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             self.dcp_world_size = 1
+             self.dcp_rank = 0
+ 
++        # Fused draft decode reuses the captured metadata object across draft
++        # steps. For DCP, build-time host-side decisions such as
++        # skip_dcp_context_attention() can change the metadata shape/control
++        # path (for example max_dcp_context_kv_len), and those Python-side
++        # fields are not refreshed in-place between graph replays. Keep the
++        # fused path disabled until DCP gets a full replay-safe refresh model.
++        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
++
+         self.cp_kv_cache_interleave_size = (
+             self.parallel_config.cp_kv_cache_interleave_size
+         )
+@@ -533,34 +592,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         if envs.VLLM_BATCH_INVARIANT:
+             max_num_splits = 1
+ 
+-        def schedule(
+-            batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
+-        ):
+-            cache_dtype = self.cache_config.cache_dtype
+-            if is_quantized_kv_cache(cache_dtype):
+-                qkv_dtype = current_platform.fp8_dtype()
+-            else:
+-                qkv_dtype = self.kv_cache_dtype
+-            if aot_schedule:
+-                return get_scheduler_metadata(
+-                    batch_size=batch_size,
+-                    max_seqlen_q=max_query_len,
+-                    max_seqlen_k=max_seq_len,
+-                    num_heads_q=self.num_heads_q * self.dcp_world_size,
+-                    num_heads_kv=self.num_heads_kv,
+-                    headdim=self.headdim,
+-                    cache_seqlens=seqlens,
+-                    qkv_dtype=qkv_dtype,
+-                    cu_seqlens_q=cu_query_lens,
+-                    page_size=self.block_size,
+-                    causal=causal,
+-                    window_size=_maybe_symmetrize_window(
+-                        self.aot_sliding_window, causal
+-                    ),
+-                    num_splits=max_num_splits,
+-                )
+-            return None
+-
+         use_cascade = common_prefix_len > 0
+         max_dcp_context_kv_len = 0
+         dcp_context_kv_lens = None
+@@ -627,13 +658,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+                     (max_seq_len + num_partitions - 1) // num_partitions
+                 ) * self.cp_kv_cache_interleave_size
+ 
+-                scheduler_metadata = schedule(
++                scheduler_metadata = self._get_scheduler_metadata(
++                    aot_schedule=aot_schedule,
+                     batch_size=num_reqs,
+                     cu_query_lens=query_start_loc,
+                     max_query_len=max_query_len,
+                     seqlens=dcp_context_kv_lens,
+                     max_seq_len=max_dcp_context_kv_len,
+                     causal=False,
++                    max_num_splits=max_num_splits,
+                 )
+         elif use_cascade:
+             cu_prefix_query_lens = torch.tensor(
+@@ -644,41 +677,38 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             )
+             # Use GPU tensor directly - no CPU sync needed
+             suffix_kv_lens = seq_lens[:num_reqs] - common_prefix_len
+-            prefix_scheduler_metadata = schedule(
++            prefix_scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=1,
+                 cu_query_lens=cu_prefix_query_lens,
+                 max_query_len=num_actual_tokens,
+                 seqlens=prefix_kv_lens,
+                 max_seq_len=common_prefix_len,
+                 causal=False,
++                max_num_splits=max_num_splits,
+             )
+-            scheduler_metadata = schedule(
++            scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=num_reqs,
+                 cu_query_lens=query_start_loc,
+                 max_query_len=max_query_len,
+                 seqlens=suffix_kv_lens,
+                 max_seq_len=max_seq_len - common_prefix_len,
+                 causal=True,
++                max_num_splits=max_num_splits,
+             )
+         else:
+-            scheduler_metadata = schedule(
++            scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=num_reqs,
+                 cu_query_lens=query_start_loc,
+                 max_query_len=max_query_len,
+                 seqlens=seq_lens,
+                 max_seq_len=max_seq_len,
+                 causal=causal,
++                max_num_splits=max_num_splits,
+             )
+-        # For FA3 + full cudagraph
+-        if self.use_full_cuda_graph and scheduler_metadata is not None:
+-            n = scheduler_metadata.shape[0]
+-            self.scheduler_metadata[:n] = scheduler_metadata
+-            # NOTE(woosuk): We should zero out the rest of the scheduler
+-            # metadata to guarantee the correctness. Otherwise, some thread
+-            # blocks may use the invalid scheduler metadata and overwrite the
+-            # output buffer.
+-            self.scheduler_metadata[n:] = 0
+-            scheduler_metadata = self.scheduler_metadata[:n]
++        scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
+ 
+         if isinstance(causal, torch.Tensor) and causal.dtype != torch.int32:
+             causal = causal.to(torch.int32)
+@@ -772,6 +802,28 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         new_metadata.slot_mapping = slot_mapping
+         return new_metadata
+ 
++    def update_draft_decode_metadata(self, metadata: FlashAttentionMetadata) -> None:
++        if metadata.scheduler_metadata is None:
++            return
++
++        num_reqs = metadata.num_decode_reqs or metadata.seq_lens.shape[0]
++
++        assert self.dcp_world_size == 1
++        assert not metadata.use_cascade
++
++        scheduler_metadata = self._get_scheduler_metadata(
++            aot_schedule=True,
++            batch_size=num_reqs,
++            cu_query_lens=metadata.query_start_loc,
++            max_query_len=metadata.max_query_len,
++            seqlens=metadata.seq_lens,
++            max_seq_len=metadata.max_seq_len,
++            causal=metadata.causal,
++            max_num_splits=metadata.max_num_splits,
++        )
++
++        metadata.scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
++
+     def use_cascade_attention(self, *args, **kwargs) -> bool:
+         return use_cascade_attention(*args, **kwargs)
+ 
+diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
+index c823f82be2..c11698335a 100644
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -400,6 +400,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+ 
+     reorder_batch_threshold: int | None = None
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++    supports_draft_decode_metadata_update = True
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -649,6 +650,40 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+             **deepseek_v4_fields,  # type: ignore[arg-type]
+         )
+ 
++    def update_draft_decode_metadata(
++        self,
++        metadata: DeepseekSparseSWAMetadata,
++    ) -> None:
++        if metadata.num_decode_tokens == 0:
++            return
++        assert metadata.query_start_loc is not None
++        assert metadata.seq_lens is not None
++        assert metadata.token_to_req_indices is not None
++        assert metadata.is_valid_token is not None
++        assert metadata.decode_swa_indices is not None
++        assert metadata.decode_swa_lens is not None
++
++        _compute_swa_indices_and_lens_kernel[(metadata.num_decode_tokens,)](
++            metadata.decode_swa_indices,
++            metadata.decode_swa_indices.stride(0),
++            metadata.decode_swa_lens,
++            metadata.decode_swa_indices.shape[-1],
++            metadata.query_start_loc,
++            metadata.seq_lens,
++            metadata.token_to_req_indices,
++            metadata.is_valid_token,
++            metadata.block_table,
++            metadata.block_table.stride(0),
++            self.block_size,
++            token_offset=0,
++            TRITON_BLOCK_SIZE=1024,
++        )
++        tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
++        metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
++        metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
++        metadata.tile_sched_c128a = tile_sched[_LAYER_TYPE_C128A]
++        metadata.flashinfer_sparse_index_cache.clear()
++
+     def build_tile_scheduler(
+         self, num_decode_tokens: int
+     ) -> dict[str, FlashMLASchedMeta | None]:
+diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+index 8ab81c438f..6a09458729 100644
+--- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
++++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
+ 
++import os
+ from typing import TYPE_CHECKING, ClassVar
+ 
+ import torch
+@@ -31,6 +32,14 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# OFF by default. Restored purely to answer one question with GSM8K: every
++# measurement showing DSpark accuracy-neutral (0.951 at DCP=1 and DCP=4, pipeline
++# 61661482) was taken with this block present, and the first measurement without
++# it came back 0.923 against 0.950 no-spec. It was removed on an acceptance A/B,
++# and acceptance is exactly what a "target sees the drafted KV" defect inflates,
++# so acceptance could not have settled it.
++_DCP_FLATTEN = os.environ.get("VLLM_TS_MLA_DCP_FLATTEN", "0") == "1"
++
+ # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
+ #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
+ # Matches the kernel's `get_workspace_size` formula. MAX_Q_LEN=8 covers up to
+@@ -266,9 +275,47 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+         seq_lens = attn_metadata.decode.seq_lens
+         causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
+ 
++        # Per-query causal bounds for a causal multi-token block under DCP.
++        # causal_seqs is ONE global bound per request, but query j of a q_len
++        # block ending at global length L must see KV only up to
++        # L - (q_len - 1 - j). The kernel does compute that -- k_bound =
++        # ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world) -- which
++        # is why this was removed. Off by default; the flag exists so GSM8K can
++        # decide, because acceptance already gave the wrong answer once.
++        q_len_per_req = num_decode_tokens // num_decodes if num_decodes else 0
++        if (
++            _DCP_FLATTEN
++            and attn_metadata.causal
++            and self.dcp_world_size > 1
++            and q_len_per_req > 1
++            and num_decode_tokens % num_decodes == 0
++            and causal_seqs is not None
++        ):
++            offsets = torch.arange(
++                q_len_per_req - 1, -1, -1,
++                device=causal_seqs.device, dtype=causal_seqs.dtype,
++            )
++            per_q_global = torch.clamp(
++                (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1), min=0
++            )
++            # Rank-local length of each global bound, matching
++            # prepare_dcp_local_seq_lens in vllm/v1/worker/gpu/cp_utils.py.
++            interleave = self.cp_kv_cache_interleave_size
++            span = self.dcp_world_size * interleave
++            remainder = torch.clamp(
++                per_q_global % span - self.dcp_rank * interleave, min=0
++            )
++            seq_lens = (per_q_global // span) * interleave + torch.clamp(
++                remainder, max=interleave
++            )
++            causal_seqs = per_q_global
++            block_tables = block_tables.repeat_interleave(q_len_per_req, dim=0)
++            q = q.view(num_decodes * q_len_per_req, 1, q.shape[-2], q.shape[-1])
+         # tokenspeed_mla_decode expects query shape
+-        # (num_decodes, q_len_per_request, num_heads, head_dim).
+-        if num_decode_tokens % num_decodes != 0:
++        # (num_decodes, q_len_per_request, num_heads, head_dim). Standalone `if`,
++        # never chained to the block above: chaining skips the reshape on exactly
++        # the DCP multi-token path and the kernel gets a 3D query.
++        elif num_decode_tokens % num_decodes != 0:
+             logger.warning_once(
+                 """TokenspeedMLAImpl got a query of uneven length.
+                 This usually indicates an issue in batch reordering
+diff --git a/vllm/v1/attention/backends/mla/triton_mla.py b/vllm/v1/attention/backends/mla/triton_mla.py
+index 71a38e95d0..e55076700f 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla.py
++++ b/vllm/v1/attention/backends/mla/triton_mla.py
+@@ -57,6 +57,8 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+ 
+     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # DCP local sequence lengths are not advanced between draft steps.
++        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
+         # Only the non-causal DSpark draft group serves multi-token blocks via
+         # the decode path; raise its reorder threshold to the spec block length
+         # so full-cudagraph capture admits it. Causal usage stays single-token.
+@@ -64,6 +66,9 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+             self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+         self._reserve_attn_logits_workspace()
+ 
++    def update_draft_decode_metadata(self, _metadata: MLACommonMetadata) -> None:
++        pass
++
+     def _reserve_attn_logits_workspace(self) -> None:
+         """Pre-size the shared workspace for the decode split-KV attn logits.
+ 
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 3f9b9ed0c1..7814a8c0f8 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -100,6 +100,8 @@ class TritonAttentionMetadata:
+ 
+ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    # Step-dependent fields reference persistent input buffers directly.
++    supports_draft_decode_metadata_update = True
+ 
+     def __init__(
+         self,
+@@ -267,6 +269,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         return attn_metadata
+ 
++    def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
++        pass
++
+ 
+ class TritonAttentionBackend(AttentionBackend):
+     supported_dtypes: ClassVar[list[torch.dtype]] = [
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 70cd267506..cc0232ec42 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -578,15 +578,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                     "full-attention and Mamba groups, got: "
+                     f"{type(g.kv_cache_spec).__name__}."
+                 )
+-        # Partial hash hits are limited to full-attention + mamba ("align")
+-        # without context parallelism.
+-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
++        self.verify_and_split_kv_cache_groups()
++
++        # TP needs hashing finer than the Mamba block. DCP accepts equality
++        # because it scales the effective full-attention block instead.
++        self.enable_partial_hash_hits = any(
+             isinstance(g.kv_cache_spec, MambaSpec)
+             and g.kv_cache_spec.mamba_cache_mode == "align"
+-            and g.kv_cache_spec.block_size > hash_block_size
++            and (
++                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
++                or (
++                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
++                )
++            )
+             for g in kv_cache_config.kv_cache_groups
+         )
+-        self.verify_and_split_kv_cache_groups()
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a781b45801..e2055ee914 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2808,14 +2808,37 @@ class Scheduler(SchedulerInterface):
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            # TODO (davidb): add support for hybrid memory allocator
+-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
++            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+             )
+ 
++            if len(req_block_id_groups) != 1:
++                # Mooncake reports load failures as physical block IDs without
++                # identifying the hybrid KV group. Attention and Mamba groups
++                # can use different logical block sizes, so there is no safe
++                # common token boundary at which to truncate them. Conservatively
++                # recompute the complete prefix for every matching hybrid request.
++                # This is a rare eviction-race path and preserves correctness.
++                req_hybrid_block_ids = {
++                    block_id
++                    for group_block_ids in req_block_id_groups
++                    for block_id in group_block_ids
++                }
++                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
++                    continue
++
++                request.num_computed_tokens = 0
++                total_affected_tokens += max(req_num_computed_tokens, 0)
++                if evict_blocks:
++                    blocks_to_evict.update(req_hybrid_block_ids)
++                affected_req_ids.add(req_id)
++                continue
++
++            (req_block_ids,) = req_block_id_groups
++
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f4f4..dbf223ec9b 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1559,6 +1559,7 @@ class MambaManager(SingleTypeKVCacheManager):
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
++                self._allocated_block_reqs.add(request_id)
+                 return []
+             else:
+                 prev_block_len = len(req_blocks)
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index c7d75b636c..ab4fedcbe0 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -248,7 +248,6 @@ class SingleDirectionOffloadingHandler:
+         blocks_per_chunk: int,
+         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
+         gpu_to_cpu: bool,
+-        mmap_region: SharedOffloadRegion | None = None,
+         canonical_layout: bool = False,
+     ):
+         """
+@@ -326,8 +325,6 @@ class SingleDirectionOffloadingHandler:
+         self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
+         self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
+ 
+-        # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
+-        self._mmap_region = mmap_region
+         # job_id -> event
+         self._transfer_events: dict[int, torch.Event] = {}
+         # queue of transfers (job_id, stream, event)
+@@ -711,18 +708,31 @@ class SingleDirectionOffloadingHandler:
+                 event.synchronize()
+ 
+     def shutdown(self) -> None:
++        """Drain this direction and release its transfer-side resources."""
++        sync_error: Exception | None = None
+         while self._transfers:
+-            transfer = self._transfers.popleft()
+-            transfer.end_event.synchronize()
++            transfer = self._transfers[0]
++            try:
++                transfer.end_event.synchronize()
++            except Exception as e:
++                logger.exception(
++                    "Failed to synchronize transfer end event; "
++                    "skipping %d remaining transfers",
++                    len(self._transfers) - 1,
++                )
++                self._transfers.clear()
++                sync_error = e
++                break
++            self._transfers.popleft()
++
+         self._transfer_events.clear()
+         self._stream_pool.clear()
+         self._event_pool.clear()
+         self._buffer_pool.clear()
+         self.src_tensors.clear()
+         self.dst_tensors.clear()
+-        if self._mmap_region is not None:
+-            self._mmap_region.cleanup()
+-            self._mmap_region = None
++        if sync_error is not None:
++            raise sync_error
+ 
+ 
+ class CPUOffloadingWorker(OffloadingWorker):
+@@ -742,6 +752,10 @@ class CPUOffloadingWorker(OffloadingWorker):
+         canonical_layout: bool = False,
+     ):
+         assert not canonical_layout or mmap_region is not None
++        # The caller owns mmap_region until this constructor returns. After a
++        # successful construction, the worker is the sole owner and releases
++        # it after both transfer directions have stopped.
++        self._mmap_region = mmap_region
+         pin_memory = PIN_MEMORY
+         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+         if mmap_region is not None and pin_memory:
+@@ -794,7 +808,6 @@ class CPUOffloadingWorker(OffloadingWorker):
+             blocks_per_chunk=blocks_per_chunk,
+             layer_refs_per_group=kv_caches.group_data_refs,
+             gpu_to_cpu=True,
+-            mmap_region=mmap_region,
+             canonical_layout=canonical_layout,
+         )
+ 
+@@ -827,5 +840,28 @@ class CPUOffloadingWorker(OffloadingWorker):
+         self._load_handler.wait(job_ids)
+ 
+     def shutdown(self) -> None:
+-        self._store_handler.shutdown()
+-        self._load_handler.shutdown()
++        handler_failed = False
++        try:
++            self._store_handler.shutdown()
++        except Exception:
++            logger.exception("Failed to shut down store offloading handler")
++            handler_failed = True
++
++        try:
++            self._load_handler.shutdown()
++        except Exception:
++            logger.exception("Failed to shut down load offloading handler")
++            handler_failed = True
++
++        if self._mmap_region is not None:
++            if handler_failed:
++                try:
++                    torch.accelerator.synchronize()
++                except Exception:
++                    logger.warning(
++                        "Device sync before mmap cleanup failed; "
++                        "proceeding with cleanup anyway",
++                        exc_info=True,
++                    )
++            self._mmap_region.cleanup()
++            self._mmap_region = None
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 2e6839fef5..a60a1cfd1b 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_coordinator import (
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
++    KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
+ )
+@@ -107,11 +108,8 @@ class SimpleCPUOffloadScheduler:
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+         # FA group's own block_size; divides scheduler_block_size (the LCM)
+         # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        self.fa_block_size: int = self._group_block_size(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec
+         )
+         assert self.block_size % self.fa_block_size == 0
+ 
+@@ -221,6 +219,22 @@ class SimpleCPUOffloadScheduler:
+             kv_cache_groups=gpu_config.kv_cache_groups,
+         )
+ 
++    def _group_block_size(self, spec: KVCacheSpec) -> int:
++        """Tokens one block of this group covers across the DCP ranks.
++
++        Mirrors ``resolve_kv_cache_block_sizes`` and the ``dcp_world_size`` that
++        ``HybridKVCacheCoordinator.find_longest_cache_hit`` passes down: DCP
++        shards the sequence for full-attention groups only, so a full-attention
++        block spans ``block_size * dcp`` tokens while a Mamba group keeps its
++        full per-rank state and spans ``block_size``. Scaling every group is a
++        no-op at dcp=1, which is why it went unnoticed; on a hybrid model at
++        dcp=4 it makes this manager take a quarter of the Mamba blocks it
++        should.
++        """
++        if isinstance(spec, FullAttentionSpec):
++            return spec.block_size * self.cp_world_size
++        return spec.block_size
++
+     @staticmethod
+     def _estimate_lazy_target_blocks(
+         kv_cache_config: "KVCacheConfig",
+@@ -272,6 +286,12 @@ class SimpleCPUOffloadScheduler:
+             remaining_hashes, max_hit_len
+         )
+ 
++        # update_state_after_alloc() indexes whole scheduler blocks per group and
++        # asserts that contract. Partial hash hits can return a finer length --
++        # under DCP the full-attention block is dcp x the hash block, so a hybrid
++        # model reports multiples of the hash block -- so re-align here. The
++        # surplus blocks stay pinned and are released with the rest.
++        hit_length = hit_length // self.block_size * self.block_size
+         if hit_length > 0:
+             pin_blocks = [
+                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
+@@ -355,9 +375,7 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+                 f"group {g} block_size={g_block_size}"
+@@ -376,9 +394,7 @@ class SimpleCPUOffloadScheduler:
+                 continue
+ 
+             # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+ 
+             # Back-trace: ext blocks sit at the tail of the computed range.
+@@ -595,9 +611,7 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-                )
++                g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+                 ready_blocks_g = aligned_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
+diff --git a/vllm/v1/worker/gpu/cp_utils.py b/vllm/v1/worker/gpu/cp_utils.py
+index 6dd8fd3474..c1b62290a6 100644
+--- a/vllm/v1/worker/gpu/cp_utils.py
++++ b/vllm/v1/worker/gpu/cp_utils.py
+@@ -59,3 +59,32 @@ def _dcp_local_seq_lens_kernel(
+     # For [num_reqs, max_num_reqs), pad with 0
+     local_seq_lens = tl.where(block < num_reqs, local_seq_lens, 0)
+     tl.store(out_ptr + block, local_seq_lens, mask=block < max_num_reqs)
++
++
++@triton.jit
++def cp_local_slot(
++    positions,
++    block_numbers,
++    block_size,
++    cp_rank,
++    CP_SIZE: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
++    PAD_ID: tl.constexpr,
++):
++    """KV slot for `positions` on this CP rank, or PAD_ID if not owned here.
++
++    DCP distributes a sequence round-robin over the CP ranks in chunks of
++    CP_INTERLEAVE, so a token's rank-local offset is not its global offset.
++    At CP_SIZE == 1 this reduces to the non-CP expression exactly.
++
++    `block_numbers` must have been loaded with the matching block index,
++    `positions // (block_size * CP_SIZE)`.
++    """
++    block_offsets = positions % (block_size * CP_SIZE)
++    if CP_SIZE == 1:
++        return block_numbers * block_size + block_offsets
++    is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
++    rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
++    remainder = block_offsets % CP_INTERLEAVE
++    local_offsets = rounds * CP_INTERLEAVE + remainder
++    return tl.where(is_local, block_numbers * block_size + local_offsets, PAD_ID)
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3a174cba80..9d7e70eccf 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -35,7 +35,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, is_uniform_query_len
+ 
+ logger = init_logger(__name__)
+ 
+@@ -97,10 +97,13 @@ def get_uniform_token_count(
+     """
+     Return the uniform token count if batch is uniform, else None.
+     A batch is uniform if all requests have the same number of tokens.
++
++    This is a shape test, so it is only valid for batches whose requests are
++    known to be decoding by construction (e.g. dummy runs, or a drafter step
++    that emits a fixed number of tokens per request). Batches coming from a
++    scheduler step must go through `get_uniform_decode_token_count`.
+     """
+-    if (max_query_len == num_tokens // num_reqs) and (
+-        num_tokens == max_query_len * num_reqs
+-    ):
++    if is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+         return max_query_len
+     return None
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a6ac6eb67e..05302347bc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -133,7 +133,12 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+ from vllm.v1.worker.gpu.states import RequestState
+ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
++from vllm.v1.worker.utils import (
++    KVBlockZeroer,
++    copy_kv_cache_blocks_inplace,
++    get_uniform_decode_token_count,
++    is_uniform_query_len,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -479,9 +484,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             block_sizes.append(spec.block_size)
+             # When using DCP, each request's KV cache is sharded among different ranks.
+             # As a result, one block on the current rank covers `block_size * cp_size`
+-            # tokens in the full, global (unsharded) sequence.
++            # tokens in the full, global (unsharded) sequence. Mamba state is
++            # replicated across DCP/PCP ranks and never sharded, so its rows stay
++            # position-indexed over the unsharded sequence -- the same rule
++            # MambaSpec.max_num_blocks_per_req states.
++            kv_shard_count = 1 if isinstance(spec, MambaSpec) else self.dcp_size
+             max_num_blocks = cdiv(
+-                block_table_max_model_len, spec.block_size * self.dcp_size
++                block_table_max_model_len, spec.block_size * kv_shard_count
+             )
+             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
+             if isinstance(spec, MambaSpec):
+@@ -1244,6 +1253,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+         )
+ 
++    def _get_uniform_token_count(
++        self,
++        scheduler_output: SchedulerOutput,
++        num_reqs: int,
++        num_tokens: int,
++        max_query_len: int,
++        dummy_run: bool,
++    ) -> int | None:
++        """Per-request token count of a uniform decode batch, or None.
++
++        Dummy batches (DP padding, memory profiling, warmup) are uniform by
++        construction and have no request state to consult, so they are
++        classified by shape alone. This mirrors `InputBatch.make_dummy`, which
++        marks every dummy request as not prefilling.
++        """
++        if dummy_run:
++            return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
++        # Shape first. This is the same test get_uniform_decode_token_count
++        # runs before it looks at any request state, and it rejects every
++        # mixed prefill/decode batch, which is most of them. Checking it here
++        # keeps the gather below off the hot path in that case.
++        if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++            return None
++        idx_mapping_np = np.fromiter(
++            map(
++                self.req_states.req_id_to_index.__getitem__,
++                scheduler_output.num_scheduled_tokens,
++            ),
++            dtype=np.intp,
++            count=num_reqs,
++        )
++        return get_uniform_decode_token_count(
++            num_reqs,
++            num_tokens,
++            max_query_len,
++            self.req_states.num_computed_prefill_tokens[idx_mapping_np],
++            self.req_states.prefill_len.np[idx_mapping_np],
++        )
++
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -1270,7 +1318,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
++        uniform_tok_count = self._get_uniform_token_count(
++            scheduler_output, num_reqs, num_toks, max_query_len, dummy_run
++        )
+ 
+         num_active_loras = 0
+         if self.lora_config:
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 5ceb6c7558..2b269a4025 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -10,17 +10,18 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
++from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    BatchExecutionDescriptor,
+-    get_uniform_token_count,
+-)
++from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++from vllm.v1.worker.gpu.model_states.interface import ModelState
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+ )
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -41,6 +42,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
++        self.use_fused_multi_step_decode = False
+ 
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+@@ -76,6 +78,49 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         """
+         return True
+ 
++    def set_attn(
++        self,
++        model_state: ModelState,
++        kv_cache_config: KVCacheConfig,
++        block_tables: BlockTables,
++        target_input_buffers: InputBuffers,
++        target_attn_groups: list[list[AttentionGroup]],
++    ) -> None:
++        super().set_attn(
++            model_state,
++            kv_cache_config,
++            block_tables,
++            target_input_buffers,
++            target_attn_groups,
++        )
++        self._configure_fused_multi_step_decode()
++
++    def _configure_fused_multi_step_decode(self) -> None:
++        if self.num_speculative_steps == 1:
++            self.use_fused_multi_step_decode = False
++            return
++
++        if not self.advance_draft_positions:
++            self.use_fused_multi_step_decode = True
++            return
++
++        unsupported_backends = sorted(
++            {
++                attn_group.backend.get_name()
++                for attn_groups in self.attn_groups
++                for attn_group in attn_groups
++                if not attn_group.supports_draft_decode_metadata_update
++            }
++        )
++        self.use_fused_multi_step_decode = not unsupported_backends
++        if unsupported_backends:
++            logger.info_once(
++                "Fused multi-step draft decode is not supported by attention "
++                "backend(s) %s; falling back to rebuilding attention metadata "
++                "between draft steps.",
++                ", ".join(unsupported_backends),
++            )
++
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+         # Initialize cudagraph manager for draft prefill (draft position 0).
+         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+@@ -104,6 +149,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         # Reset indices to zeros to prevent stale values from prior
+         # dummy runs to cause out-of-bounds indexing during capture.
+         self.last_token_indices.zero_()
++        self.idx_mapping.zero_()
+ 
+         # Capture the prefill routine (model forward + compute_logits +
+         # sample).
+@@ -133,12 +179,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             return
+ 
+         self.on_multi_step_decode_begin(self.max_num_reqs)
+-        # Capture the decode draft generation routine (model forward +
+-        # sample + update_draft_inputs) for a single
+-        # step.
++        # Capture either the fused decode loop or one decode step per graph.
+         assert self.decode_cudagraph_manager is not None
++        decode_fn = (
++            self._generate_fused_drafts
++            if self.use_fused_multi_step_decode
++            else self._generate_draft
++        )
+         self.decode_cudagraph_manager.capture(
+-            self._generate_draft,
++            decode_fn,
+             self.model_state,
+             self.input_buffers,
+             self.block_tables,
+@@ -222,12 +271,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             # Use the actual number of tokens without padding added by
+             # the target model during FULL cudagraph.
+             num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.prefill_cudagraph_manager,
+@@ -290,7 +341,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         self.on_multi_step_decode_begin(num_reqs)
+         # Generate the remaining num_speculative_steps - 1 draft tokens.
+-        self._multi_step_decode(
++        decode_fn = (
++            self._fused_multi_step_decode
++            if self.use_fused_multi_step_decode
++            else self._multi_step_decode
++        )
++        decode_fn(
+             num_reqs,
+             dummy_run and skip_attn_for_dummy_run,
+             decode_batch_desc,
+@@ -435,10 +491,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     step=step,
+                 )
+ 
+-            # Update the current draft step.
+             self.current_draft_step.fill_(step)
+ 
+-            # Generate draft tokens for the current step.
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                 assert self.decode_cudagraph_manager is not None
+                 self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+@@ -452,6 +506,95 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                 )
+ 
++    def _fused_multi_step_decode(
++        self,
++        num_reqs: int,
++        skip_attn: bool,
++        batch_desc: BatchExecutionDescriptor,
++        num_tokens_across_dp: torch.Tensor | None,
++        seq_lens_cpu_upper_bound: torch.Tensor,
++    ) -> None:
++        positions = self.input_buffers.positions[:num_reqs]
++        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
++        idx_mapping = self.idx_mapping[:num_reqs]
++
++        attn_metadata = None
++        slot_mappings_by_layer = None
++        if not skip_attn:
++            slot_mappings = self.block_tables.compute_slot_mappings(
++                idx_mapping,
++                query_start_loc,
++                positions,
++                batch_desc.num_tokens,
++            )
++            if batch_desc.cg_mode != CUDAGraphMode.FULL:
++                slot_mappings_by_layer = build_slot_mappings_by_layer(
++                    slot_mappings, self.kv_cache_config
++                )
++            attn_metadata = self._build_draft_attn_metadata(
++                num_reqs=num_reqs,
++                num_reqs_padded=batch_desc.num_reqs or num_reqs,
++                num_tokens_padded=batch_desc.num_tokens,
++                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++                step=1,
++            )
++
++        if batch_desc.cg_mode == CUDAGraphMode.FULL:
++            assert self.decode_cudagraph_manager is not None
++            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
++            return
++
++        self._generate_fused_drafts(
++            num_reqs,
++            batch_desc.num_tokens,
++            attn_metadata,
++            slot_mappings_by_layer,
++            num_tokens_across_dp,
++            batch_desc.cg_mode,
++        )
++
++    def _generate_fused_drafts(
++        self,
++        num_reqs: int,
++        num_tokens_padded: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> None:
++        idx_mapping = self.idx_mapping[:num_reqs]
++        positions = self.input_buffers.positions[:num_reqs]
++        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
++        attn_groups = (
++            [group for groups in self.attn_groups for group in groups]
++            if attn_metadata is not None
++            else []
++        )
++
++        for step in range(1, self.num_speculative_steps):
++            self.current_draft_step.fill_(step)
++            self._generate_draft(
++                num_reqs,
++                num_tokens_padded,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp,
++                cudagraph_runtime_mode,
++            )
++            if (
++                step < self.num_speculative_steps - 1
++                and attn_metadata is not None
++                and self.advance_draft_positions
++            ):
++                self.block_tables.compute_slot_mappings(
++                    idx_mapping,
++                    query_start_loc,
++                    positions,
++                    num_tokens_padded,
++                )
++                for attn_group in attn_groups:
++                    attn_group.update_draft_decode_metadata(attn_metadata)
++
+     def _generate_draft(
+         self,
+         num_reqs: int,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index e59202c879..93dbb5aa14 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     build_slot_mappings_by_layer,
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     AttentionState,
+     BatchExecutionDescriptor,
+@@ -41,6 +42,21 @@ def _prepare_dflash_inputs_to_capture(
+     attn_metadata = None
+     if not skip_attn:
+         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
++        # The draft has two independent metadata paths -- this one for capture
++        # and DFlashSpeculator._build_draft_attn_metadata for serving. Only the
++        # serving one was DCP-aware, so build() dereferenced a None
++        # dcp_local_seq_lens during capture.
++        dcp_local_seq_lens = None
++        if block_tables.cp_size > 1:
++            prepare_dcp_local_seq_lens(
++                input_buffers.dcp_local_seq_lens,
++                input_buffers.seq_lens,
++                num_reqs,
++                block_tables.cp_size,
++                block_tables.cp_rank,
++                block_tables.cp_interleave,
++            )
++            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+@@ -49,6 +65,7 @@ def _prepare_dflash_inputs_to_capture(
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=num_tokens // num_reqs,
+             seq_lens=input_batch.seq_lens,
++            dcp_local_seq_lens=dcp_local_seq_lens,
+             max_seq_len=max_model_len,
+             block_tables=input_block_tables,
+             slot_mappings=slot_mappings,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 333648637b..a05cafd652 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+ from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+@@ -288,6 +289,20 @@ class DFlashSpeculator(DraftModelSpeculator):
+         if not self.draft_attn_layer_names:
+             return None
+         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
++        dcp_local_seq_lens = None
++        if self.block_tables.cp_size > 1:
++            # prepare_dflash_inputs has already written the draft's absolute
++            # sequence length (context + query block) into input_buffers.seq_lens,
++            # so this is the same call the target makes.
++            prepare_dcp_local_seq_lens(
++                self.input_buffers.dcp_local_seq_lens,
++                self.input_buffers.seq_lens,
++                num_reqs,
++                self.block_tables.cp_size,
++                self.block_tables.cp_rank,
++                self.block_tables.cp_interleave,
++            )
++            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+         return super()._build_draft_attn_metadata(
+             num_reqs,
+             num_reqs_padded,
+@@ -297,6 +312,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             num_query_per_req=self.num_query_per_req,
+             causal=causal,
+             query_start_loc_np=query_start_loc_np,
++            dcp_local_seq_lens=dcp_local_seq_lens,
+         )
+ 
+     @torch.inference_mode()
+@@ -392,6 +408,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 seeds,
+                 self.block_tables.input_block_tables[gid],
+                 self.block_tables.kernel_block_sizes[gid],
++                self.block_tables.cp_rank,
++                self.block_tables.cp_size,
++                self.block_tables.cp_interleave,
+                 self.parallel_drafting_token_id,
+                 self.num_query_per_req,
+                 self.num_speculative_steps,
+@@ -506,8 +525,11 @@ def _prepare_dflash_inputs_kernel(
+     max_num_reqs,
+     max_num_tokens,
+     max_model_len,
++    cp_rank,
+     SAMPLE_FROM_ANCHOR: tl.constexpr,
+     PAD_SLOT_ID: tl.constexpr,
++    CP_SIZE: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
+@@ -540,14 +562,16 @@ def _prepare_dflash_inputs_kernel(
+     # --- Context positions / slots ---
+     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
+     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+-    ctx_block_num = ctx_pos // block_size
++    ctx_block_num = ctx_pos // (block_size * CP_SIZE)
+     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
+     ctx_block_id = tl.load(
+         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
+         mask=is_ctx,
+         other=0,
+     ).to(tl.int64)
+-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
++    ctx_slot = cp_local_slot(
++        ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
++    )
+     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+ 
+@@ -557,14 +581,16 @@ def _prepare_dflash_inputs_kernel(
+     is_bonus = is_query & (query_off == 0)
+     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
+ 
+-    q_block_num = query_pos // block_size
++    q_block_num = query_pos // (block_size * CP_SIZE)
+     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
+     q_block_id = tl.load(
+         block_table_ptr + req_idx * block_table_stride + q_block_num,
+         mask=is_query,
+         other=0,
+     ).to(tl.int64)
+-    q_slot = q_block_id * block_size + (query_pos % block_size)
++    q_slot = cp_local_slot(
++        query_pos, q_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
++    )
+ 
+     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
+@@ -655,6 +681,9 @@ def prepare_dflash_inputs(
+     # [max_num_reqs, max_num_blocks]
+     block_table: torch.Tensor,
+     block_size: int,
++    cp_rank: int,
++    cp_size: int,
++    cp_interleave: int,
+     parallel_drafting_token_id: int,
+     num_query_per_req: int,
+     num_speculative_steps: int,
+@@ -702,7 +731,10 @@ def prepare_dflash_inputs(
+         max_num_reqs,
+         max_num_tokens,
+         max_model_len,
++        cp_rank,
+         SAMPLE_FROM_ANCHOR=sample_from_anchor,
+         PAD_SLOT_ID=PAD_SLOT_ID,
++        CP_SIZE=cp_size,
++        CP_INTERLEAVE=cp_interleave,
+         BLOCK_SIZE=BLOCK_SIZE,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index 4be22b4474..61d1c0003f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -12,9 +12,6 @@ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    get_uniform_token_count,
+-)
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+@@ -22,6 +19,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -190,10 +188,12 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.cudagraph_manager,
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 69e0cc1091..80de83109b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -234,6 +234,7 @@ class DraftModelSpeculator(BaseSpeculator):
+         num_query_per_req: int = 1,
+         causal: bool | Mapping[int, bool] = True,
+         query_start_loc_np: np.ndarray | None = None,
++        dcp_local_seq_lens: torch.Tensor | None = None,
+     ) -> dict[str, Any] | None:
+         if query_start_loc_np is not None:
+             # Non-uniform query layout (e.g. multi-module MTP's mixed
+@@ -278,6 +279,11 @@ class DraftModelSpeculator(BaseSpeculator):
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=max_query_len,
+             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
++            dcp_local_seq_lens=(
++                None
++                if dcp_local_seq_lens is None
++                else dcp_local_seq_lens[:num_reqs_padded]
++            ),
+             max_seq_len=self.draft_max_seq_len,
+             block_tables=block_tables,
+             slot_mappings=slot_mappings,
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9d056cc67c..7b66dc2e44 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -299,6 +299,17 @@ class AttentionGroup:
+         assert len(self.metadata_builders) > ubatch_id
+         return self.metadata_builders[ubatch_id]
+ 
++    @property
++    def supports_draft_decode_metadata_update(self) -> bool:
++        return self.get_metadata_builder().supports_draft_decode_metadata_update
++
++    def update_draft_decode_metadata(
++        self,
++        attn_metadata: Mapping[str, Any],
++    ) -> None:
++        metadata = attn_metadata[self.layer_names[0]]
++        self.get_metadata_builder().update_draft_decode_metadata(metadata)
++
+ 
+ def select_common_block_size(
+     kv_manager_block_size: int,
+@@ -601,6 +612,63 @@ def copy_kv_cache_blocks_inplace(
+         blocks[dst_indices] = blocks[src_indices]
+ 
+ 
++def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
++    """Whether every request in the batch has the same query length.
++
++    This tests the batch shape only. Callers classifying a scheduled batch as a
++    decode batch must use ``get_uniform_decode_token_count`` instead, because a
++    prompt chunk can have a decode batch's shape.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++    """
++    return num_reqs > 0 and num_tokens == max_query_len * num_reqs
++
++
++def get_uniform_decode_token_count(
++    num_reqs: int,
++    num_tokens: int,
++    max_query_len: int,
++    num_computed_tokens: np.ndarray,
++    prefill_lens: np.ndarray,
++) -> int | None:
++    """Per-request token count of a uniform decode batch, or None.
++
++    A batch is a uniform decode batch only if every request has the same query
++    length *and* no request is still prefilling. Query length alone is a shape
++    test that a prompt chunk satisfies by coincidence: a prompt chunk of
++    ``1 + num_speculative_tokens`` tokens has the shape of a spec-decode step,
++    and a 1-token chunk has the shape of a plain decode step. Classifying such
++    a batch as a decode batch replays a decode-captured cudagraph over prompt
++    tokens, whose captured kernels read per-request state that a prefill
++    metadata build does not refresh.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++        num_computed_tokens: Per-request tokens computed before this step, in
++            batch order. Must be exactly ``num_reqs`` long; a full
++            ``max_num_reqs`` state array would compare the wrong requests.
++        prefill_lens: Per-request prefill length, i.e. the prompt plus any
++            output tokens recomputed after preemption, in batch order. Same
++            length requirement.
++
++    Returns:
++        The shared per-request query length, or None if the batch is not a
++        uniform decode batch.
++    """
++    if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++        return None
++    # Equivalent to `InputBatch.is_prefilling_np.any()`, which the drafter's
++    # call site derives from the same two arrays.
++    if np.any(num_computed_tokens < prefill_lens):
++        return None
++    return max_query_len
++
++
+ def is_residual_scattered_for_sp(
+     vllm_config: VllmConfig, num_input_tokens: int
+ ) -> bool:
