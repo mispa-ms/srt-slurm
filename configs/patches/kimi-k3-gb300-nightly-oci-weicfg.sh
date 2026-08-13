@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Kimi-K3 DISAGG on the stock vLLM nightly + Hanjie's patch, WEI'S NUMBERS AS
+# WRITTEN (oci-aga). Sibling of kimi-k3-gb300-nightly-disagg.sh.
+#
+# That script is tuned for lyris and forces three things this one must not,
+# because Wei's config is an oci-aga config and the point here is to run it as
+# he wrote it:
+#
+#   segment      lyris tops out at 120 GB/rank (Wei, 2026-08-13: "150gb ... works
+#                on OCI-aga, on lyris I can only do 120GB"). His file asks for
+#                150, so the value comes from the arm, not from here.
+#   MOONCAKE_DEVICE  lyris has mlx5_0..3 and we let auto-discovery read the
+#                inventory. His config names mlx5_8, which is an oci-aga NIC --
+#                so the arm sets it and this script keeps its hands off. If it
+#                is wrong the log says `Found 0 HCAs` and the RDMA topology dump
+#                above it names what is actually there.
+#   (DURATION stays 3600 -- the campaign standard is mandatory and overrides
+#    matching his 1800 window; expect the arm to read low against his chart
+#    for that reason alone -- B300 measured -7.8% at 3600 against 1800.)
+#
+# Everything else -- the patch, the applier, its sha gate, the post-patch
+# verification, the mooncake version gate -- is identical.
+set -euxo pipefail
+
+export MOONCAKE_VERSION=0.3.12.post1
+export FI_VER=${FI_VER:-0.6.16.post3}
+
+# Mooncake host-DRAM segment: defaulted, NOT forced. 600 / 4 ranks = the 150
+# GB/rank Wei's config asks for on oci-aga. An arm that needs another value sets
+# TOTAL_CPU_DRAM_GB itself.
+export TOTAL_CPU_DRAM_GB=${TOTAL_CPU_DRAM_GB:-600}
+export MOONCAKE_TP=${MOONCAKE_TP:-4}
+
+# Report the reservation against the tray. The lyris ceiling that this check was
+# written for does not apply here -- oci-aga holds 150 GB/rank where lyris
+# cannot -- so this warns rather than exits, and MOONCAKE_NODE_FRACTION_PCT
+# still tightens it if a tray turns out to be small.
+MEM_TOTAL_GB=$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
+if [ -n "${MEM_TOTAL_GB}" ] && [ "${MEM_TOTAL_GB}" -gt 0 ]; then
+    MC_CEILING_GB=$(( MEM_TOTAL_GB * ${MOONCAKE_NODE_FRACTION_PCT:-55} / 100 ))
+    echo "[mooncake] node MemTotal ${MEM_TOTAL_GB} GB, reserving ${TOTAL_CPU_DRAM_GB} GB" \
+         "across ${MOONCAKE_TP} ranks ($(( TOTAL_CPU_DRAM_GB / MOONCAKE_TP )) GB each)," \
+         "advisory ceiling ${MC_CEILING_GB} GB"
+    if [ "${TOTAL_CPU_DRAM_GB}" -gt "${MC_CEILING_GB}" ]; then
+        echo "[mooncake] WARN: ${TOTAL_CPU_DRAM_GB} GB is above ${MC_CEILING_GB} GB." \
+             "On lyris that OOM-killed the node; oci-aga is expected to hold it." >&2
+    fi
+else
+    echo "[mooncake] WARN: /proc/meminfo unreadable -- cannot report the reservation"
+fi
+
+# The staged K3 checkpoint sits at a different path on every cluster, and this
+# script now runs on more than one of them, so probe rather than hardcode. An
+# explicit K3_STAGED_DIR still wins; otherwise take the first candidate that
+# exists and say which. Guessing a path costs a whole run to find out, and the
+# team sheet has no OCI-aga entry yet.
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    for _cand in \
+        /lustre/share/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/models/kimi-k3 \
+        /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3
+    do
+        if [ -d "${_cand}" ]; then
+            export K3_STAGED_DIR="${_cand}"
+            echo "[k3] staged checkpoint: ${K3_STAGED_DIR}"
+            break
+        fi
+    done
+fi
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    echo "[k3] WARN: no staged checkpoint found on this cluster; the HF shim will" \
+         "fall back to downloading 1.45 TB. Set K3_STAGED_DIR to the local copy." >&2
+fi
+
+# hfshim first -- the model has to resolve before anything else matters -- then
+# the Mooncake wheel, config and master.
+bash /configs/patches/vllm-container-deps-k3-mooncake.sh
+
+apt-get -y update
+apt-get install -y --no-install-recommends --allow-change-held-packages \
+    ibverbs-providers \
+    numactl \
+    patch
+
+FI_CUDA=$(python3 -c "
+import torch
+major = torch.version.cuda.split('.')[0]
+print(f'cu{major}' + ('0' if major == '13' else '8'))
+")
+echo "=== installing flashinfer ${FI_VER} (${FI_CUDA}) ==="
+python3 -m pip install --no-deps --force-reinstall "flashinfer-python==${FI_VER}"
+python3 -m pip install --no-deps --force-reinstall \
+    --extra-index-url "https://flashinfer.ai/whl/" "flashinfer-cubin==${FI_VER}"
+python3 -m pip install --no-deps --force-reinstall \
+    --extra-index-url "https://flashinfer.ai/whl/${FI_CUDA}/" \
+    "flashinfer-jit-cache==${FI_VER}+${FI_CUDA}" || \
+    echo "WARNING: flashinfer-jit-cache ${FI_VER}+${FI_CUDA} not installed; JIT will compile on demand"
+
+SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
+echo "site-packages: $SITE"
+
+# --- Hanjie's applier, unmodified -----------------------------------------
+# It gates on _version.py containing g3d204dfda and refuses to touch any other
+# image, which is a stronger identity check than we had: our own source-built
+# images could not be told apart until v3 forced the issue. Do not soften it --
+# the patch is cut against that exact nightly and a near miss applies with
+# offsets rather than failing.
+export VLLM_SITE_PACKAGES="$SITE"
+export VLLM_DCP_PATCH_FILE=/configs/patches/vllm-wzhao-kimi-k3-agentx-v2-on-nightly-aug13.patch
+bash /configs/patches/apply-vllm-kimi-k3-dcp-aug13.sh
+
+echo "=== verifying the patched tree ==="
+# Read the tree rather than trust the applier's exit code: `patch --forward`
+# reports success when it decides a hunk is already applied, so a partially
+# stale tree can exit 0. These assert the behaviours the arms depend on.
+python3 -c "
+import ast
+import pathlib
+import vllm
+
+root = pathlib.Path(vllm.__file__).parent
+read = lambda rel: (root / rel).read_text()
+
+coord = read('v1/core/kv_cache_coordinator.py')
+assert 'def get_replay_boundary' in coord, (
+    'the patch did not land: no get_replay_boundary'
+)
+# The conflict Hanjie resolved: upstream disables fine-grained hits under DCP,
+# Wei's change is what enables them. Every arm here is DCP8, so a silent revert
+# to the upstream form would turn prefix-match-unit off and look like a plain
+# regression.
+assert 'enable_partial_hash_hits = has_partial_mamba_group' in coord, (
+    'partial hash hits are still gated on dcp_world_size == 1: the DCP arms '
+    'would run with prefix-match-unit silently inert'
+)
+assert 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size' in coord, (
+    'the DCP branch of has_partial_mamba_group is missing'
+)
+
+stkcm = read('v1/core/single_type_kv_cache_manager.py')
+assert '(block_idx, req_blocks[block_idx])' in stkcm, (
+    'the partial-hit CoW still records new_computed_blocks[-1]; '
+    'allocate_new_blocks dies on a bare AssertionError under load'
+)
+
+# vllm#51733, the MLA prefill workspace fix Wei named as the CUDA-OOM guard.
+# It is upstream and therefore in the nightly, but it is the one thing whose
+# absence explains every weicfg arm we lost, so check rather than assume.
+mla = read('model_executor/layers/attention/mla_attention.py')
+assert 'max_num_seqs' not in mla.split('def align_mla_chunked_context_workspace_size')[1].split('def ')[0], (
+    'MLA prefill workspace still scales with max_num_seqs: vllm#51733 is absent '
+    'and the prefill worker will OOM at gmu 0.92'
+)
+print('=== patched tree verified ===')
+"
+
+echo "=== mooncake client/master version agreement ==="
+python3 - <<'MCGATE'
+import importlib.metadata as md
+import os
+import sys
+
+want = os.environ.get("MOONCAKE_VERSION", "0.3.11.post1")
+try:
+    import mooncake
+    from mooncake.store import MooncakeDistributedStore  # noqa: F401
+except Exception as exc:
+    sys.exit("mooncake is not importable after setup: %s" % exc)
+
+dists = [d for d in md.distributions()
+         if (d.metadata["Name"] or "").startswith("mooncake-transfer-engine")]
+present = sorted("%s==%s" % (d.metadata["Name"], d.version) for d in dists)
+print("  imported from: %s" % getattr(mooncake, "__file__", "?"))
+print("  distributions present: %s" % (present or "none"))
+if len(dists) != 1:
+    sys.exit("expected exactly one mooncake-transfer-engine distribution, found "
+             "%d: %s" % (len(dists), present))
+if dists[0].version != want:
+    sys.exit("mooncake is %s, not the pinned %s -- the deps script fell back"
+             % (present[0], want))
+print("  ok: %s" % present[0])
+MCGATE
+
+echo "=== GB300 nightly disagg setup complete ==="
