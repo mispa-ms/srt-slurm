@@ -61,9 +61,11 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 # is what happened to us: 4 oom_kill events on theia0217, prefill_0 dead before
 # the engine came up (SLURM 2678074, pipeline 62448615).
 #
-# It survived once at 150 only because mooncake 0.3.9 was silently installed and
-# never committed the segment. With the wheel fix the reservation is real, so
-# the number now has to be one a tray can actually hold.
+# I first wrote that 150 only survived earlier because mooncake 0.3.9 never
+# committed the segment, and that the wheel fix made the reservation real. That
+# is wrong: 62444695 ran 150 GB/rank on 0.3.9, with all 384 registrations
+# refused, and was OOM-killed just the same. 150 is simply more than a tray
+# holds, whichever client is installed.
 #
 # Back to 400 -- 100 GB/rank, SA's GB300 recipe value, and the one our own clean
 # GB300 ladder ran at (pipeline 62405731). Raise it only against a measurement.
