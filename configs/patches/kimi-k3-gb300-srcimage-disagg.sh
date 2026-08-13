@@ -201,14 +201,24 @@ assert not resets, (
     f'(line {resets[0].lineno})'
 )
 
-# --- cdcc7eae38: clamp instead of asserting on an unhashed speculative tail ---
+# --- cdcc7eae38's clamp: absent by design on the v3 image ---
+# The image is now built from wzhao/kimi-k3-agentx-v2, and that branch does not
+# carry the clamp -- process_tokens still asserts that the block hashes cover
+# token_len. The k3-wei-v2 image did carry it, so this check used to read the
+# other way round.
+#
+# Left as his branch has it rather than patched back in: the point of this image
+# is to measure on the tree his numbers come from, and a local divergence here
+# would undo that. The assert only fires on a speculative tail the hashes do not
+# cover, which a no-spec arm never produces -- so pin the expectation to
+# no-spec and fail loudly if a spec arm is ever pointed at this script.
 data = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py')
-assert 'token_len = min(token_len, len(block_hashes)' in data, (
-    'process_tokens still asserts on a speculative tail the block hashes do not '
-    'cover, which kills the decode worker mid-run'
+assert 'assert token_len // self.hash_block_size <= len(block_hashes)' in data, (
+    'process_tokens no longer asserts on the hash coverage -- the branch moved; '
+    're-check whether the clamp came back before trusting spec arms here'
 )
-assert 'assert token_len // self.hash_block_size <= len(block_hashes)' not in data, (
-    'the old assert survives alongside the clamp'
+assert 'token_len = min(token_len, len(block_hashes)' not in data, (
+    'the clamp reappeared alongside the assert; one of them is dead code'
 )
 
 # --- e4008bfc0a: the DCP scaling rule, shared ---
