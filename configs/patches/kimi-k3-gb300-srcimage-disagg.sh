@@ -228,14 +228,19 @@ assert not resets, (
 # would undo that. The assert only fires on a speculative tail the hashes do not
 # cover, which a no-spec arm never produces -- so pin the expectation to
 # no-spec and fail loudly if a spec arm is ever pointed at this script.
+# This script serves BOTH images, so the check reports which state it found
+# instead of enforcing one. Pinning it to v3's state broke every v2 arm at setup
+# (62565009 and its siblings) -- the two images genuinely differ here and the
+# script cannot demand a single answer.
 data = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py')
-assert 'assert token_len // self.hash_block_size <= len(block_hashes)' in data, (
-    'process_tokens no longer asserts on the hash coverage -- the branch moved; '
-    're-check whether the clamp came back before trusting spec arms here'
+has_clamp = 'token_len = min(token_len, len(block_hashes)' in data
+has_assert = 'assert token_len // self.hash_block_size <= len(block_hashes)' in data
+assert has_clamp != has_assert, (
+    'process_tokens is in neither known state (clamp=%s assert=%s): the branch '
+    'moved again, re-read it before trusting any arm here' % (has_clamp, has_assert)
 )
-assert 'token_len = min(token_len, len(block_hashes)' not in data, (
-    'the clamp reappeared alongside the assert; one of them is dead code'
-)
+print('  process_tokens tail:', 'clamped (k3-wei-v2)' if has_clamp
+      else 'asserts on hash coverage (k3-wei-v3) -- no-spec only')
 
 # --- e4008bfc0a: the DCP scaling rule, shared ---
 from vllm.v1.core.kv_cache_utils import effective_kv_block_size  # noqa: F401
