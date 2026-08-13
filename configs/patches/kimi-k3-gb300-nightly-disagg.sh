@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kimi-K3 DISAGG on the stock vLLM nightly, patched at runtime (GB300 / lyris).
+# Kimi-K3 DISAGG on the stock vLLM nightly, patched at runtime (GB300).
 #
 # This replaces kimi-k3-gb300-srcimage-disagg.sh, which needed a 60-minute
 # aarch64 image build for every move of wzhao/kimi-k3-agentx-v2 -- and we were
@@ -17,7 +17,7 @@
 # scaffolding, including the unsupported_partial_hit_managers guard, and drops
 # only the `dcp_world_size == 1` restriction.
 #
-# LYRIS DIFFERS FROM HIS CLUSTER in three ways, all handled below:
+# CLUSTER DIFFERENCES, all handled below (this runs on lyris and oci-aga):
 #   - NICs are mlx5_0..3, not the mlx5_8 his oci-aga config names. Copying his
 #     device_name once already cost us six runs to `Found 0 HCAs`, so this script
 #     leaves MOONCAKE_DEVICE unset and lets auto-discovery read the inventory.
@@ -56,9 +56,29 @@ else
     echo "[mooncake] WARN: /proc/meminfo unreadable -- cannot check the reservation"
 fi
 
-# lyris keeps the K3 weights on a shared path that carries inferencex in its name
-# but does not follow SLURM_PPP, so it resolves for either account.
-export K3_STAGED_DIR=${K3_STAGED_DIR:-/lustre/share/coreai_comparch_inferencex/models/kimi-k3}
+# The staged K3 checkpoint sits at a different path on every cluster, and this
+# script now runs on more than one of them, so probe rather than hardcode. An
+# explicit K3_STAGED_DIR still wins; otherwise take the first candidate that
+# exists and say which. Guessing a path costs a whole run to find out, and the
+# team sheet has no OCI-aga entry yet.
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    for _cand in \
+        /lustre/share/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/models/kimi-k3 \
+        /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3
+    do
+        if [ -d "${_cand}" ]; then
+            export K3_STAGED_DIR="${_cand}"
+            echo "[k3] staged checkpoint: ${K3_STAGED_DIR}"
+            break
+        fi
+    done
+fi
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    echo "[k3] WARN: no staged checkpoint found on this cluster; the HF shim will" \
+         "fall back to downloading 1.45 TB. Set K3_STAGED_DIR to the local copy." >&2
+fi
 
 # hfshim first -- the model has to resolve before anything else matters -- then
 # the Mooncake wheel, config and master.
