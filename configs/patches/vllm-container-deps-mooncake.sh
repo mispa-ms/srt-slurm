@@ -45,10 +45,15 @@ sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null && echo "[mooncake] enabled tcp_tw
 
 # ---- Mooncake store install (cu13 wheel for B300/GB300) ----------------------
 MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
-# Arch-aware: the cuda13 aarch64 wheel is built manylinux_2_39 (needs glibc 2.39),
-# but the vllm arm64 container is Ubuntu 22.04 (glibc 2.35) -> pip can't install it
-# on GB300. The non-cuda13 'mooncake-transfer-engine' ships a manylinux_2_35
-# aarch64 wheel that matches. (x86/bia keeps the cuda13 build, glibc 2.35 ok.)
+# Arch-aware, and the glibc floor below is a moving target -- read it before
+# trusting it. The cuda13 aarch64 wheels WERE manylinux_2_39; as of
+# 0.3.12.post1 they are manylinux_2_28, which installs on glibc 2.35. Leaving
+# the old 2.39 floor in place silently downgraded every GB300 run to
+# mooncake-transfer-engine 0.3.9, whose register_buffer signature does not match
+# what vLLM's MooncakeStoreConnector calls: 96 registrations per worker rejected
+# with ErrorCode::INVALID_PARAMS (-600), then 82,760 AddressNotRegistered, and
+# an offload tier that moved zero bytes while every arm was still labelled
+# "dram-mooncake".
 # Pick the wheel by (arch, CUDA major) so it both INSTALLS (glibc) and IMPORTS
 # (libcudart.so.<major>):
 #   - x86: cuda13 wheel (manylinux_2_35, glibc 2.35 ok on bia 22.04).
@@ -64,7 +69,7 @@ NEED_CUDART12_SHIM=0
 if [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "12" ]; then
     # aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35, links libcudart.so.12).
     MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
-elif [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "13" ] && [ -n "${GLIBC_MINOR}" ] && [ "${GLIBC_MINOR}" -lt 39 ]; then
+elif [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "13" ] && [ -n "${GLIBC_MINOR}" ] && [ "${GLIBC_MINOR}" -lt "${MOONCAKE_CU13_GLIBC_MIN:-28}" ]; then
     # aarch64 + cu13 container but glibc<2.39 (e.g. vLLM nightly arm64 on 22.04): the
     # cuda13 wheel (manylinux_2_39) won't install. Fall back to the non-cuda13 2.35 wheel
     # (0.3.9 satisfies vLLM's kv_connectors floor >=0.3.8) and provide libcudart.so.12 via

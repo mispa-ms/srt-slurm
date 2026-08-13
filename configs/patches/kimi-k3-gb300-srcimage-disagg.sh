@@ -211,26 +211,51 @@ python3 /configs/patches/test_mooncake_dcp_keyset.py
 # from; a mismatch surfaces fifteen minutes in as 'invalid rpc arg' and reads
 # like a capacity problem.
 echo "=== mooncake client/master version agreement ==="
-python3 - <<'PY'
+python3 - <<'MCGATE'
 import importlib.metadata as md
 import os
 import sys
 
+# Ask the module that actually gets imported which distribution it came from.
+# Both mooncake-transfer-engine and mooncake-transfer-engine-cuda13 can be
+# installed at once -- the cu13 one ships in the image, the other is added by
+# the deps script -- and both provide the `mooncake` package. Querying a NAME
+# reports whichever was asked for, which is how a 0.3.9 client ran under a gate
+# that printed 0.3.12.post1 while every KV registration failed with
+# INVALID_PARAMS (-600) and the offload tier moved zero bytes.
 want = os.environ.get("MOONCAKE_VERSION", "0.3.11.post1")
-for pkg in ("mooncake-transfer-engine-cuda13", "mooncake-transfer-engine"):
-    try:
-        got = md.version(pkg)
-    except md.PackageNotFoundError:
+try:
+    import mooncake
+except Exception as exc:
+    sys.exit("mooncake is not importable after setup: %s" % exc)
+
+present = sorted(
+    "%s==%s" % (d.metadata["Name"], d.version)
+    for d in md.distributions()
+    if (d.metadata["Name"] or "").startswith("mooncake-transfer-engine")
+)
+owner = None
+for d in md.distributions():
+    if not (d.metadata["Name"] or "").startswith("mooncake-transfer-engine"):
         continue
-    print(f"  {pkg}: installed {got}, master started from {want}")
-    if got != want:
-        sys.exit(
-            f"mooncake client {got} != master {want}. Segment mounts will be "
-            f"refused with 'invalid rpc arg'."
-        )
-    break
-else:
-    sys.exit("no mooncake wheel found after setup")
-PY
+    if any(str(f).split("/")[0] == "mooncake" for f in (d.files or [])):
+        owner = d
+        break
+
+print("  imported from: %s" % getattr(mooncake, "__file__", "?"))
+print("  distributions present: %s" % present)
+if owner is None:
+    sys.exit("cannot tell which distribution owns the imported mooncake; %s" % present)
+got = owner.version
+print("  providing distribution: %s==%s, master started from %s"
+      % (owner.metadata["Name"], got, want))
+if got != want:
+    sys.exit(
+        "the imported mooncake is %s==%s, not %s. Below the pin, register_buffer "
+        "does not match what vLLM's MooncakeStoreConnector calls: every KV "
+        "registration is rejected with INVALID_PARAMS (-600) and the offload "
+        "tier silently moves zero bytes." % (owner.metadata["Name"], got, want)
+    )
+MCGATE
 
 echo "=== GB300 disagg setup complete ==="
