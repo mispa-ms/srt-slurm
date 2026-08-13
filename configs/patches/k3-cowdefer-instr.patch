@@ -1,0 +1,126 @@
+diff -ruN a/vllm/v1/core/kv_cache_coordinator.py i/vllm/v1/core/kv_cache_coordinator.py
+--- a/vllm/v1/core/kv_cache_coordinator.py	2026-08-13 14:46:05.041807974 -0700
++++ i/vllm/v1/core/kv_cache_coordinator.py	2026-08-13 14:47:17.811679007 -0700
+@@ -132,6 +132,11 @@
+             self.retention_interval, self.scheduler_block_size, kv_cache_config
+         )
+ 
++    # Whether the last get_num_blocks_to_allocate refused a request only
++    # because a CoW copy queued this step has not run yet, rather than
++    # because blocks ran out. The scheduler needs the two apart.
++    deferred_for_pending_cow = False
++
+     def get_num_blocks_to_allocate(
+         self,
+         request_id: str,
+@@ -169,6 +174,8 @@
+             The number of blocks to allocate.
+         """
+         num_blocks_to_allocate = 0
++        for manager in self.single_type_managers:
++            manager.deferred_for_pending_cow = False
+         for i, manager in enumerate(self.single_type_managers):
+             if isinstance(manager, CrossAttentionManager):
+                 # For cross-attention, we issue a single static allocation
+@@ -192,6 +199,9 @@
+                     num_tokens_main_model,
+                     apply_admission_cap=apply_admission_cap,
+                 )
++        self.deferred_for_pending_cow = any(
++            m.deferred_for_pending_cow for m in self.single_type_managers
++        )
+         return num_blocks_to_allocate
+ 
+     def allocate_new_computed_blocks(
+diff -ruN a/vllm/v1/core/sched/scheduler.py i/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-08-13 14:46:05.044202261 -0700
++++ i/vllm/v1/core/sched/scheduler.py	2026-08-13 14:47:08.075160809 -0700
+@@ -188,6 +188,12 @@
+         self.waiting = create_request_queue(self.policy)
+         # requests skipped in waiting flow due async deps or constraints.
+         self.skipped_waiting = create_request_queue(self.policy)
++        # Instrumentation for the same-step CoW deferral. _alloc_fail_events is
++        # every waiting-loop allocation failure; _cow_break_events is the subset
++        # caused by a queued CoW copy rather than by a lack of blocks.
++        self._alloc_fail_events = 0
++        self._cow_break_events = 0
++        self._sched_steps = 0
+         self.running: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+@@ -994,6 +1000,12 @@
+ 
+                 if new_blocks is None:
+                     # The request cannot be scheduled.
++                    self._alloc_fail_events += 1
++                    if self.kv_cache_manager.coordinator.deferred_for_pending_cow:
++                        # Not out of memory: a CoW copy queued this step has not
++                        # run yet. Counted here so the cost of breaking the whole
++                        # waiting loop for it can be read off the log.
++                        self._cow_break_events += 1
+ 
+                     # NOTE: we need to untouch the request from the encode cache
+                     # manager
+@@ -1108,12 +1120,23 @@
+             # re-queue requests skipped in this pass ahead of older skipped items.
+             if step_skipped_waiting:
+                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+-
+             # DP prefill balancing: on a step that admitted prefills (release),
+             # record whether it was capacity-bound.
+             if not defer_prefills:
+                 self.prefill_capacity_bound = bool(self.waiting)
+ 
++        self._sched_steps += 1
++        if self._sched_steps % 500 == 0:
++            from vllm.v1.core.single_type_kv_cache_manager import MambaManager
++
++            logger.info(
++                "cow-defer: steps=%d alloc_fail=%d cow_break=%d defer_calls=%d",
++                self._sched_steps,
++                self._alloc_fail_events,
++                self._cow_break_events,
++                MambaManager.cow_defer_events,
++            )
++
+         # Check if the scheduling constraints are satisfied.
+         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+diff -ruN a/vllm/v1/core/single_type_kv_cache_manager.py i/vllm/v1/core/single_type_kv_cache_manager.py
+--- a/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-13 14:46:05.040599838 -0700
++++ i/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-13 14:46:18.152389012 -0700
+@@ -1249,6 +1249,9 @@
+ 
+ 
+ class MambaManager(SingleTypeKVCacheManager):
++    # Cumulative same-step CoW deferrals. Instrumentation only.
++    cow_defer_events = 0
++
+     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+ 
+     def __init__(
+@@ -1262,6 +1265,10 @@
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
++        # Set by get_num_blocks_to_allocate when it refuses a request only
++        # because a CoW copy queued this step has not run yet. Cleared by the
++        # coordinator before each round of calls.
++        self.deferred_for_pending_cow = False
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+             # allocated in the previous step
+@@ -1466,6 +1473,13 @@
+             # To put it in the next step, we return num_gpu_blocks + 1 so
+             # that kv_cache_manager will think there is no enough blocks to allocate now
+             # and don't schedule it in the current step.
++            #
++            # This is NOT an out-of-memory condition, and the scheduler's waiting
++            # loop treats it as one: allocate_slots returns None and the loop
++            # breaks, so one request waiting on a CoW copy queued this step stops
++            # every request behind it. Flag it so the caller can tell them apart.
++            self.deferred_for_pending_cow = True
++            MambaManager.cow_defer_events += 1
+             return self.block_pool.num_gpu_blocks + 1
+         if self.mamba_cache_mode != "align":
+             # Allocate extra `num_speculative_blocks` blocks for

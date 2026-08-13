@@ -1,0 +1,23 @@
+diff -ruN i/vllm/v1/core/sched/scheduler.py s/vllm/v1/core/sched/scheduler.py
+--- i/vllm/v1/core/sched/scheduler.py	2026-08-13 14:47:08.075160809 -0700
++++ s/vllm/v1/core/sched/scheduler.py	2026-08-13 14:47:08.075671152 -0700
+@@ -1003,9 +1003,17 @@
+                     self._alloc_fail_events += 1
+                     if self.kv_cache_manager.coordinator.deferred_for_pending_cow:
+                         # Not out of memory: a CoW copy queued this step has not
+-                        # run yet. Counted here so the cost of breaking the whole
+-                        # waiting loop for it can be read off the log.
++                        # run yet, so only THIS request has to wait. Breaking the
++                        # loop here would hold back every request behind it for a
++                        # reason that has nothing to do with them. Skip it the way
++                        # the loop already skips WAITING_FOR_REMOTE_KVS, stale
++                        # output and max_loras, and carry on.
+                         self._cow_break_events += 1
++                        if request.has_encoder_inputs:
++                            self.encoder_cache_manager.free(request)
++                        request_queue.pop_request()
++                        step_skipped_waiting.prepend_request(request)
++                        continue
+ 
+                     # NOTE: we need to untouch the request from the encode cache
+                     # manager
