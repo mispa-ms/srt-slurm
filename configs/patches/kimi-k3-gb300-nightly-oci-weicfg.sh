@@ -184,6 +184,34 @@ if [ -n "${_plugdir}" ]; then
     done
     # ldd resolves exactly what the loader will, including the injected driver.
     ldd "${_plugdir}/libuct_cuda.so" 2>/dev/null | grep -E "not found|libcuda|libnvidia-ml" | sed 's/^/    /' || true
+    # UCX searches its compiled-in default for loadable modules -- libucs
+    # carries "MODULE_DIR ... /usr/lib64/ucx ... Directory to search for
+    # loadable modules" -- but auditwheel relocated the plugins under the
+    # wheel's own .libs. The directory it looks in does not exist here, so
+    # libuct_cuda.so is present and never opened, which is what "UCX CUDA
+    # support was not found" means while ldd resolves every dependency.
+    #
+    # Wei does not hit this: his NGC container has a properly installed UCX at
+    # /usr/local/ucx, where the compiled-in prefix is right.
+    #
+    # The fix is UCX_MODULE_DIR, and it has to be set in the ARM's environment,
+    # not exported here: workers are launched by their own srun and do not
+    # inherit this shell. Exporting it would look like a fix and change nothing
+    # -- the same trap as the mooncake cudart shim, which had to go through the
+    # ld.so cache for exactly this reason. So verify instead, and fail loudly
+    # when the arm's value does not match what is on disk.
+    if [ -z "${UCX_MODULE_DIR:-}" ]; then
+        echo "[ucx] FATAL: UCX_MODULE_DIR is unset in the worker environment." >&2
+        echo "[ucx]   set it in the arm to: ${_plugdir}" >&2
+        exit 1
+    fi
+    if [ "${UCX_MODULE_DIR}" != "${_plugdir}" ]; then
+        echo "[ucx] FATAL: UCX_MODULE_DIR=${UCX_MODULE_DIR} but the plugins are" \
+             "at ${_plugdir}. UCX would search the wrong directory and report" \
+             "'CUDA support was not found' with every library present." >&2
+        exit 1
+    fi
+    echo "  UCX_MODULE_DIR=${UCX_MODULE_DIR} (matches the plugin dir)"
 fi
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
