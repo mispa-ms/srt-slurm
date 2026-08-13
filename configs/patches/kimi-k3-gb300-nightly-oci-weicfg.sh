@@ -146,6 +146,46 @@ cu = [p for p in present if p.startswith('nixl-cu')]
 assert len(cu) == 1, 'expected exactly one nixl-cuXX variant, found %s' % cu
 "
 
+
+# --- why UCX may not see CUDA -------------------------------------------
+# nixl's wheel does ship the CUDA plugins (libuct_cuda.so, libucm_cuda.so), so
+# "UCX CUDA support was not found" is a load failure, not a missing build. Their
+# NEEDED list is the tell:
+#   libuct_cuda.so -> libcuda.so.1, libnvidia-ml.so.1
+#   libucm_cuda.so -> libcuda.so.1, libcudart.so.13
+# torch only needs libcuda + libcudart, which is why the model loads and KV cache
+# is sized normally while UCX still refuses VRAM. libnvidia-ml.so.1 is injected by
+# the container runtime only when NVIDIA_DRIVER_CAPABILITIES includes `utility`.
+# Print the loader's view so the next failure names the missing library instead
+# of leaving us to infer it.
+echo "=== driver libraries the UCX CUDA plugin needs ==="
+echo "  NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-<unset>}"
+for _lib in libcuda.so.1 libnvidia-ml.so.1 libcudart.so.13; do
+    _found=$(ldconfig -p 2>/dev/null | grep -m1 "${_lib}" || true)
+    if [ -n "${_found}" ]; then
+        echo "  ok      ${_lib}: ${_found##*=> }"
+    else
+        echo "  MISSING ${_lib}"
+    fi
+done
+_plugdir=$(python3 -c "
+import pathlib
+try:
+    import nixl
+except Exception:
+    raise SystemExit(0)
+for p in pathlib.Path(nixl.__file__).parent.parent.glob('nixl*.libs/ucx'):
+    print(p); break
+" 2>/dev/null)
+if [ -n "${_plugdir}" ]; then
+    echo "  ucx plugin dir: ${_plugdir}"
+    for _p in "${_plugdir}"/libuct_cuda.so "${_plugdir}"/libucm_cuda.so; do
+        [ -e "${_p}" ] && echo "    present: $(basename ${_p})"
+    done
+    # ldd resolves exactly what the loader will, including the injected driver.
+    ldd "${_plugdir}/libuct_cuda.so" 2>/dev/null | grep -E "not found|libcuda|libnvidia-ml" | sed 's/^/    /' || true
+fi
+
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
 echo "site-packages: $SITE"
 
