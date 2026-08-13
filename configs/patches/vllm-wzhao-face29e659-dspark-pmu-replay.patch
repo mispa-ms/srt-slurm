@@ -1,0 +1,208 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index 5d6e414368..7ab7b79945 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -146,6 +146,18 @@ class MooncakeStoreCoordinator:
+         self.eagle_group_ids = {
+             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
+         }
++        self.eagle_proof_units = {
++            gid: (
++                self.hash_block_size
++                if self.enable_partial_hash_hits
++                and g.manager_cls.supports_fine_grained_hash_lookup
++                and g.spec.block_size > self.hash_block_size
++                else g.spec.block_size
++            )
++            for g in attention_groups
++            if g.use_eagle and not isinstance(g.spec, MambaSpec)
++            for gid in g.group_ids
++        }
+ 
+     def find_longest_cache_hit(
+         self,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 6daa1e82ea..6c4f551ac9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -366,6 +366,7 @@ class ReqMeta:
+ 
+     token_ids: list[int] | None = None
+     num_prompt_tokens: int | None = None
++    num_computed_tokens: int | None = None
+     # Core-provided per-mamba-group
+     # (group_id, cow_block_id, boundary_tokens) for this request's partial tail.
+     # Present only on the producer's CoW step; drives the connector's offload
+@@ -431,6 +432,7 @@ class ReqMeta:
+             is_last_chunk=is_last_chunk,
+             token_ids=token_ids,
+             num_prompt_tokens=tracker.prefill_end_tokens,
++            num_computed_tokens=tracker.token_len,
+         )
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 42c6f3fa99..3805a1a7fd 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -388,6 +388,7 @@ class MooncakeStoreScheduler:
+                         block_hashes=req_tuple[0].block_hashes,
+                         can_save=True,
+                         num_prompt_tokens=tracker.prefill_end_tokens,
++                        num_computed_tokens=tracker.token_len,
+                         partial_tail_offloads=groups,
+                     )
+                 )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 8156a8b812..9a24cdf0a4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -653,6 +653,41 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                         )
+                     )
+ 
++            # Fine-grained EAGLE lookup proves a replay boundary by matching
++            # one additional hash unit and dropping it. The proof entry is
++            # never loaded, but it must exist so external lookup enforces the
++            # same condition as the local prefix cache.
++            proof_unit = getattr(self.coord, "eagle_proof_units", {}).get(g_idx)
++            proof_end = boundary + proof_unit if proof_unit is not None else 0
++            if (
++                proof_unit is not None
++                and proof_end // hash_block_size <= len(req_meta.block_hashes)
++                and (req_meta.num_computed_tokens or 0) >= proof_end
++            ):
++                proof_block_idx = cdiv(proof_end, db.block_size) - 1
++                if (
++                    proof_block_idx % put_step == put_step_rank
++                    and proof_block_idx < len(group_blocks)
++                ):
++                    proof_block_id = group_blocks[proof_block_idx]
++                    if proof_block_id != NULL_BLOCK_ID:
++                        proof_hash = req_meta.block_hashes[
++                            proof_end // hash_block_size - 1
++                        ]
++                        proof_key = db.key_for(proof_hash)
++                        if proof_key not in keys:
++                            addr, size = db.prepare_value_for_block(proof_block_id)
++                            keys.append(proof_key)
++                            addrs.append(addr)
++                            sizes.append(size)
++                            if group_ids is not None:
++                                group_ids.append(
++                                    _make_mooncake_group_id(
++                                        db.metadata,
++                                        proof_key.rsplit("@", 1)[-1],
++                                    )
++                                )
++
+         if not keys:
+             return True
+         exists_start = time.perf_counter()
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 6340001415..a21f3686fc 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
++    MambaManager,
+     SingleTypeKVCacheManager,
+     get_manager_for_kv_cache_spec,
+ )
+@@ -639,6 +640,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 )
+         self.verify_and_split_kv_cache_groups()
+ 
++        # A speculative attention group drops one fine-grained hash unit from
++        # its hit. Mamba has no draft layer, but its recurrent checkpoint must
++        # be cached at the same replay boundary.
++        if self.eagle_group_ids and self.enable_partial_hash_hits:
++            for manager in self.single_type_managers:
++                if isinstance(manager, MambaManager):
++                    manager.use_eagle = True
++
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+         # Fine-grained partial hits may return hash-block-aligned lengths;
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 21f66ef966..018c2fdfc8 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -374,11 +374,12 @@ class Scheduler(SchedulerInterface):
+             return num_new_tokens
+ 
+         block_size = self.cache_config.block_size
+-        # The last block-aligned position whose state can be cached. With
+-        # Eagle, FullAttn prunes the last matching block, so back off one
+-        # block to avoid a Mamba cache miss.
++        # The last block-aligned position whose state can be cached. Without
++        # fine-grained hits, Eagle prunes the last matching block, so back off
++        # one block to avoid a Mamba cache miss. With a finer PMU, Eagle only
++        # rewinds one hash unit; keep the normal block boundary materialized.
+         last_cache_position = request.num_tokens - request.num_tokens % block_size
+-        if self.use_eagle:
++        if self.use_eagle and not self.mamba_partial_cache_hit:
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+@@ -402,21 +403,28 @@ class Scheduler(SchedulerInterface):
+             if self.mamba_partial_cache_hit
+             else 0
+         )
+-        if tail_boundary and self.use_eagle:
+-            # Eagle matches one hash unit past the candidate and drops it, so
+-            # nothing proves the prompt's own last hash boundary. Materialize
+-            # the state one unit lower, where the hit can actually land.
+-            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
++        speculative_replay_boundary = (
++            tail_boundary - self.hash_block_size
++            if self.use_eagle and tail_boundary >= self.hash_block_size
++            else 0
++        )
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+             next_block_boundary if start % block_size != 0 else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+-            # Fine-grained hits: the prompt's partial-tail entry can only be
+-            # registered by a chunk ending exactly at its last hash boundary.
++            # DSpark/EAGLE rewinds a fine-grained attention hit by one hash
++            # unit. Materialize the matching recurrent state before advancing
++            # to the lookahead boundary.
++            speculative_replay_boundary
++            if speculative_replay_boundary < request.num_prompt_tokens
++            else 0,
++            # Without speculative lookahead, the partial-tail state itself is
++            # the reusable checkpoint.
+             tail_boundary
+-            if last_cache_position < tail_boundary < request.num_prompt_tokens
++            if not self.use_eagle
++            and last_cache_position < tail_boundary < request.num_prompt_tokens
+             else 0,
+             # Marconi shared-prefix junction, block-floored (a sub-block
+             # junction's state is not separately cacheable): cache its state
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 79af088603..790026eb59 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -136,10 +136,14 @@ class SingleTypeKVCacheManager(ABC):
+         if num_local_computed_tokens % self.block_size == 0:
+             return False
+         block_idx = num_local_computed_tokens // self.block_size
++        if block_idx >= len(new_computed_blocks):
++            return False
++        boundary_block = new_computed_blocks[block_idx]
++        cached_boundary = boundary_block.block_hash_num_tokens
+         return (
+-            block_idx < len(new_computed_blocks)
+-            and new_computed_blocks[block_idx].block_hash_num_tokens
+-            == num_local_computed_tokens
++            not boundary_block.is_null
++            and cached_boundary is not None
++            and cached_boundary >= num_local_computed_tokens
+         )
+ 
+     def get_num_blocks_to_allocate(

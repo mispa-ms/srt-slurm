@@ -110,6 +110,34 @@ export VLLM_SITE_PACKAGES="$SITE"
 export VLLM_DCP_PATCH_FILE=/configs/patches/vllm-wzhao-kimi-k3-agentx-v2-on-nightly-aug13.patch
 bash /configs/patches/apply-vllm-kimi-k3-dcp-aug13.sh
 
+# --- wzhao18/vllm@face29e659, on top of Hanjie's patch --------------------
+# His branch moved one commit after the patch was cut (2026-08-13 14:38,
+# "fix(prefix-cache): preserve DSpark PMU replay state"). Kept as its own file
+# rather than folded in, so Hanjie's stays byte-for-byte his and our addition is
+# reviewable on its own. Verified: applying the two in order reproduces the
+# cherry-picked tree exactly.
+#
+# Inert on these arms -- it populates eagle_proof_units only for groups with
+# use_eagle, and every arm here is no-spec. It matters for DSpark/EAGLE, where
+# external lookup must prove the same replay boundary the local prefix cache
+# does.
+EXTRA_PATCH=/configs/patches/vllm-wzhao-face29e659-dspark-pmu-replay.patch
+if [ -r "${EXTRA_PATCH}" ]; then
+    if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${EXTRA_PATCH}" >/dev/null 2>&1; then
+        patch --batch --forward -d "${SITE}" -p1 < "${EXTRA_PATCH}"
+        echo "[patch] applied face29e659 (DSpark PMU replay state)"
+    elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${EXTRA_PATCH}" >/dev/null 2>&1; then
+        echo "[patch] face29e659 already present"
+    else
+        echo "[patch] FATAL: face29e659 neither applies nor is already applied" >&2
+        exit 1
+    fi
+    python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer" "${SITE}/vllm/v1/core"
+else
+    echo "[patch] FATAL: ${EXTRA_PATCH} missing" >&2
+    exit 1
+fi
+
 echo "=== verifying the patched tree ==="
 # Read the tree rather than trust the applier's exit code: `patch --forward`
 # reports success when it decides a hunk is already applied, so a partially
@@ -136,6 +164,12 @@ assert 'enable_partial_hash_hits = has_partial_mamba_group' in coord, (
 )
 assert 'dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size' in coord, (
     'the DCP branch of has_partial_mamba_group is missing'
+)
+
+proof = read('distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py')
+assert 'eagle_proof_units' in proof, (
+    'wzhao18/vllm@face29e659 did not land: external EAGLE lookup will not prove '
+    'the replay boundary the local prefix cache enforces'
 )
 
 stkcm = read('v1/core/single_type_kv_cache_manager.py')
