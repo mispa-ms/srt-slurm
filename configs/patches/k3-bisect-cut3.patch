@@ -1,0 +1,4504 @@
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 59195f307b..74e959f33a 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -180,7 +180,7 @@ class KernelConfig:
+     # to the shared JIT warmup infrastructure.
+     # https://github.com/vllm-project/vllm/pull/47451
+     enable_cutedsl_warmup: bool = True
+-    """If True, run CuTeDSL compile warmup during kernel warmup."""
++    """Deprecated: run legacy CuTeDSL warmup providers."""
+ 
+     enable_jit_warmup: bool = True
+     """If True, run JIT compile warmup during kernel warmup."""
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index fa8c282007..2a64f8e448 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1020,16 +1020,6 @@ class SpeculativeConfig:
+                 if self.method in ("dflash", "dspark"):
+                     self.parallel_drafting = True
+ 
+-                if (
+-                    self.method == "dspark"
+-                    and "K3DSparkModel" in self.draft_model_config.architectures
+-                    and self.target_parallel_config.decode_context_parallel_size > 1
+-                ):
+-                    raise ValueError(
+-                        "MLA DSpark does not currently support decode context "
+-                        "parallelism; set decode_context_parallel_size=1."
+-                    )
+-
+                 if self.num_speculative_tokens is not None and hasattr(
+                     self.draft_model_config.hf_config, "num_lookahead_tokens"
+                 ):
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 91372385e0..e03f70a295 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -66,9 +66,14 @@ else:
+ 
+ logger = init_logger(__name__)
+ 
++MRV1_UNSUPPORTED_PIECEWISE_CUDAGRAPH_ARCHITECTURES = frozenset(
++    {"DeepseekV4ForCausalLM"}
++)
++
+ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+     {
+         "DeepseekV2ForCausalLM",
++        "DeepseekV4ForCausalLM",
+         "GraniteMoeForCausalLM",
+         "InklingForCausalLM",
+         "InklingForConditionalGeneration",
+@@ -702,6 +707,25 @@ class VllmConfig:
+             return False
+         return is_default_v2_architecture or not model_config.is_moe
+ 
++    def _validate_mrv1_piecewise_cudagraph(self) -> None:
++        if self.use_v2_model_runner:
++            return
++        model_config = self.model_config
++        if model_config is None:
++            return
++        if not self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
++            return
++        architectures = getattr(model_config, "architectures", [])
++        if any(
++            arch in MRV1_UNSUPPORTED_PIECEWISE_CUDAGRAPH_ARCHITECTURES
++            for arch in architectures
++        ):
++            raise ValueError(
++                "DeepSeek V4 does not support PIECEWISE CUDA graphs with "
++                "Model Runner V1. Use Model Runner V2 or disable PIECEWISE "
++                "CUDA graphs."
++            )
++
+     @property
+     def needs_dp_coordinator(self) -> bool:
+         """
+@@ -1589,6 +1613,8 @@ class VllmConfig:
+                         "pipeline parallelism",
+                     )
+ 
++        self._validate_mrv1_piecewise_cudagraph()
++
+         # final check of cudagraph mode after all possible updates
+         if current_platform.is_cuda_alike():
+             if (
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index ca32c3345c..d94766f144 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -116,10 +116,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                 )
+         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+         dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
+-            unsupported.append(
+-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+-            )
++        # DCP with hybrid attention is supported: the worker now puts every
++        # group's block size into the scheduler's coordinate space -- attention
++        # groups scaled by dcp, Mamba groups not, the rule
++        # resolve_kv_cache_block_sizes states -- so ``starts // block_size`` in
++        # ChunkedTokenDatabase indexes the block_ids it is handed. The store key
++        # has always carried @dcp{rank}, so each rank's strided slice keys
++        # separately.
++        #
++        # PCP is a different sharding, is not mirrored by that scaling, and has
++        # not been measured, so it stays refused.
++        if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
++            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+         if unsupported:
+             raise ValueError(
+                 "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c846354..1eb5df965e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -37,6 +37,13 @@ class ExternalCachedBlockPool:
+         # determined and we just want each spec's manager to apply its own mask.
+         self._exists = exists
+         self.hash_block_size = hash_block_size
++        # False on the recv side, where the pool answers "present" to anything.
++        # The exact-boundary retry must not run against such a pool: it would
++        # shorten a hit that the lookup already validated, and load_mask's caller
++        # keeps using the original token_len, so process_tokens' trailing chunks
++        # would fall off the end of the mask and leave those blocks
++        # uninitialized -- silent corruption where -704 was at least loud.
++        self.tracks_existence = exists is not None
+         self.null_block = KVCacheBlock(block_id=0)
+         # Dummy ID 1 for present block for duck-typing.
+         self._present_block = KVCacheBlock(block_id=1)
+@@ -90,6 +97,14 @@ class MooncakeStoreCoordinator:
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+ 
++    @property
++    def cache_hit_alignment_tokens(self) -> int:
++        return (
++            self.hash_block_size
++            if self.enable_partial_hash_hits
++            else self.lcm_block_size
++        )
++
+     def align_lookup_length(self, length: int) -> int:
+         alignment = (
+             self.hash_block_size
+@@ -152,14 +167,56 @@ class MooncakeStoreCoordinator:
+         already reflects the eagle-pruned hit length and a second pop would
+         leave the trailing block unloaded.
+         """
+-        blocks_per_group, hit_length = self._find_hit_blocks(
+-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+-        )
+-        masks = tuple(
+-            [blk is not cached_block_pool.null_block for blk in blocks]
+-            for blocks in blocks_per_group
++        candidate_length = max_length
++        while True:
++            blocks_per_group, hit_length = self._find_hit_blocks(
++                block_hashes,
++                candidate_length,
++                cached_block_pool,
++                apply_eagle=apply_eagle,
++            )
++            masks = tuple(
++                [blk is not cached_block_pool.null_block for blk in blocks]
++                for blocks in blocks_per_group
++            )
++            if hit_length == 0 or self._exact_partial_hit_key_exists(
++                block_hashes, hit_length, cached_block_pool
++            ):
++                return masks, hit_length
++
++            candidate_length = max(0, hit_length - self.cache_hit_alignment_tokens)
++
++    def _exact_partial_hit_key_exists(
++        self,
++        block_hashes: Sequence[BlockHash],
++        hit_length: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> bool:
++        """Whether the reconciled partial FullAttention tail can be loaded."""
++        if not self.enable_partial_hash_hits:
++            return True
++        if not cached_block_pool.tracks_existence:
++            # Recv-side pool: it has no truth to check, and shortening the hit
++            # here would desynchronise the mask from its caller's token_len.
++            return True
++
++        # Attribute access, not tuple unpacking: SpecGroup carries manager_cls
++        # and use_eagle here, so the upstream 3-tuple unpack raises ValueError
++        # on the first lookup. git apply cannot see that -- it is a runtime
++        # arity mismatch, not a textual conflict.
++        group = self.attention_groups[0]
++        if not isinstance(group.spec, FullAttentionSpec):
++            # Nothing to revalidate: the defect needs an attention group coarser
++            # than hash granularity, and a recurrent group is tail-only. Upstream
++            # asserts FullAttentionSpec here, which crashes at the first lookup on
++            # a Mamba-only layout -- reachable, since partial hits are enabled by
++            # a Mamba group alone.
++            return True
++        hash_idx = hit_length // self.hash_block_size - 1
++        return (
++            cached_block_pool.get_cached_block(block_hashes[hash_idx], group.group_ids)
++            is not None
+         )
+-        return masks, hit_length
+ 
+     def load_mask(
+         self,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba92..eb1fa7bbb9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -65,6 +65,7 @@ from vllm.v1.core.kv_cache_utils import (
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -1364,19 +1365,54 @@ class MooncakeStoreWorker:
+             )
+             return
+ 
+-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+-        # self.block_size (= scheduler_block_size) so the coordinator's
+-        # ``block_size % hash_block_size == 0`` invariant holds.
++        # Put every group's block size into the scheduler's coordinate space.
++        #
++        # This connector indexes ``block_ids`` with GLOBAL token positions --
++        # ``starts // block_size`` and ``(spans + block_size - 1) // block_size``
++        # in ChunkedTokenDatabase.prepare_values. Under DCP a rank holds a
++        # strided 1/dcp slice, so one physical block of an ATTENTION group spans
++        # ``block_size * dcp`` global tokens, while a Mamba group's state is
++        # replicated per rank and still spans ``block_size``. That is the rule
++        # ``resolve_kv_cache_block_sizes`` states and the scheduler follows, so
++        # mirroring it keeps this connector in the same coordinates as the
++        # ``block_ids`` it is handed. Applying it per group is what lifts the
++        # hybrid + DCP refusal in connector.py.
++        #
++        # The single-group path is left exactly as it was. It substitutes
++        # scheduler_block_size wholesale, which for one ATTENTION group equals
++        # ``block_size * dcp`` and so agrees with the rule anyway -- but for one
++        # MAMBA group it does not, and that substitution is deliberate: it keeps
++        # the coordinator's ``block_size % hash_block_size`` invariant holding.
++        # Generalising over it would have changed a working path to open an
++        # unrelated one.
+         groups = list(kv_cache_config.kv_cache_groups)
+-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+-            g = groups[0]
++        if len(groups) == 1:
++            if groups[0].kv_cache_spec.block_size != self.block_size:
++                g = groups[0]
++                groups = [
++                    dataclasses.replace(
++                        g,
++                        kv_cache_spec=dataclasses.replace(
++                            g.kv_cache_spec, block_size=self.block_size
++                        ),
++                    )
++                ]
++        else:
++            # dcp only, exactly as resolve_kv_cache_block_sizes does. PCP is a
++            # different sharding, is still refused in connector.py, and folding
++            # it in here would be a scale nothing else agrees with.
++            dcp = vllm_config.parallel_config.decode_context_parallel_size
+             groups = [
+-                dataclasses.replace(
++                g
++                if not isinstance(g.kv_cache_spec, AttentionSpec) or dcp == 1
++                else dataclasses.replace(
+                     g,
+                     kv_cache_spec=dataclasses.replace(
+-                        g.kv_cache_spec, block_size=self.block_size
++                        g.kv_cache_spec,
++                        block_size=g.kv_cache_spec.block_size * dcp,
+                     ),
+                 )
++                for g in groups
+             ]
+         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+         spec_cfg = getattr(vllm_config, "speculative_config", None)
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index f84e3c355b..3b9ead7f7e 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -2566,8 +2566,18 @@ class EngineArgs:
+         # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces
+         # throughput, see PR #17885 for more details.
+         # So here we do an extra device name check to prevent such regression.
+-        if device_memory >= 70 * GiB_bytes and "a100" not in device_name:
+-            # For GPUs like H100 and MI300x, use larger default values.
++        if device_memory >= 160 * GiB_bytes:
++            # for GPUs like B200/B300 with >= 160GB memory, use the largest defaults
++            default_max_num_batched_tokens = {
++                UsageContext.LLM_CLASS: 16384,
++                UsageContext.OPENAI_API_SERVER: 16384,
++            }
++            default_max_num_seqs = {
++                UsageContext.LLM_CLASS: 1024,
++                UsageContext.OPENAI_API_SERVER: 1024,
++            }
++        elif device_memory >= 70 * GiB_bytes and "a100" not in device_name:
++            # For GPUs like H100 and H200, use larger offline defaults.
+             default_max_num_batched_tokens = {
+                 UsageContext.LLM_CLASS: 16384,
+                 UsageContext.OPENAI_API_SERVER: 8192,
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index eda0f5a3ba..13b8133172 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     FunctionDefinition,
+     OpenAIBaseModel,
+     PerRequestTimingMetrics,
++    StopParam,
+     StreamOptions,
+     ToolCall,
+     UsageInfo,
+@@ -228,7 +229,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     presence_penalty: float | None = 0.0
+     response_format: AnyResponseFormat | None = None
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+-    stop: str | list[str] | None = []
++    stop: StopParam = []
+     stream: bool | None = False
+     stream_options: StreamOptions | None = None
+     temperature: float | None = None
+@@ -1077,7 +1078,7 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
+     presence_penalty: float | None = 0.0
+     response_format: Any | None = None
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+-    stop: str | list[str] | None = Field(default_factory=list)
++    stop: StopParam = Field(default_factory=list)
+     temperature: float | None = None
+     top_p: float | None = None
+     user: str | None = None
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index 516a2c371f..54de327c64 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     AnyResponseFormat,
+     OpenAIBaseModel,
+     PerRequestTimingMetrics,
++    StopParam,
+     StreamOptions,
+     UsageInfo,
+     structured_outputs_from_response_format,
+@@ -61,7 +62,7 @@ class CompletionRequest(OpenAIBaseModel):
+     n: int = 1
+     presence_penalty: float | None = 0.0
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+-    stop: str | list[str] | None = []
++    stop: StopParam = []
+     stream: bool | None = False
+     stream_options: StreamOptions | None = None
+     suffix: str | None = None
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 805c639d7d..4d07c29408 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -6,7 +6,7 @@
+ import json
+ import time
+ from http import HTTPStatus
+-from typing import Any, ClassVar, Literal, TypeAlias
++from typing import Annotated, Any, ClassVar, Literal, TypeAlias
+ 
+ import regex as re
+ from pydantic import (
+@@ -17,6 +17,7 @@ from pydantic import (
+     model_validator,
+ )
+ 
++import vllm.envs as envs
+ from vllm.config.utils import replace
+ from vllm.entrypoints.chat_utils import make_tool_call_id
+ from vllm.exceptions import VLLMServerError, VLLMValidationError
+@@ -27,6 +28,10 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
+ 
+ logger = init_logger(__name__)
+ 
++StopParam: TypeAlias = (
++    str | Annotated[list[str], Field(max_length=envs.VLLM_MAX_STOP_STRINGS)] | None
++)
++
+ 
+ class OpenAIBaseModel(BaseModel):
+     # OpenAI API does allow extra fields
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index ec8d25d10a..7ad9f57116 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -60,7 +60,7 @@ from vllm.entrypoints.chat_utils import (
+     ChatCompletionMessageParam,
+     ChatTemplateContentFormatOption,
+ )
+-from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
++from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, StopParam
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
+@@ -281,7 +281,7 @@ class ResponsesRequest(OpenAIBaseModel):
+ 
+     repetition_penalty: float | None = None
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+-    stop: str | list[str] | None = []
++    stop: StopParam = []
+     ignore_eos: bool = False
+     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+         default=None,
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1b941db970..819c6d30cd 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -108,6 +108,9 @@ if TYPE_CHECKING:
+     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+     VLLM_MAX_N_SEQUENCES: int = 16384
+     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
++    VLLM_MAX_STOP_STRINGS: int = 4
++    VLLM_MAX_NUM_BAD_WORDS: int = 128
++    VLLM_MAX_BAD_WORDS_TOTAL_TOKENS: int = 1024
+     VLLM_PLUGINS: list[str] | None = None
+     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
+     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
+@@ -1114,6 +1117,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_MAX_COMPLETION_PROMPTS": lambda: int(
+         os.environ.get("VLLM_MAX_COMPLETION_PROMPTS", "1024")
+     ),
++    # Maximum number of stop strings allowed in a single request.
++    "VLLM_MAX_STOP_STRINGS": lambda: int(os.environ.get("VLLM_MAX_STOP_STRINGS", "4")),
++    # Maximum number of bad-word token sequences generated per request.
++    "VLLM_MAX_NUM_BAD_WORDS": lambda: int(
++        os.environ.get("VLLM_MAX_NUM_BAD_WORDS", "128")
++    ),
++    # Maximum total number of bad-word tokens (summed across all bad words)
++    # allowed per request. Bounds the per-request GPU buffer width.
++    "VLLM_MAX_BAD_WORDS_TOTAL_TOKENS": lambda: int(
++        os.environ.get("VLLM_MAX_BAD_WORDS_TOTAL_TOKENS", "1024")
++    ),
+     # a list of plugin names to load, separated by commas.
+     # if this is not set, it means all plugins will be loaded
+     # if this is set to an empty string, no plugins will be loaded
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index 90e983653e..9915255a84 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -426,6 +426,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
+     PlatformEnum.XPU: [
+         XPUFp8BlockScaledMMKernel,
+         TritonFp8BlockScaledMMKernel,
++        BlockWiseTorchFP8ScaledMMLinearKernel,
+     ],
+ }
+ 
+diff --git a/vllm/model_executor/kernels/linear/zentorch_utils.py b/vllm/model_executor/kernels/linear/zentorch_utils.py
+index 310aed579e..17ab28f422 100644
+--- a/vllm/model_executor/kernels/linear/zentorch_utils.py
++++ b/vllm/model_executor/kernels/linear/zentorch_utils.py
+@@ -4,11 +4,32 @@
+ 
+ from __future__ import annotations
+ 
++import logging
++from typing import TYPE_CHECKING
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+ 
+-__all__ = ["has_zentorch_op"]
++if TYPE_CHECKING:
++    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
++
++__all__ = [
++    "has_zentorch_op",
++    "is_zentorch_moe_config_supported",
++    "is_zentorch_moe_supported",
++    "_ZENTORCH_MOE_ACTIVATIONS",
++]
++
++
++_ZENTORCH_MOE_ACTIVATIONS = frozenset({"gelu", "gelu_tanh", "silu", "swigluoai"})
++
++
++def _moe_activation_to_str(activation: object) -> str:
++    """Normalize activation to a lowercase string (enum-safe)."""
++    if hasattr(activation, "value"):
++        return str(activation.value).lower()
++    return str(activation).lower()
+ 
+ 
+ def has_zentorch_op(op_names: list[str]) -> bool:
+@@ -21,3 +42,44 @@ def has_zentorch_op(op_names: list[str]) -> bool:
+     if ns is None:
+         return False
+     return all(hasattr(ns, op_name) for op_name in op_names)
++
++
++def is_zentorch_moe_config_supported(moe_config: FusedMoEConfig) -> bool:
++    if not has_zentorch_op(["zentorch_fused_moe"]):
++        return False
++    if not moe_config.is_act_and_mul:
++        return False
++    act = _moe_activation_to_str(moe_config.activation)
++    return act in _ZENTORCH_MOE_ACTIVATIONS
++
++
++def is_zentorch_moe_supported(layer: torch.nn.Module) -> bool:
++    if not has_zentorch_op(["zentorch_fused_moe"]):
++        logging.debug(
++            "Skipping zentorch fused-MoE: not a Zen CPU or "
++            "zentorch not loaded; using default MoE."
++        )
++        return False
++    moe_config = getattr(layer, "moe_config", None)
++    if moe_config is not None and not moe_config.is_act_and_mul:
++        logging.debug(
++            "Skipping zentorch fused-MoE: layer is not a gated "
++            "(act-and-mul, e.g. SwiGLU) MLP, the only structure supported."
++        )
++        return False
++    activation = getattr(layer, "activation", None)
++    if activation is None:
++        logging.debug(
++            "Skipping zentorch fused-MoE: layer has no 'activation' "
++            "attribute, so the activation can't be verified."
++        )
++        return False
++    act = str(getattr(activation, "value", activation)).lower()
++    if act not in _ZENTORCH_MOE_ACTIVATIONS:
++        logging.debug(
++            "Skipping zentorch fused-MoE: activation %r unsupported (supported: %s).",
++            act,
++            _ZENTORCH_MOE_ACTIVATIONS,
++        )
++        return False
++    return True
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index b21f967732..0b59956543 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1705,11 +1705,7 @@ def align_mla_chunked_context_workspace_size(
+             parallel_config.decode_context_parallel_size
+             * parallel_config.cp_kv_cache_interleave_size,
+         )
+-    workspace_size = max(
+-        workspace_size,
+-        vllm_config.scheduler_config.max_num_seqs * alignment,
+-    )
+-    return round_up(workspace_size, alignment)
++    return round_up(max(workspace_size, alignment), alignment)
+ 
+ 
+ def build_mla_chunked_context_metadata(
+@@ -2574,7 +2570,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+                 # FP8 path: gather cache without dequantization
+                 ops.cp_gather_cache(
+                     src_cache=kv_c_and_k_pe_cache,
+-                    dst=workspace,
++                    dst=workspace[:toks],
+                     block_table=block_table,
+                     cu_seq_lens=chunk.cu_seq_lens,
+                     batch_size=chunk.num_requests,
+@@ -2683,7 +2679,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
+             else:
+                 ops.cp_gather_cache(
+                     src_cache=kv_c_and_k_pe_cache,
+-                    dst=workspace,
++                    dst=workspace[:toks],
+                     block_table=block_table,
+                     cu_seq_lens=padded_local_cu_seq_lens,
+                     batch_size=chunk.num_requests,
+diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+index 132bb5f920..a619b74035 100644
+--- a/vllm/model_executor/layers/attention/sparse_mla_attention.py
++++ b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+@@ -196,10 +196,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
+             64 * 1024,
+             scheduler_config.max_num_seqs * topk_tokens,
+         )
+-        workspace_size = max(
+-            workspace_size,
+-            scheduler_config.max_num_seqs * cache_config.block_size,
+-        )
++        workspace_size = max(workspace_size, cache_config.block_size)
+         if vllm_config.parallel_config.decode_context_parallel_size > 1:
+             return align_mla_chunked_context_workspace_size(vllm_config, workspace_size)
+         return workspace_size
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index 054240271f..456d6c5793 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -1311,6 +1311,13 @@ class FusedMoEConfig:
+     # Only honored on the non-reduced (late-AR) TP path. Default False.
+     skip_final_all_reduce: bool = False
+ 
++    # When True, experts that can stop after GEMM2 are allowed to hand back an
++    # UnfinalizedMoEOutput instead of finalized states, leaving the top-k
++    # reduction to fuse into the consumer. Set by layers that have such a
++    # consumer; read through `use_deferred_moe_finalize`, which applies the
++    # guards. Kernels without the capability ignore it. Default False.
++    defer_moe_finalize: bool = False
++
+     # SwiGLU clamp limit. When set, backends that do not implement the clamp
+     # are filtered out by `FusedMoEExperts.is_supported_config` so the oracle
+     # cannot silently select one and drop the clamp.
+@@ -1428,6 +1435,18 @@ class FusedMoEConfig:
+     def use_ep(self):
+         return self.moe_parallel_config.use_ep
+ 
++    @property
++    def use_deferred_moe_finalize(self) -> bool:
++        """Whether experts may return an unfinalized output on this deployment.
++
++        Evaluated on read rather than in ``__post_init__`` because
++        ``defer_moe_finalize`` is set after construction, like
++        ``skip_final_all_reduce``.
++        """
++        # Without TP there is no all-reduce for the top-k reduction to fuse
++        # into, so the deferred form buys nothing.
++        return self.defer_moe_finalize and self.tp_size > 1
++
+     @property
+     def use_deepep_ht_kernels(self):
+         return self.moe_parallel_config.use_deepep_ht_kernels
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+index 0353d81b3d..846dc9f372 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cpu_moe.py
+@@ -20,6 +20,10 @@ from vllm._custom_ops import (
+     cpu_prepack_moe_weight_int8,
+     fused_experts_cpu,
+ )
++from vllm.model_executor.kernels.linear.zentorch_utils import (
++    is_zentorch_moe_config_supported,
++    is_zentorch_moe_supported,
++)
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -214,6 +218,7 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         self.renormalize = False
+         self.scoring_func = "softmax"
+         self.custom_routing_function: Callable | None = None
++        self._use_zentorch = False
+ 
+     @property
+     def expects_unquantized_inputs(self) -> bool:
+@@ -240,6 +245,8 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+         return cpu_cls._supports_grouped_gemm(moe_config)
+ 
+@@ -287,11 +294,14 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+         return True
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        self._pad_moe_intermediate(layer)
+         self.use_grouped_topk = layer.use_grouped_topk
+         self.renormalize = layer.renormalize
+         self.scoring_func = layer.scoring_func
+         self.custom_routing_function = layer.custom_routing_function
++        self._use_zentorch = is_zentorch_moe_supported(layer)
++        if self._use_zentorch:
++            return
++        self._pad_moe_intermediate(layer)
+         replace_parameter(
+             layer, "w13_weight", cpu_prepack_moe_weight(layer.w13_weight, self.isa)
+         )
+@@ -388,6 +398,22 @@ class CPUUnquantizedExperts(mk.FusedMoEExpertsMonolithic):
+             )
+             hidden_states.mul_(topk_weights.to(hidden_states.dtype))
+ 
++        if self._use_zentorch:
++            output = torch.empty_like(hidden_states)
++            torch.ops.zentorch.zentorch_fused_moe(
++                output,
++                hidden_states,
++                w1,
++                w2,
++                self.w1_bias,
++                self.w2_bias,
++                topk_weights,
++                topk_ids,
++                apply_router_weight_on_input,
++                str(activation.value).lower(),
++            )
++            return output
++
+         return cpu_fused_moe(
+             hidden_states,
+             w1,
+@@ -430,6 +456,8 @@ class X86CPUUnquantizedExperts(CPUUnquantizedExperts):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         if moe_config.in_dtype != torch.bfloat16:
+             return False, "kernel requires bfloat16 activations"
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+@@ -464,6 +492,8 @@ class ArmCPUUnquantizedExperts(CPUUnquantizedExperts):
+         )
+         if not supported:
+             return supported, reason
++        if is_zentorch_moe_config_supported(moe_config):
++            return True, None
+         if moe_config.in_dtype != torch.bfloat16:
+             return False, "kernel requires bfloat16 activations"
+         cpu_cls = cast(type[CPUUnquantizedExperts], cls)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+index ca23e12724..97e3021afc 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+@@ -45,6 +45,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
+ 
+     _ACTIVATION_MAP: dict[MoEActivation, str] = {
+         MoEActivation.SILU: "silu",
++        MoEActivation.GELU_TANH: "gelu_tanh",
+         MoEActivation.RELU2_NO_MUL: "relu2",
+     }
+ 
+@@ -188,7 +189,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+-        return activation in (MoEActivation.SILU, MoEActivation.RELU2_NO_MUL)
++        return activation in (
++            MoEActivation.SILU,
++            MoEActivation.GELU_TANH,
++            MoEActivation.RELU2_NO_MUL,
++        )
+ 
+     @staticmethod
+     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+diff --git a/vllm/model_executor/layers/fused_moe/experts/trtllm_bf16_moe.py b/vllm/model_executor/layers/fused_moe/experts/trtllm_bf16_moe.py
+index 559180bd72..ae6dc11beb 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/trtllm_bf16_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/trtllm_bf16_moe.py
+@@ -11,6 +11,9 @@ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+     RoutingMethodType,
+ )
++from vllm.model_executor.layers.fused_moe.moe_output import (
++    UnfinalizedMoEOutput,
++)
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceNoOP,
+ )
+@@ -266,13 +269,18 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
+         e_score_correction_bias: torch.Tensor | None = None,
+         routed_scaling_factor: float | None = None,
+         topk_group: int | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | UnfinalizedMoEOutput:
+         import flashinfer
+ 
+         assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
+ 
++        num_tokens = hidden_states.shape[0]
++        # The runner divides by the token count on the host, so an idle rank's
++        # dummy 0-token forward has to keep the finalized (empty) form.
++        defer = self.moe_config.use_deferred_moe_finalize and num_tokens > 0
++
+         routing_replay_out = self._maybe_make_routing_replay_buffer(
+-            num_tokens=hidden_states.shape[0],
++            num_tokens=num_tokens,
+             device=hidden_states.device,
+         )
+         out = flashinfer.fused_moe.trtllm_bf16_moe(
+@@ -293,8 +301,19 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
+             activation_type=activation_to_flashinfer_int(activation),
+             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+             routing_replay_out=routing_replay_out,
++            do_finalize=not defer,
+         )
+-        self._maybe_dispatch_routing_replay(
+-            routing_replay_out, num_tokens=hidden_states.shape[0]
+-        )
+-        return out
++        self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
++        if defer:
++            # flashinfer returns a flat permute map; the protocol wants
++            # [num_tokens, top_k] so consumers can read top_k from its shape.
++            return UnfinalizedMoEOutput(
++                gemm2_permuted=out[0],
++                expert_weights=out[1],
++                expanded_idx_to_permuted_idx=out[2]
++                .to(torch.int32)
++                .view(num_tokens, self.topk),
++            )
++        # do_finalize=True yields the finalized states (a bare tensor on some
++        # FlashInfer versions, a single-element list on others).
++        return out[0] if isinstance(out, (list, tuple)) else out
+diff --git a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+index a5555dc132..29ccd5770e 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py
+@@ -13,6 +13,9 @@ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEQuantConfig,
+     RoutingMethodType,
+ )
++from vllm.model_executor.layers.fused_moe.moe_output import (
++    UnfinalizedMoEOutput,
++)
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceNoOP,
+ )
+@@ -518,7 +521,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
+         e_score_correction_bias: torch.Tensor | None = None,
+         routed_scaling_factor: float | None = None,
+         topk_group: int | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | UnfinalizedMoEOutput:
+         import flashinfer
+ 
+         assert self._supports_activation(activation)
+@@ -543,8 +546,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
+ 
+         output1_scale_gate_scalar = self.quant_config.g1_alphas
+ 
++        num_tokens = hidden_states.shape[0]
++        # The runner divides by the token count on the host, so an idle rank's
++        # dummy 0-token forward has to keep the finalized (empty) form.
++        defer = self.moe_config.use_deferred_moe_finalize and num_tokens > 0
++
+         routing_replay_out = self._maybe_make_routing_replay_buffer(
+-            num_tokens=hidden_states.shape[0],
++            num_tokens=num_tokens,
+             device=hidden_states.device,
+         )
+         # Invoke kernel.
+@@ -578,13 +586,21 @@ class TrtLlmNvFp4ExpertsMonolithic(
+             local_num_experts=self.local_num_experts,
+             routed_scaling_factor=routed_scaling_factor,
+             routing_method_type=self.routing_method_type,
+-            do_finalize=True,
++            do_finalize=not defer,
+             activation_type=activation_to_flashinfer_int(activation),
+             per_token_scale=per_token_scale,
+             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+             routing_replay_out=routing_replay_out,
+-        )[0]
+-        self._maybe_dispatch_routing_replay(
+-            routing_replay_out, num_tokens=hidden_states.shape[0]
+         )
+-        return result
++        self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
++        if defer:
++            # flashinfer returns a flat permute map; the protocol wants
++            # [num_tokens, top_k] so consumers can read top_k from its shape.
++            return UnfinalizedMoEOutput(
++                gemm2_permuted=result[0],
++                expert_weights=result[1],
++                expanded_idx_to_permuted_idx=result[2]
++                .to(torch.int32)
++                .view(num_tokens, self.topk),
++            )
++        return result[0]
+diff --git a/vllm/model_executor/layers/fused_moe/moe_output.py b/vllm/model_executor/layers/fused_moe/moe_output.py
+new file mode 100644
+index 0000000000..d3fc1a75fb
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/moe_output.py
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Output contract between a MoE layer and a consumer that fuses its tail."""
++
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass
++class UnfinalizedMoEOutput:
++    """Unfinalized output of a monolithic MoE kernel.
++
++    Kernels that can stop after GEMM2 (the TRTLLM-Gen ``do_finalize=False`` path)
++    hand back their permuted, unweighted output plus the routing weights and the
++    permute map, so that the top-k reduction can be fused with whatever follows
++    -- the shared-expert add and the tensor-parallel all-reduce -- instead of
++    running as its own kernel.
++
++    The buffers are consumed as-is by the fused kernels, which index
++    ``gemm2_permuted`` by row: it must be densely packed at ``hidden_dim``, and
++    its row count (an autotuner-dependent padded value) is never referenced.
++    """
++
++    # [num_permuted_rows, hidden_dim] permuted, unweighted GEMM2 output.
++    gemm2_permuted: torch.Tensor
++    # [num_tokens, top_k] routing weights, in the activation dtype -- consumers
++    # index them as such, and a buffer typed wider than its contents reads as
++    # garbage. These already carry routed_scaling_factor for routing methods that
++    # fold it in.
++    expert_weights: torch.Tensor
++    # [num_tokens, top_k] int32 permute map; -1 = expert not local to this rank.
++    expanded_idx_to_permuted_idx: torch.Tensor
++
++
++@dataclass
++class MoEOutput:
++    """A MoE layer's output with its final reduction still open.
++
++    Returned by layers whose MoE runs un-reduced (``reduce_results=False``) so
++    that the consumer -- typically the next layer's RMSNorm -- can fuse the
++    tensor-parallel all-reduce into itself instead of paying for a standalone
++    one. Keeping the shared-expert output and the routed scale separate leaves
++    that reduction the consumer's to schedule; when the routed output is still
++    unfinalized, the top-k reduction is open too and can fold into the same
++    kernel.
++
++    Producers only leave the routed output unfinalized when a fused consumer can
++    actually take that form -- the token ceiling and topology support are theirs
++    to check -- so an ``UnfinalizedMoEOutput`` here means the fused path applies,
++    and a consumer need not re-derive that.
++    """
++
++    # Un-reduced routed output, either finalized or not.
++    routed: torch.Tensor | UnfinalizedMoEOutput
++    # Un-reduced shared-expert output, folded in by whoever finalizes.
++    shared_output: torch.Tensor | None = None
++    # Applied to the routed sum before the shared add. Already folded into the
++    # routing weights for methods that do so, in which case this is 1.0.
++    routed_scaling_factor: float = 1.0
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 3722528c21..edb54bcf40 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -651,6 +651,12 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
+         # which would inflate weights and OOM.
+         intermediate_size = round_up(intermediate_size, 128)
+         hidden_size = round_up(hidden_size, 128)
++    elif (
++        backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and activation == MoEActivation.SILU
++    ):
++        # AITER's A16W4 SiLU kernel handles native dimensions aligned to 128.
++        intermediate_size = round_up(intermediate_size, 128)
++        hidden_size = round_up(hidden_size, 128)
+     elif backend == Mxfp4MoeBackend.EMULATION:
+         # Emulation has no kernel tile; it only needs OCP MX block alignment so the
+         # per-block scale buffers (`dim // OCP_MX_BLOCK_SIZE`) aren't floor-truncated
+diff --git a/vllm/model_executor/models/keye.py b/vllm/model_executor/models/keye.py
+index aa5ca77bff..fd8cf4cbda 100644
+--- a/vllm/model_executor/models/keye.py
++++ b/vllm/model_executor/models/keye.py
+@@ -1466,6 +1466,14 @@ class BaseKeyeModule(nn.Module, SupportsMultiModal):
+             tower_model="visual.",
+         )
+ 
++    def get_num_mm_encoder_tokens(self, num_image_tokens: int) -> int:
++        merge_size = self.config.vision_config.spatial_merge_size
++        return num_image_tokens * merge_size**2
++
++    def get_num_mm_connector_tokens(self, num_vision_tokens: int) -> int:
++        merge_size = self.config.vision_config.spatial_merge_size
++        return num_vision_tokens // merge_size**2
++
+ 
+ @MULTIMODAL_REGISTRY.register_processor(
+     KeyeMultiModalProcessor,
+diff --git a/vllm/model_executor/models/transformers/base.py b/vllm/model_executor/models/transformers/base.py
+index cb5d9dde59..1d0bbb71a6 100644
+--- a/vllm/model_executor/models/transformers/base.py
++++ b/vllm/model_executor/models/transformers/base.py
+@@ -279,14 +279,8 @@ class Base(
+         )(cls)
+ 
+     def _decorate_for_torch_compile(self):
+-        """
+-        Decorate the model's decoder class to indicate to vLLM that it supports torch
+-        compile if `can_enable_torch_compile` is True.
+-
+-        Args:
+-            kwargs: The kwargs to create the model, which are needed to get the decoder
+-                class.
+-        """
++        """Decorate the model's decoder class to indicate to vLLM that it
++        supports torch compile if `can_enable_torch_compile` is True."""
+         self._decorate_cls_for_torch_compile(
+             cls=self._pre_trained_model_classes.decoder,
+             # Applied to a PreTrainedModel so the batch dimension will exist
+diff --git a/vllm/model_executor/warmup/cutedsl_warmup.py b/vllm/model_executor/warmup/cutedsl_warmup.py
+index d2b8142f3b..3abd486e3c 100644
+--- a/vllm/model_executor/warmup/cutedsl_warmup.py
++++ b/vllm/model_executor/warmup/cutedsl_warmup.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Run registered CuTeDSL warmup compile units."""
++"""Deprecated compatibility registry for legacy CuTeDSL warmups."""
+ 
+ # TODO(roberto): Remove this compatibility registry after registered CuTeDSL
+ # warmups are migrated to the shared JIT warmup infrastructure.
+diff --git a/vllm/model_executor/warmup/fa4_cutedsl_warmup.py b/vllm/model_executor/warmup/fa4_cutedsl_warmup.py
+index 7f1042338e..5470da5034 100644
+--- a/vllm/model_executor/warmup/fa4_cutedsl_warmup.py
++++ b/vllm/model_executor/warmup/fa4_cutedsl_warmup.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Warm up FA4 CuTeDSL MLA prefill compile keys."""
++"""Warm up FA4 CuTeDSL kernels."""
+ 
+ from __future__ import annotations
+ 
+@@ -12,7 +12,7 @@ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu_worker import Worker
+ 
+ 
+-def fa4_cutedsl_warmup(worker: Worker) -> None:
++def _warm_fa4_mla_prefill(worker: Worker) -> None:
+     runner = worker.model_runner
+     if runner.is_pooling_model:
+         return
+@@ -32,3 +32,22 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
+     from vllm.v1.attention.backends.mla.prefill import flash_attn
+ 
+     flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
++
++
++def _warm_inkling_fa4_rel_attention(worker: Worker) -> None:
++    from vllm.models.inkling.configs import InklingMMConfig, InklingModelConfig
++    from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
++        INKLING_FA4_REL_ATTENTION_KERNEL,
++    )
++
++    vllm_config = worker.vllm_config
++    hf_config = vllm_config.model_config.hf_config
++    if not isinstance(hf_config, (InklingMMConfig, InklingModelConfig)):
++        return
++
++    INKLING_FA4_REL_ATTENTION_KERNEL.warmup(vllm_config)
++
++
++def fa4_cutedsl_warmup(worker: Worker) -> None:
++    _warm_fa4_mla_prefill(worker)
++    _warm_inkling_fa4_rel_attention(worker)
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index c5411b5efb..d8c5140950 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -28,13 +28,29 @@ CompileKeyT = TypeVar("CompileKeyT")
+ 
+ @dataclass(frozen=True)
+ class WarmupIntRange:
++    """Expand integers with range semantics or a custom monotonic progression."""
++
+     start: int
+     stop: int
+     step: int = 1
++    advance: Callable[[int], int] | None = None
+ 
+ 
+ WarmupValues = Any
+ CompileKeyDispatchFn = Callable[..., CompileKeyT]
++WarmupPredicateFn = Callable[..., bool]
++_LocalExprs = tuple[tuple[str, ast.AST], ...]
++
++
++def _eval_local_exprs(
++    local_exprs: _LocalExprs,
++    values: Mapping[str, Any],
++    globals_: Mapping[str, Any],
++) -> dict[str, Any]:
++    evaluated_values = dict(values)
++    for name, expr in local_exprs:
++        evaluated_values[name] = _eval_dispatch_expr(expr, evaluated_values, globals_)
++    return evaluated_values
+ 
+ 
+ @dataclass(frozen=True)
+@@ -46,7 +62,20 @@ class _WarmupInputRows:
+ 
+ def _expand_warmup_values(values: WarmupValues) -> tuple[Any, ...]:
+     if isinstance(values, WarmupIntRange):
+-        return tuple(range(values.start, values.stop, values.step))
++        if values.advance is None:
++            return tuple(range(values.start, values.stop, values.step))
++        if values.step != 1:
++            raise ValueError("WarmupIntRange cannot set both step and advance")
++
++        expanded: list[int] = []
++        value = values.start
++        while value < values.stop:
++            expanded.append(value)
++            next_value = values.advance(value)
++            if next_value <= value:
++                raise ValueError("WarmupIntRange.advance must return a greater value")
++            value = next_value
++        return tuple(expanded)
+     if isinstance(values, (list, tuple)):
+         return tuple(values)
+     return (values,)
+@@ -75,20 +104,6 @@ def zip_inputs(*rows: Mapping[str, WarmupValues]) -> _WarmupInputRows:
+     return _WarmupInputRows(rows=tuple(input_rows))
+ 
+ 
+-def _expand_warmup_value_grid(
+-    values: Mapping[str, WarmupValues],
+-    input_names: frozenset[str],
+-) -> tuple[dict[str, Any], ...]:
+-    names = tuple(name for name in values if name in input_names)
+-    if not names:
+-        return ({},)
+-
+-    expanded_values = tuple(_expand_warmup_values(values[name]) for name in names)
+-    return tuple(
+-        dict(zip(names, value_set)) for value_set in itertools.product(*expanded_values)
+-    )
+-
+-
+ def _expand_warmup_input_rows(
+     rows: tuple[Mapping[str, WarmupValues], ...],
+     input_names: frozenset[str],
+@@ -117,7 +132,7 @@ def _merge_warmup_kwargs(parts: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+ 
+ @dataclass(frozen=True)
+ class _CompileKeyDispatchTrace:
+-    local_exprs: tuple[tuple[str, ast.AST], ...]
++    local_exprs: _LocalExprs
+     field_exprs: tuple[tuple[str, ast.AST], ...]
+     globals: Mapping[str, Any]
+     input_names: frozenset[str]
+@@ -128,11 +143,9 @@ class _CompileKeyDispatchTrace:
+         compile_key_type: type[CompileKeyT],
+         kwargs: Mapping[str, Any],
+     ) -> CompileKeyT:
+-        dispatch_values = {**self.defaults, **kwargs}
+-        for name, expr in self.local_exprs:
+-            dispatch_values[name] = _eval_dispatch_expr(
+-                expr, dispatch_values, self.globals
+-            )
++        dispatch_values = _eval_local_exprs(
++            self.local_exprs, {**self.defaults, **kwargs}, self.globals
++        )
+         return compile_key_type(
+             **{
+                 field: _eval_dispatch_expr(expr, dispatch_values, self.globals)
+@@ -141,6 +154,23 @@ class _CompileKeyDispatchTrace:
+         )
+ 
+ 
++@dataclass(frozen=True)
++class _WarmupPredicateTrace:
++    local_exprs: _LocalExprs
++    return_expr: ast.AST
++    globals: Mapping[str, Any]
++    input_names: frozenset[str]
++    defaults: Mapping[str, Any]
++
++    def matches(self, kwargs: Mapping[str, Any]) -> bool:
++        dispatch_values = _eval_local_exprs(
++            self.local_exprs, {**self.defaults, **kwargs}, self.globals
++        )
++        return bool(
++            _eval_dispatch_expr(self.return_expr, dispatch_values, self.globals)
++        )
++
++
+ _BIN_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
+     ast.Add: operator.add,
+     ast.Sub: operator.sub,
+@@ -317,10 +347,10 @@ def _collect_input_names(
+     }
+ 
+ 
+-def _collect_dispatch_body(
+-    fn: CompileKeyDispatchFn[Any],
++def _collect_expression_body(
++    fn: Callable[..., Any],
+     function_def: ast.FunctionDef,
+-) -> tuple[list[tuple[str, ast.AST]], ast.Call]:
++) -> tuple[list[tuple[str, ast.AST]], ast.AST]:
+     local_exprs: list[tuple[str, ast.AST]] = []
+     for statement in function_def.body:
+         if (
+@@ -335,7 +365,8 @@ def _collect_dispatch_body(
+                 statement.targets[0], ast.Name
+             ):
+                 raise _dispatch_expr_error(
+-                    statement, "Dispatch assignments must target one local name"
++                    statement,
++                    "Traced warmup helper assignments must target one local name",
+                 )
+             local_exprs.append((statement.targets[0].id, statement.value))
+             continue
+@@ -343,29 +374,45 @@ def _collect_dispatch_body(
+         if isinstance(statement, ast.AnnAssign):
+             if statement.value is None:
+                 raise _dispatch_expr_error(
+-                    statement, "Dispatch annotations must assign a value"
++                    statement, "Traced warmup helper annotations must assign a value"
+                 )
+             if not isinstance(statement.target, ast.Name):
+                 raise _dispatch_expr_error(
+-                    statement, "Dispatch assignments must target one local name"
++                    statement,
++                    "Traced warmup helper assignments must target one local name",
+                 )
+             local_exprs.append((statement.target.id, statement.value))
+             continue
+ 
+-        if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Call):
++        if isinstance(statement, ast.Return) and statement.value is not None:
+             return local_exprs, statement.value
+ 
+         if isinstance(statement, ast.Return):
+             raise _dispatch_expr_error(
+-                statement, "Dispatch must return one CompileKey(...) call"
++                statement, "Traced warmup helper must return an expression"
+             )
+ 
+         raise _dispatch_expr_error(
+             statement,
+-            "Dispatch may only contain local assignments before CompileKey return",
++            "Traced warmup helper may only contain local assignments before return",
+         )
+ 
+-    raise ValueError(f"Expected {fn.__name__} to return one CompileKey(...) call")
++    raise ValueError(f"Expected {fn.__name__} to return an expression")
++
++
++def _function_trace_inputs(
++    fn: Callable[..., Any],
++) -> tuple[dict[str, Any], set[str]]:
++    signature = inspect.signature(fn)
++    defaults = {
++        name: parameter.default
++        for name, parameter in signature.parameters.items()
++        if parameter.default is not inspect.Parameter.empty
++    }
++    bound_self = getattr(fn, "__self__", None)
++    if bound_self is not None:
++        defaults["self"] = bound_self
++    return defaults, set(signature.parameters)
+ 
+ 
+ def _trace_compile_key_dispatch(
+@@ -375,21 +422,20 @@ def _trace_compile_key_dispatch(
+     globals_ = source_fn.__globals__
+     function_def = get_function_source_node(fn)
+ 
+-    local_exprs, return_call = _collect_dispatch_body(fn, function_def)
++    local_exprs, return_expr = _collect_expression_body(fn, function_def)
++    if not isinstance(return_expr, ast.Call):
++        raise _dispatch_expr_error(
++            return_expr,
++            "Dispatch must return one CompileKey(...) call",
++        )
+ 
+     field_exprs: list[tuple[str, ast.AST]] = []
+-    signature = inspect.signature(fn)
+-    defaults = {
+-        name: parameter.default
+-        for name, parameter in signature.parameters.items()
+-        if parameter.default is not inspect.Parameter.empty
+-    }
+-    candidate_names = set(signature.parameters)
++    defaults, candidate_names = _function_trace_inputs(fn)
+     input_names: set[str] = set()
+     local_names = {name for name, _ in local_exprs}
+     for _, expr in local_exprs:
+         input_names.update(_collect_input_names(expr, candidate_names))
+-    for keyword in return_call.keywords:
++    for keyword in return_expr.keywords:
+         if keyword.arg is None:
+             raise ValueError(f"{fn.__name__} cannot use **kwargs in CompileKey")
+         field_exprs.append((keyword.arg, keyword.value))
+@@ -406,6 +452,30 @@ def _trace_compile_key_dispatch(
+     )
+ 
+ 
++def _trace_warmup_predicate(
++    fn: WarmupPredicateFn,
++) -> _WarmupPredicateTrace:
++    source_fn = getattr(fn, "__func__", fn)
++    globals_ = source_fn.__globals__
++    function_def = get_function_source_node(fn)
++
++    local_exprs, return_expr = _collect_expression_body(fn, function_def)
++    defaults, candidate_names = _function_trace_inputs(fn)
++    input_names: set[str] = set()
++    local_names = {name for name, _ in local_exprs}
++    for _, expr in local_exprs:
++        input_names.update(_collect_input_names(expr, candidate_names))
++    input_names.update(_collect_input_names(return_expr, candidate_names, local_names))
++
++    return _WarmupPredicateTrace(
++        tuple(local_exprs),
++        return_expr,
++        globals_,
++        frozenset(input_names),
++        defaults,
++    )
++
++
+ class VllmJitKernel(Generic[CompileKeyT], ABC):
+     """Kernel wrapper that owns dispatch, warmup keys, and compilation."""
+ 
+@@ -424,6 +494,7 @@ class VllmJitKernel(Generic[CompileKeyT], ABC):
+ 
+         def traced(
+             *input_groups: _WarmupInputRows,
++            _when: WarmupPredicateFn | None = None,
+             **kwargs: WarmupValues,
+         ) -> list[CompileKeyT]:
+             for group in input_groups:
+@@ -432,24 +503,50 @@ class VllmJitKernel(Generic[CompileKeyT], ABC):
+                         "_trace_dispatch positional arguments must be "
+                         "zip_inputs(...) groups"
+                     )
++            predicate_trace = (
++                _trace_warmup_predicate(_when) if _when is not None else None
++            )
++            input_names = compile_key_dispatch_trace.input_names
++            if predicate_trace is not None:
++                input_names = input_names | predicate_trace.input_names
+             expanded_input_groups = tuple(
+-                _expand_warmup_input_rows(
+-                    group.rows, compile_key_dispatch_trace.input_names
+-                )
++                _expand_warmup_input_rows(group.rows, input_names)
+                 for group in input_groups
+             )
+-            expanded_kwargs = _expand_warmup_value_grid(
+-                kwargs, compile_key_dispatch_trace.input_names
++            # Expand independent keyword inputs into cartesian-product axes.
++            expanded_kwarg_axes = tuple(
++                (name, _expand_warmup_values(value))
++                for name, value in kwargs.items()
++                if name in input_names
+             )
+-            dispatch_value_groups = (*expanded_input_groups, expanded_kwargs)
+-            return list(
+-                dict.fromkeys(
+-                    compile_key_dispatch_trace.compile_key(
+-                        self.CompileKey, _merge_warmup_kwargs(dispatch_values)
++            dispatch_value_axes = (
++                *expanded_input_groups,
++                *(values for _, values in expanded_kwarg_axes),
++            )
++            input_group_count = len(expanded_input_groups)
++            kwarg_names = tuple(name for name, _ in expanded_kwarg_axes)
++            compile_keys: dict[CompileKeyT, None] = {}
++            for dispatch_value_set in itertools.product(*dispatch_value_axes):
++                dispatch_values = _merge_warmup_kwargs(
++                    (
++                        *dispatch_value_set[:input_group_count],
++                        dict(
++                            zip(
++                                kwarg_names,
++                                dispatch_value_set[input_group_count:],
++                            )
++                        ),
+                     )
+-                    for dispatch_values in itertools.product(*dispatch_value_groups)
+                 )
+-            )
++                if predicate_trace is not None and not predicate_trace.matches(
++                    dispatch_values
++                ):
++                    continue
++                compile_key = compile_key_dispatch_trace.compile_key(
++                    self.CompileKey, dispatch_values
++                )
++                compile_keys[compile_key] = None
++            return list(compile_keys)
+ 
+         return traced
+ 
+diff --git a/vllm/models/deepseek_v4/amd/dspark.py b/vllm/models/deepseek_v4/amd/dspark.py
+index 4769483ff2..28056cb550 100644
+--- a/vllm/models/deepseek_v4/amd/dspark.py
++++ b/vllm/models/deepseek_v4/amd/dspark.py
+@@ -290,6 +290,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     # load_dspark_model always aliases the target's.
+     has_own_embed_tokens = False
+     has_own_lm_head = False
++    # Full-vocab draft: draft ids are target ids, no remapping needed.
++    draft_id_to_target_id = None
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 7c232fe9e5..9b38409d1f 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -372,6 +372,10 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
+ 
+ 
+ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
++    # Keep fused multi-step decode disabled until update_draft_decode_metadata()
++    # also refreshes the ROCm-specific ragged SWA indices and indptrs.
++    supports_draft_decode_metadata_update = False
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+diff --git a/vllm/models/inkling/nvidia/attention.py b/vllm/models/inkling/nvidia/attention.py
+index fc617b89ad..b18fa81f7e 100644
+--- a/vllm/models/inkling/nvidia/attention.py
++++ b/vllm/models/inkling/nvidia/attention.py
+@@ -35,11 +35,10 @@ from vllm.v1.kv_cache_interface import (
+ from ..configs import InklingModelConfig
+ from .layernorm import InklingRMSNorm
+ from .ops.fa4_rel_attention import (
++    INKLING_FA4_REL_ATTENTION_KERNEL,
+     bucket_max_seqlen_q,
+     inkling_fa4_num_splits,
+-    inkling_fa4_rel_attention,
+ )
+-from .ops.fa4_warmup import InklingFA4WarmupConfig, register_fa4_warmup
+ from .ops.qkvr_prep import fused_qkvr_prep
+ from .sconv_swa_attn import _K, _V, InklingConvState, InklingSconvMetadata
+ from .short_conv import InklingShortConv
+@@ -175,25 +174,6 @@ class InklingAttention(nn.Module, AttentionLayerBase):
+         compilation_config.static_forward_context[prefix] = self
+         self.kv_cache = torch.tensor([])  # replaced by bind_kv_cache
+ 
+-        register_fa4_warmup(
+-            InklingFA4WarmupConfig(
+-                num_heads=self.num_heads,
+-                num_kv_heads=self.num_kv_heads,
+-                head_dim=self.head_dim,
+-                rel_extent=self.rel_extent,
+-                window_size=self.window_size,
+-                is_local=self.is_local,
+-                max_kv_len=self._max_kv_len,
+-                dtype=vllm_config.model_config.dtype,
+-                kv_dtype=self.kv_cache_torch_dtype,
+-                block_size=vllm_config.cache_config.block_size,
+-                max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
+-                max_num_batched_tokens=(
+-                    vllm_config.scheduler_config.max_num_batched_tokens
+-                ),
+-            )
+-        )
+-
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return FlashAttentionBackend
+ 
+@@ -309,7 +289,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
+             num_kv_heads=self.num_kv_heads,
+             max_kv_len=self._max_kv_len,
+         )
+-        inkling_fa4_rel_attention(
++        INKLING_FA4_REL_ATTENTION_KERNEL(
+             q[:nt],
+             key_cache,
+             value_cache,
+diff --git a/vllm/models/inkling/nvidia/ops/__init__.py b/vllm/models/inkling/nvidia/ops/__init__.py
+index 2d364fc614..bb7f066ddb 100644
+--- a/vllm/models/inkling/nvidia/ops/__init__.py
++++ b/vllm/models/inkling/nvidia/ops/__init__.py
+@@ -15,11 +15,13 @@ from .sconv import fused_sconv
+ _LAZY_EXPORTS = {
+     "silu_and_mul_triton": "silu_and_mul",
+     "sink_silu_mul_epilogue": "silu_and_mul",
+-    "inkling_fa4_rel_attention": "fa4_rel_attention",
++    "INKLING_FA4_REL_ATTENTION_KERNEL": "fa4_rel_attention",
+ }
+ 
+ if TYPE_CHECKING:
+-    from .fa4_rel_attention import inkling_fa4_rel_attention  # noqa: F401
++    from .fa4_rel_attention import (  # noqa: F401
++        INKLING_FA4_REL_ATTENTION_KERNEL,
++    )
+     from .silu_and_mul import (  # noqa: F401
+         silu_and_mul_triton,
+         sink_silu_mul_epilogue,
+diff --git a/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py b/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
+index 883545e3f2..4385786135 100644
+--- a/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
++++ b/vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
+@@ -3,12 +3,23 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Callable
++from dataclasses import dataclass
+ from functools import cache
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ 
++from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.model_executor.warmup.jit_warmup import (
++    VllmJitKernel,
++    WarmupIntRange,
++    zip_inputs,
++)
+ from vllm.platforms import current_platform
++from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
+ 
+ 
+ def bucket_max_seqlen_q(max_seqlen_q: int) -> int:
+@@ -98,73 +109,328 @@ def inkling_fa4_num_splits(
+     )
+ 
+ 
+-def inkling_fa4_rel_attention(
+-    q: torch.Tensor,
+-    key_cache: torch.Tensor,
+-    value_cache: torch.Tensor,
+-    *,
+-    block_table: torch.Tensor,
+-    cache_seqlens: torch.Tensor,
+-    cu_seqlens_q: torch.Tensor,
+-    max_seqlen_q: int,
+-    softmax_scale: float,
+-    causal: bool,
+-    window_size: tuple[int, int],
+-    rel_extent: int,
+-    rel_logits: torch.Tensor,
+-    num_splits: int = 32,
+-    out: torch.Tensor | None = None,
+-) -> torch.Tensor:
+-    """Paged varlen FA4 over the bound K/V cache with the Inkling relative bias.
+-
+-    ``q`` is ``(num_tokens, num_heads, head_dim)``; ``key_cache`` / ``value_cache``
+-    are the paged caches ``(num_blocks, block_size, num_kv_heads, head_dim)``;
+-    ``block_table`` is the per-request page table and ``cache_seqlens`` the
+-    per-request KV lengths (``seqused_k``). ``rel_logits`` is
+-    ``(num_tokens, num_heads, rel_extent)``.
+-
+-    Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
+-    sheared relative-bias layout.
+-    """
+-    # cute uses (None, None) to mean "no window".
+-    cute_window = (None, None) if window_size == (-1, -1) else window_size
+-
+-    rel_logits = rel_logits.contiguous()
+-    flash_attn_varlen_func: Callable[..., Any]
+-    if _use_sheared_bias():
+-        from vllm.third_party.tml_fa4 import (
+-            flash_attn_varlen_func as tml_flash_attn_varlen_func,
++def _num_warps_bucket(num_reqs: int) -> int:
++    num_warps = min((num_reqs + 30) // 31, 32)
++    return 1 << (num_warps - 1).bit_length()
++
++
++class InklingFA4RelAttentionKernel(
++    VllmJitKernel["InklingFA4RelAttentionKernel.CompileKey"]
++):
++    @dataclass(frozen=True)
++    class CompileKey:
++        is_local: bool
++        num_heads: int
++        num_kv_heads: int
++        head_dim: int
++        rel_extent: int
++        dtype: torch.dtype
++        kv_dtype: torch.dtype
++        block_size: int
++        window_size: tuple[int, int]
++        max_seqlen_q: int
++        num_splits: int
++        num_warps_bucket: int | None
++        large_num_reqs: bool
++
++    @staticmethod
++    def kernel(
++        q: torch.Tensor,
++        key_cache: torch.Tensor,
++        value_cache: torch.Tensor,
++        *,
++        block_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        cu_seqlens_q: torch.Tensor,
++        max_seqlen_q: int,
++        softmax_scale: float,
++        causal: bool,
++        window_size: tuple[int, int],
++        rel_extent: int,
++        rel_logits: torch.Tensor,
++        num_splits: int = 32,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Paged varlen FA4 over the bound K/V cache with the Inkling relative bias.
++
++        ``q`` is ``(num_tokens, num_heads, head_dim)``; ``key_cache`` / ``value_cache``
++        are the paged caches ``(num_blocks, block_size, num_kv_heads, head_dim)``;
++        ``block_table`` is the per-request page table and ``cache_seqlens`` the
++        per-request KV lengths (``seqused_k``). ``rel_logits`` is
++        ``(num_tokens, num_heads, rel_extent)``.
++
++        Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
++        sheared relative-bias layout.
++        """
++        # cute uses (None, None) to mean "no window".
++        cute_window = (None, None) if window_size == (-1, -1) else window_size
++
++        rel_logits = rel_logits.contiguous()
++        flash_attn_varlen_func: Callable[..., Any]
++        if _use_sheared_bias():
++            from vllm.third_party.tml_fa4 import (
++                flash_attn_varlen_func as tml_flash_attn_varlen_func,
++            )
++
++            flash_attn_varlen_func = tml_flash_attn_varlen_func
++            bias_kwargs: dict[str, Any] = {"rel_bias": rel_logits}
++        else:
++            from vllm.vllm_flash_attn.cute import (
++                flash_attn_varlen_func as cute_flash_attn_varlen_func,
++            )
++
++            flash_attn_varlen_func = cute_flash_attn_varlen_func
++            bias_kwargs = {
++                "score_mod": _get_score_mod(rel_extent),
++                "aux_tensors": [rel_logits],
++            }
++
++        ret = flash_attn_varlen_func(
++            q=q,
++            k=key_cache,
++            v=value_cache,
++            cu_seqlens_q=cu_seqlens_q,
++            seqused_k=cache_seqlens,
++            max_seqlen_q=max_seqlen_q,
++            page_table=block_table,
++            softmax_scale=softmax_scale,
++            causal=causal,
++            window_size=cute_window,
++            num_splits=num_splits,
++            return_lse=False,
++            out=out,
++            **bias_kwargs,
+         )
++        if isinstance(ret, tuple):
++            return ret[0]
++        return ret
+ 
+-        flash_attn_varlen_func = tml_flash_attn_varlen_func
+-        bias_kwargs: dict[str, Any] = {"rel_bias": rel_logits}
+-    else:
+-        from vllm.vllm_flash_attn.cute import (
+-            flash_attn_varlen_func as cute_flash_attn_varlen_func,
++    def dispatch(  # type: ignore[override]
++        self,
++        *,
++        is_local: bool,
++        num_heads: int,
++        num_kv_heads: int,
++        head_dim: int,
++        rel_extent: int,
++        dtype: torch.dtype,
++        kv_dtype: torch.dtype,
++        block_size: int,
++        window_size: tuple[int, int],
++        max_kv_len: int,
++        query_len: int,
++        num_reqs: int,
++    ) -> CompileKey:
++        max_seqlen_q = bucket_max_seqlen_q(query_len)
++        num_splits = inkling_fa4_num_splits(
++            is_local=is_local,
++            batch_size=num_reqs,
++            max_query_len=max_seqlen_q,
++            num_heads=num_heads,
++            num_kv_heads=num_kv_heads,
++            max_kv_len=max_kv_len,
++        )
++        return self.CompileKey(
++            is_local=is_local,
++            num_heads=num_heads,
++            num_kv_heads=num_kv_heads,
++            head_dim=head_dim,
++            rel_extent=rel_extent,
++            dtype=dtype,
++            kv_dtype=kv_dtype,
++            block_size=block_size,
++            window_size=window_size,
++            max_seqlen_q=max_seqlen_q,
++            num_splits=num_splits,
++            num_warps_bucket=(_num_warps_bucket(num_reqs) if num_splits > 1 else None),
++            large_num_reqs=num_reqs > 1024,
+         )
+ 
+-        flash_attn_varlen_func = cute_flash_attn_varlen_func
+-        bias_kwargs = {
+-            "score_mod": _get_score_mod(rel_extent),
+-            "aux_tensors": [rel_logits],
+-        }
+-
+-    ret = flash_attn_varlen_func(
+-        q=q,
+-        k=key_cache,
+-        v=value_cache,
+-        cu_seqlens_q=cu_seqlens_q,
+-        seqused_k=cache_seqlens,
+-        max_seqlen_q=max_seqlen_q,
+-        page_table=block_table,
+-        softmax_scale=softmax_scale,
+-        causal=causal,
+-        window_size=cute_window,
+-        num_splits=num_splits,
+-        return_lse=False,
+-        out=out,
+-        **bias_kwargs,
+-    )
+-    if isinstance(ret, tuple):
+-        return ret[0]
+-    return ret
++    def _is_valid_warmup_dispatch(
++        self,
++        *,
++        query_len: int,
++        num_reqs: int,
++        max_num_batched_tokens: int,
++    ) -> bool:
++        return query_len + num_reqs <= max_num_batched_tokens + 1
++
++    def get_warmup_keys(self, vllm_config: VllmConfig) -> list[CompileKey]:
++        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
++        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
++        if max_num_reqs <= 0 or max_num_batched_tokens <= 0:
++            return []
++
++        hf_config = vllm_config.model_config.hf_config
++        get_text_config = getattr(hf_config, "get_text_config", None)
++        config = get_text_config() if callable(get_text_config) else hf_config
++
++        tp_size = get_tensor_model_parallel_world_size()
++        dtype = vllm_config.model_config.dtype
++        kv_dtype = kv_cache_dtype_str_to_dtype(
++            vllm_config.cache_config.cache_dtype,
++            vllm_config.model_config,
++        )
++        block_size = vllm_config.cache_config.block_size
++        local_extent = config.sliding_window_size
++
++        global_num_kv_heads = config.num_key_value_heads
++        local_num_kv_heads = config.swa_num_key_value_heads
++        assert config.num_attention_heads % tp_size == 0
++        assert config.swa_num_attention_heads % tp_size == 0
++        if global_num_kv_heads >= tp_size:
++            assert global_num_kv_heads % tp_size == 0
++        else:
++            assert tp_size % global_num_kv_heads == 0
++        if local_num_kv_heads >= tp_size:
++            assert local_num_kv_heads % tp_size == 0
++        else:
++            assert tp_size % local_num_kv_heads == 0
++
++        return self._trace_dispatch(self.dispatch)(
++            zip_inputs(
++                dict(
++                    is_local=False,
++                    num_heads=config.num_attention_heads // tp_size,
++                    num_kv_heads=max(1, global_num_kv_heads // tp_size),
++                    head_dim=config.head_dim,
++                    rel_extent=config.rel_extent,
++                    dtype=dtype,
++                    kv_dtype=kv_dtype,
++                    block_size=block_size,
++                    window_size=(-1, -1),
++                    max_kv_len=vllm_config.model_config.max_model_len,
++                ),
++                dict(
++                    is_local=True,
++                    num_heads=config.swa_num_attention_heads // tp_size,
++                    num_kv_heads=max(1, local_num_kv_heads // tp_size),
++                    head_dim=config.swa_head_dim,
++                    rel_extent=local_extent,
++                    dtype=dtype,
++                    kv_dtype=kv_dtype,
++                    block_size=block_size,
++                    window_size=(local_extent - 1, 0),
++                    max_kv_len=local_extent,
++                ),
++            ),
++            query_len=WarmupIntRange(
++                1,
++                max_num_batched_tokens + 1,
++                advance=lambda value: bucket_max_seqlen_q(value) + 1,
++            ),
++            num_reqs=WarmupIntRange(1, max_num_reqs + 1),
++            max_num_batched_tokens=max_num_batched_tokens,
++            _when=self._is_valid_warmup_dispatch,
++        )
++
++    def compile(self, compile_key: CompileKey) -> None:
++        from torch._subclasses.fake_tensor import FakeTensorMode
++
++        if compile_key.num_splits == 1 or compile_key.num_warps_bucket is None:
++            num_reqs = 1025 if compile_key.large_num_reqs else 1
++        else:
++            min_num_warps = (
++                1
++                if compile_key.num_warps_bucket == 1
++                else compile_key.num_warps_bucket // 2 + 1
++            )
++            min_num_reqs = (min_num_warps - 1) * 31 + 1
++            num_reqs = max(
++                min_num_reqs,
++                1025 if compile_key.large_num_reqs else 1,
++            )
++
++        with FakeTensorMode():
++            device = torch.accelerator.current_accelerator()
++            total_q = compile_key.max_seqlen_q + num_reqs - 1
++            q = torch.empty(
++                total_q,
++                compile_key.num_heads,
++                compile_key.head_dim,
++                dtype=compile_key.dtype,
++                device=device,
++            )
++            kv = torch.empty(
++                1,
++                2,
++                compile_key.block_size,
++                compile_key.num_kv_heads,
++                compile_key.head_dim,
++                dtype=compile_key.kv_dtype,
++                device=device,
++            )
++            key_cache, value_cache = kv.unbind(1)
++            self.kernel(
++                q,
++                key_cache,
++                value_cache,
++                block_table=torch.empty(
++                    num_reqs,
++                    1,
++                    dtype=torch.int32,
++                    device=device,
++                ),
++                cache_seqlens=torch.empty(
++                    num_reqs,
++                    dtype=torch.int32,
++                    device=device,
++                ),
++                cu_seqlens_q=torch.empty(
++                    num_reqs + 1,
++                    dtype=torch.int32,
++                    device=device,
++                ),
++                max_seqlen_q=compile_key.max_seqlen_q,
++                softmax_scale=compile_key.head_dim**-1,
++                causal=True,
++                window_size=compile_key.window_size,
++                rel_extent=compile_key.rel_extent,
++                rel_logits=torch.empty(
++                    total_q,
++                    compile_key.num_heads,
++                    compile_key.rel_extent,
++                    dtype=compile_key.dtype,
++                    device=device,
++                ),
++                num_splits=compile_key.num_splits,
++                out=torch.empty_like(q),
++            )
++
++    def __call__(
++        self,
++        q: torch.Tensor,
++        key_cache: torch.Tensor,
++        value_cache: torch.Tensor,
++        *,
++        block_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        cu_seqlens_q: torch.Tensor,
++        max_seqlen_q: int,
++        softmax_scale: float,
++        causal: bool,
++        window_size: tuple[int, int],
++        rel_extent: int,
++        rel_logits: torch.Tensor,
++        num_splits: int = 32,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return self.kernel(
++            q,
++            key_cache,
++            value_cache,
++            block_table=block_table,
++            cache_seqlens=cache_seqlens,
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_q=max_seqlen_q,
++            softmax_scale=softmax_scale,
++            causal=causal,
++            window_size=window_size,
++            rel_extent=rel_extent,
++            rel_logits=rel_logits,
++            num_splits=num_splits,
++            out=out,
++        )
++
++
++INKLING_FA4_REL_ATTENTION_KERNEL = InklingFA4RelAttentionKernel()
+diff --git a/vllm/models/inkling/nvidia/ops/fa4_warmup.py b/vllm/models/inkling/nvidia/ops/fa4_warmup.py
+deleted file mode 100644
+index ff8cdb0293..0000000000
+--- a/vllm/models/inkling/nvidia/ops/fa4_warmup.py
++++ /dev/null
+@@ -1,154 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Startup compilation of the FA4 kernels used by Inkling."""
+-
+-from __future__ import annotations
+-
+-from collections.abc import Iterator
+-from dataclasses import dataclass
+-from functools import partial
+-
+-import torch
+-
+-from vllm.model_executor.warmup.cutedsl_warmup import (
+-    CuTeDSLCompileUnit,
+-    register_cutedsl_warmup_provider,
+-)
+-
+-from .fa4_rel_attention import (
+-    bucket_max_seqlen_q,
+-    inkling_fa4_num_splits,
+-    inkling_fa4_rel_attention,
+-)
+-
+-
+-@dataclass(frozen=True)
+-class InklingFA4WarmupConfig:
+-    num_heads: int
+-    num_kv_heads: int
+-    head_dim: int
+-    rel_extent: int
+-    window_size: tuple[int, int]
+-    is_local: bool
+-    max_kv_len: int
+-    dtype: torch.dtype
+-    kv_dtype: torch.dtype
+-    block_size: int
+-    max_num_reqs: int
+-    max_num_batched_tokens: int
+-
+-
+-def _num_warps_bucket(num_reqs: int) -> int:
+-    num_warps = min((num_reqs + 30) // 31, 32)
+-    return 1 << (num_warps - 1).bit_length()
+-
+-
+-def _compile(config: InklingFA4WarmupConfig, max_seqlen_q: int, num_reqs: int) -> None:
+-    from torch._subclasses.fake_tensor import FakeTensorMode
+-
+-    num_splits = inkling_fa4_num_splits(
+-        is_local=config.is_local,
+-        batch_size=num_reqs,
+-        max_query_len=max_seqlen_q,
+-        num_heads=config.num_heads,
+-        num_kv_heads=config.num_kv_heads,
+-        max_kv_len=config.max_kv_len,
+-    )
+-    with FakeTensorMode():
+-        device = torch.accelerator.current_accelerator()
+-        total_q = max_seqlen_q + num_reqs - 1
+-        q = torch.empty(
+-            total_q,
+-            config.num_heads,
+-            config.head_dim,
+-            dtype=config.dtype,
+-            device=device,
+-        )
+-        kv = torch.empty(
+-            1,
+-            2,
+-            config.block_size,
+-            config.num_kv_heads,
+-            config.head_dim,
+-            dtype=config.kv_dtype,
+-            device=device,
+-        )
+-        key_cache, value_cache = kv.unbind(1)
+-        inkling_fa4_rel_attention(
+-            q,
+-            key_cache,
+-            value_cache,
+-            block_table=torch.empty(num_reqs, 1, dtype=torch.int32, device=device),
+-            cache_seqlens=torch.empty(num_reqs, dtype=torch.int32, device=device),
+-            cu_seqlens_q=torch.empty(num_reqs + 1, dtype=torch.int32, device=device),
+-            max_seqlen_q=max_seqlen_q,
+-            softmax_scale=1.0 / config.head_dim,
+-            causal=True,
+-            window_size=config.window_size,
+-            rel_extent=config.rel_extent,
+-            rel_logits=torch.empty(
+-                total_q,
+-                config.num_heads,
+-                config.rel_extent,
+-                dtype=config.dtype,
+-                device=device,
+-            ),
+-            num_splits=num_splits,
+-            out=torch.empty_like(q),
+-        )
+-
+-
+-def _iter_compile_units(
+-    config: InklingFA4WarmupConfig,
+-) -> Iterator[CuTeDSLCompileUnit]:
+-    max_bucket = bucket_max_seqlen_q(config.max_num_batched_tokens)
+-    max_seqlen_q = 1
+-    while max_seqlen_q <= max_bucket:
+-        min_query_len = max_seqlen_q // 2 + 1
+-        max_num_reqs = min(
+-            config.max_num_reqs,
+-            config.max_num_batched_tokens - min_query_len + 1,
+-        )
+-        seen: set[tuple[int, int, int | None, bool]] = set()
+-        for num_reqs in range(1, max_num_reqs + 1):
+-            num_splits = inkling_fa4_num_splits(
+-                is_local=config.is_local,
+-                batch_size=num_reqs,
+-                max_query_len=max_seqlen_q,
+-                num_heads=config.num_heads,
+-                num_kv_heads=config.num_kv_heads,
+-                max_kv_len=config.max_kv_len,
+-            )
+-            key = (
+-                max_seqlen_q,
+-                num_splits,
+-                _num_warps_bucket(num_reqs) if num_splits > 1 else None,
+-                num_reqs > 1024,
+-            )
+-            if key in seen:
+-                continue
+-            seen.add(key)
+-            yield CuTeDSLCompileUnit(
+-                name="inkling_fa4",
+-                key=("inkling_fa4", config, key),
+-                compile=partial(_compile, config, max_seqlen_q, num_reqs),
+-            )
+-        max_seqlen_q *= 2
+-
+-
+-class _WarmupProvider:
+-    def __init__(self) -> None:
+-        self.configs: set[InklingFA4WarmupConfig] = set()
+-
+-    def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
+-        return tuple(
+-            unit for config in self.configs for unit in _iter_compile_units(config)
+-        )
+-
+-
+-_PROVIDER = _WarmupProvider()
+-
+-
+-def register_fa4_warmup(config: InklingFA4WarmupConfig) -> None:
+-    _PROVIDER.configs.add(config)
+-    register_cutedsl_warmup_provider(_PROVIDER)
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 0bb4864d29..0c729bef91 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -246,6 +246,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         assert isinstance(self.kv_cache_spec, MambaSpec)
++        self._check_block_table_width(m.block_table_tensor.shape[1])
+         # Equivalent PyTorch "align" path:
+         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
+         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
+@@ -485,6 +486,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+         )
+ 
++    def _check_block_table_width(self, width: int) -> None:
++        """Fail at startup if the block table cannot hold the slot we index.
++
++        ``_get_aligned_state_indices_kernel`` reads column
++        ``(seq_lens - 1) // spec.block_size`` and its mask bounds only the row,
++        so a table narrower than ``max_num_blocks_per_req`` reads off the end of
++        the row and yields an arbitrary block id. That surfaces far away, either
++        as an index-out-of-bounds assert in whichever consumer touches the state
++        cache first or, when the stray id happens to be in range, as silently
++        wrong recurrent state. Neither names this as the cause, so check it once
++        where the contract is stated.
++        """
++        if getattr(self, "_block_table_width_checked", False):
++            return
++        self._block_table_width_checked = True
++        required = self.kv_cache_spec.max_num_blocks_per_req(
++            self.vllm_config, self.vllm_config.model_config.max_model_len
++        )
++        if width < required:
++            raise ValueError(
++                f"KDA block table is {width} columns but the state slot is "
++                f"indexed over {required} (max_model_len="
++                f"{self.vllm_config.model_config.max_model_len}, block_size="
++                f"{self.kv_cache_spec.block_size}). Mamba state is replicated "
++                f"across DCP ranks, so its block table must not be scaled by "
++                f"decode_context_parallel_size="
++                f"{self.vllm_config.parallel_config.decode_context_parallel_size}."
++            )
++
+ 
+ class KimiK3KDAAttentionBackend(GDNAttentionBackend):
+     @staticmethod
+diff --git a/vllm/models/kimi_k3/nvidia/mla.py b/vllm/models/kimi_k3/nvidia/mla.py
+index 654f83b452..b4383de36a 100644
+--- a/vllm/models/kimi_k3/nvidia/mla.py
++++ b/vllm/models/kimi_k3/nvidia/mla.py
+@@ -320,11 +320,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
+             "parallelism."
+         )
+         self.dcp_world_size = parallel_config.decode_context_parallel_size
+-        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
+-            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
+-            "context parallelism because gathered queries require gathered "
+-            "positions."
+-        )
+         self.dcp_manager: MLADCPManager | None = None
+         if self.dcp_world_size > 1:
+             query_dtype = (
+diff --git a/vllm/multimodal/processing/processor.py b/vllm/multimodal/processing/processor.py
+index 8fafccc3e7..d35856e04f 100644
+--- a/vllm/multimodal/processing/processor.py
++++ b/vllm/multimodal/processing/processor.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from collections.abc import Callable, Generator, ItemsView, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field, replace
+ from enum import Enum
+@@ -706,91 +706,191 @@ class PlaceholderFeaturesInfo:
+         )
+ 
+ 
+-_MatchToApply = tuple[tuple[str, int], tuple[PromptTargetMatch, int]]
++class _MatchedUpdate(NamedTuple):
++    """A resolved update selected for a match in the original prompt."""
+ 
++    priority: int
++    """The original item order used to preserve match tie-breaking."""
+ 
+-def _find_matches(
+-    prompt: _S,
++    update: ResolvedPromptUpdate
++    """The selected update for the multimodal item."""
++
++    update_idx: int
++    """The selected update's index within the item's alternatives."""
++
++    match: PromptTargetMatch
++    """The target range in the original prompt."""
++
++
++_UpdateQueue: TypeAlias = deque[tuple[int, Sequence[ResolvedPromptUpdate]]]
++"""
++Items with the same ordered match rules, stored as `(priority, alternatives)`.
++"""
++
++_QueueMatch: TypeAlias = tuple[_UpdateQueue, PromptTargetMatch, int]
++"""A queue together with its next match and selected alternative index."""
++
++
++def _target_key(target: UpdateTarget) -> tuple[str, object]:
++    """Return a hashable key that preserves target matching semantics."""
++    if isinstance(target, PromptIndex):
++        return ("index", id(target))
++    if isinstance(target, str):
++        return ("text", target)
++
++    return ("tokens", tuple(target))
++
++
++def _compile_prompt_update_queues(
+     mm_prompt_updates: "MultiModalPromptUpdates",
++) -> dict[
++    tuple[tuple[UpdateMode, tuple[str, object]], ...],
++    _UpdateQueue,
++]:
++    """Group items with identical match rules into ordered queues."""
++    queues_by_signature = dict[
++        tuple[tuple[UpdateMode, tuple[str, object]], ...],
++        _UpdateQueue,
++    ]()
++    priority = 0
++
++    for modality_updates in mm_prompt_updates.values():
++        for updates in modality_updates:
++            signature = tuple(
++                (update.mode, _target_key(update.target)) for update in updates
++            )
++            queues_by_signature.setdefault(signature, deque()).append(
++                (priority, updates)
++            )
++            priority += 1
++
++    return queues_by_signature
++
++
++def _find_queue_match(
++    queue: _UpdateQueue,
++    prompt: _S,
+     tokenizer: TokenizerLike | None,
+     *,
+-    prev_end_idx: int = 0,
+-    current_result: "MultiModalPromptUpdatesApplyResult",
+-) -> tuple[UpdateMode | None, list[_MatchToApply]]:
+-    mode: UpdateMode | None = None
+-    mm_matches = dict[tuple[str, int], tuple[PromptTargetMatch, int]]()
+-
+-    # Items commonly share the same target object (a static PromptUpdate
+-    # target resolves to the same object for every item); scan the prompt once
+-    # per distinct target instead of once per item. The cache is keyed by
+-    # object identity: it implies value equality, costs O(1) per lookup
+-    # (hashing a long target value per lookup would defeat the point), and the
+-    # target objects are kept alive by `mm_prompt_updates` for the duration of
+-    # this call. Items with equal-valued but distinct target objects simply
+-    # miss the cache and scan independently.
+-    # NOTE: ResolvedPromptUpdate.iter_matches depends only on the target,
+-    # prompt, tokenizer and start_idx, so updates sharing a target share the
+-    # same first match within this invocation. Revisit this cache if matching
+-    # ever depends on other update attributes.
+-    first_match_by_target_id = dict[int, PromptTargetMatch | None]()
+-
+-    def get_first_match(update: "ResolvedPromptUpdate") -> PromptTargetMatch | None:
+-        target = update.target
+-        if isinstance(target, PromptIndex):  # Matches are not cacheable
+-            return next(
+-                update.iter_matches(prompt, tokenizer, start_idx=prev_end_idx),
+-                None,
+-            )
++    start_idx: int,
++    mode: UpdateMode | None = None,
++) -> tuple[PromptTargetMatch, int] | None:
++    """Find the first matching alternative for the next queued item."""
++    _, updates = queue[0]
++    for update_idx, update in enumerate(updates):
++        if mode is not None and update.mode != mode:
++            continue
++
++        match = next(
++            update.iter_matches(prompt, tokenizer, start_idx=start_idx),
++            None,
++        )
++        if match is not None:
++            return match, update_idx
+ 
+-        key = id(target)
+-        if key not in first_match_by_target_id:
+-            first_match_by_target_id[key] = next(
+-                update.iter_matches(prompt, tokenizer, start_idx=prev_end_idx),
+-                None,
+-            )
++    return None
+ 
+-        return first_match_by_target_id[key]
+ 
+-    for modality, modality_updates in mm_prompt_updates.items():
+-        for item_idx, item_updates in enumerate(modality_updates):
+-            if current_result[modality][item_idx] is not None:
+-                continue  # Updates have already been applied for this item
++def _next_priority(queue: _UpdateQueue) -> int:
++    """Return the original priority of the next queued item."""
++    priority, _ = queue[0]
++    return priority
+ 
+-            for update_idx, update in enumerate(item_updates):
+-                if (modality, item_idx) in mm_matches:
+-                    break  # Already found a match for this item
+ 
+-                match = get_first_match(update)
+-                if match is None:
+-                    continue
++def _plan_prompt_updates(
++    prompt: _S,
++    mm_prompt_updates: "MultiModalPromptUpdates",
++    tokenizer: TokenizerLike | None,
++) -> tuple[list[_MatchedUpdate], "MultiModalPromptUpdatesApplyResult"]:
++    """Plan non-overlapping prompt updates before rendering the output."""
++    queues = list(_compile_prompt_update_queues(mm_prompt_updates).values())
++    result: MultiModalPromptUpdatesApplyResult = {
++        modality: [None] * len(items) for modality, items in mm_prompt_updates.items()
++    }
++    planned_updates = list[_MatchedUpdate]()
++    prev_end_idx = 0
+ 
+-                # All matches should share the same mode
+-                if mode is None:
+-                    mode = update.mode
+-                elif mode != update.mode:
+-                    continue
++    while queues:
++        first_matches = list[_QueueMatch]()
++        for queue in queues:
++            queue_match = _find_queue_match(
++                queue,
++                prompt,
++                tokenizer,
++                start_idx=prev_end_idx,
++            )
++            if queue_match is not None:
++                prompt_match, update_idx = queue_match
++                first_matches.append((queue, prompt_match, update_idx))
+ 
+-                mm_matches[(modality, item_idx)] = match, update_idx
++        if not first_matches:
++            break
+ 
+-    # Prioritize earlier matches
+-    matches_to_apply = sorted(mm_matches.items(), key=lambda item: item[1][0])
++        mode_queue, _, mode_update_idx = min(
++            first_matches,
++            key=lambda item: _next_priority(item[0]),
++        )
++        _, mode_updates = mode_queue[0]
++        mode = mode_updates[mode_update_idx].mode
+ 
+-    # To avoid conflicts, only replace one non-empty item at a time
+-    if mode == UpdateMode.REPLACE:
+-        matches_to_apply_ = list[_MatchToApply]()
+-        has_non_empty_matches = False
++        mode_matches = list[_QueueMatch]()
++        for queue, prompt_match, first_update_idx in first_matches:
++            if queue[0][1][first_update_idx].mode == mode:
++                mode_matches.append((queue, prompt_match, first_update_idx))
++                continue
++
++            queue_match = _find_queue_match(
++                queue,
++                prompt,
++                tokenizer,
++                start_idx=prev_end_idx,
++                mode=mode,
++            )
++            if queue_match is not None:
++                prompt_match, update_idx = queue_match
++                mode_matches.append((queue, prompt_match, update_idx))
++
++        updates_to_apply = list[_MatchedUpdate]()
++        non_empty_replacements = list[_QueueMatch]()
++        for queue, match, update_idx in mode_matches:
++            if mode == UpdateMode.REPLACE and match.start_idx != match.end_idx:
++                non_empty_replacements.append((queue, match, update_idx))
++            else:
++                while queue:
++                    priority, updates = queue.popleft()
++                    updates_to_apply.append(
++                        _MatchedUpdate(
++                            priority=priority,
++                            update=updates[update_idx],
++                            update_idx=update_idx,
++                            match=match,
++                        )
++                    )
+ 
+-        for item in matches_to_apply:
+-            _, (match, _) = item
+-            if match.start_idx == match.end_idx:
+-                matches_to_apply_.append(item)
+-            elif not has_non_empty_matches:
+-                has_non_empty_matches = True
+-                matches_to_apply_.append(item)
++        if non_empty_replacements:
++            queue, match, update_idx = min(
++                non_empty_replacements,
++                key=lambda item: (item[1], _next_priority(item[0])),
++            )
++            priority, updates = queue.popleft()
++            updates_to_apply.append(
++                _MatchedUpdate(
++                    priority=priority,
++                    update=updates[update_idx],
++                    update_idx=update_idx,
++                    match=match,
++                )
++            )
+ 
+-        matches_to_apply = matches_to_apply_
++        updates_to_apply.sort(key=lambda item: (item.match, item.priority))
++        for matched_update in updates_to_apply:
++            update = matched_update.update
++            result[update.modality][update.item_idx] = matched_update.update_idx
++            prev_end_idx = matched_update.match.end_idx
++        planned_updates.extend(updates_to_apply)
++        queues = [queue for queue in queues if queue]
+ 
+-    return mode, matches_to_apply
++    return planned_updates, result
+ 
+ 
+ def _all_items_found(
+@@ -808,65 +908,37 @@ def _apply_matches(
+     mm_prompt_updates: "MultiModalPromptUpdates",
+     tokenizer: TokenizerLike | None,
+ ) -> tuple[list[_S], "MultiModalPromptUpdatesApplyResult"]:
+-    mm_item_counts = {m: len(items) for m, items in mm_prompt_updates.items()}
+-
+     out_seqs = list[str | list[int]]()
+-    out_result: MultiModalPromptUpdatesApplyResult = {
+-        m: [None] * len(items) for m, items in mm_prompt_updates.items()
+-    }
+-
+-    # Early exit if no items to find
+-    mm_found_counts = {
+-        m: sum(r is not None for r in res) for m, res in out_result.items()
+-    }
+-    if _all_items_found(mm_item_counts, mm_found_counts):
+-        return [prompt], out_result
++    matched_updates, result = _plan_prompt_updates(
++        prompt,
++        mm_prompt_updates,
++        tokenizer,
++    )
+ 
+     prev_end_idx = 0
+-    while True:
+-        mode, matches_to_apply = _find_matches(
+-            prompt,
+-            mm_prompt_updates,
+-            tokenizer,
+-            prev_end_idx=prev_end_idx,
+-            current_result=out_result,
+-        )
+-
+-        if mode is None:
+-            break  # No more matches to find
+-
+-        for (modality, item_idx), (match, update_idx) in matches_to_apply:
+-            matched_update = mm_prompt_updates[modality][item_idx][update_idx]
+-            matched_content = matched_update.content.full
+-
+-            if mode == UpdateMode.INSERT:
+-                end_idx_to_insert = match.end_idx
+-            elif mode == UpdateMode.REPLACE:
+-                end_idx_to_insert = match.start_idx
+-            else:
+-                assert_never(mode)
+-
+-            out_seqs.append(prompt[prev_end_idx:end_idx_to_insert])
+-            out_seqs.append(
+-                _seq2text(tokenizer, matched_content)
+-                if isinstance(prompt, str)
+-                else _seq2tokens(tokenizer, matched_content)
+-            )
+-            out_result[modality][item_idx] = update_idx
+-
+-            # Exclude overlapping matches
+-            prev_end_idx = match.end_idx
++    for matched_update in matched_updates:
++        update = matched_update.update
++        match = matched_update.match
++        matched_content = update.content.full
++
++        if update.mode == UpdateMode.INSERT:
++            end_idx_to_insert = match.end_idx
++        elif update.mode == UpdateMode.REPLACE:
++            end_idx_to_insert = match.start_idx
++        else:
++            assert_never(update.mode)
+ 
+-        # Early exit if all items found
+-        mm_found_counts = {
+-            m: sum(r is not None for r in res) for m, res in out_result.items()
+-        }
+-        if _all_items_found(mm_item_counts, mm_found_counts):
+-            break
++        out_seqs.append(prompt[prev_end_idx:end_idx_to_insert])
++        out_seqs.append(
++            _seq2text(tokenizer, matched_content)
++            if isinstance(prompt, str)
++            else _seq2tokens(tokenizer, matched_content)
++        )
++        prev_end_idx = match.end_idx
+ 
+     out_seqs.append(prompt[prev_end_idx:])
+ 
+-    return cast(list[_S], out_seqs), out_result
++    return cast(list[_S], out_seqs), result
+ 
+ 
+ def apply_token_matches(
+diff --git a/vllm/platforms/cpu.py b/vllm/platforms/cpu.py
+index 139cfd6701..4eeb98a79c 100644
+--- a/vllm/platforms/cpu.py
++++ b/vllm/platforms/cpu.py
+@@ -54,12 +54,15 @@ class CpuPlatform(Platform):
+         elif self.get_cpu_architecture() == CpuArchEnum.ARM and sys.platform.startswith(
+             "darwin"
+         ):
+-            if (
+-                subprocess.check_output(
+-                    ["sysctl -n hw.optional.arm.FEAT_BF16"], shell=True
+-                ).strip()
++            # sysctl exits non-zero when the OID is absent, so check_output would
++            # raise instead of letting the fp16/fp32 fallback below run.
++            bf16 = (
++                subprocess.run(
++                    ["sysctl", "-n", "hw.optional.arm.FEAT_BF16"], capture_output=True
++                ).stdout.strip()
+                 == b"1"
+-            ):
++            )
++            if bf16:
+                 return [torch.bfloat16, torch.float16, torch.float32]
+             return [torch.float16, torch.float32]
+         elif self.get_cpu_architecture() == CpuArchEnum.RISCV:
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index af19377548..dde7a223f7 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -326,6 +326,30 @@ class XPUPlatform(Platform):
+                     )
+                     setattr(pass_config, flag, False)
+ 
++        # UVA-offloaded weights are host USM allocations, which Inductor's
++        # static Triton launcher rejects ("Pointer argument doesn't reference
++        # XPU device memory"). Fall back to Triton's own launcher. Remove once
++        # the released torch contains pytorch/pytorch#188240, which relaxes
++        # that check to any memory type known by the driver.
++        offload_config = vllm_config.offload_config
++        uva_offloading = offload_config.offload_backend == "uva" or (
++            offload_config.offload_backend == "auto"
++            and offload_config.prefetch.offload_group_size == 0
++            and offload_config.uva.cpu_offload_gb > 0
++        )
++        if (
++            uva_offloading
++            and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA
++            and compilation_config.mode != CompilationMode.NONE
++        ):
++            compilation_config.inductor_compile_config.setdefault(
++                "use_static_cuda_launcher", False
++            )
++            logger.info_once(
++                "Disabling Inductor's static Triton launcher because UVA "
++                "weight offloading is enabled."
++            )
++
+         # check and update parallel config
+         parallel_config = vllm_config.parallel_config
+         # Only override worker_cls if it's still the default "auto"
+diff --git a/vllm/profiler/wrapper.py b/vllm/profiler/wrapper.py
+index 6e3403708b..bbdec955a0 100644
+--- a/vllm/profiler/wrapper.py
++++ b/vllm/profiler/wrapper.py
+@@ -150,10 +150,11 @@ class WorkerProfiler(ABC):
+         return nullcontext()
+ 
+ 
+-TorchProfilerActivity = Literal["CPU", "CUDA", "XPU"]
++TorchProfilerActivity = Literal["CPU", "CUDA", "PrivateUse1", "XPU"]
+ TorchProfilerActivityMap = {
+     "CPU": torch.profiler.ProfilerActivity.CPU,
+     "CUDA": torch.profiler.ProfilerActivity.CUDA,
++    "PrivateUse1": torch.profiler.ProfilerActivity.PrivateUse1,
+     "XPU": torch.profiler.ProfilerActivity.XPU,
+ }
+ 
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index 5dedbde372..8964f4047e 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -32,6 +32,22 @@ MAX_LOGPROB_TOKEN_IDS = 128
+ the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
+ 
+ 
++def _verify_num_sequences(value: int, parameter_name: str) -> None:
++    if not isinstance(value, int):
++        raise VLLMValidationError(
++            f"{parameter_name} must be an int, but is of type {type(value)}"
++        )
++    if value < 1:
++        raise VLLMValidationError(f"{parameter_name} must be at least 1, got {value}.")
++    max_n = envs.VLLM_MAX_N_SEQUENCES
++    if value > max_n:
++        raise VLLMValidationError(
++            f"{parameter_name} must be at most {max_n}, got {value}. "
++            "To increase this limit, set the VLLM_MAX_N_SEQUENCES "
++            "environment variable."
++        )
++
++
+ def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
+     """Validate ``thinking_token_budget``; return ``None`` if unset."""
+     if value is None:
+@@ -479,9 +495,13 @@ class SamplingParams(
+ 
+         if self.stop_token_ids is None:
+             self.stop_token_ids = []
++        else:
++            self.stop_token_ids = list(dict.fromkeys(self.stop_token_ids))
+ 
+         if self.bad_words is None:
+             self.bad_words = []
++        else:
++            self.bad_words = list(dict.fromkeys(self.bad_words))
+ 
+         if self.logprobs is True:
+             self.logprobs = 1
+@@ -513,19 +533,7 @@ class SamplingParams(
+             self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+ 
+     def _verify_args(self) -> None:
+-        if not isinstance(self.n, int):
+-            raise VLLMValidationError(
+-                f"n must be an int, but is of type {type(self.n)}"
+-            )
+-        if self.n < 1:
+-            raise VLLMValidationError(f"n must be at least 1, got {self.n}.")
+-        max_n = envs.VLLM_MAX_N_SEQUENCES
+-        if self.n > max_n:
+-            raise VLLMValidationError(
+-                f"n must be at most {max_n}, got {self.n}. "
+-                "To increase this limit, set the VLLM_MAX_N_SEQUENCES "
+-                "environment variable."
+-            )
++        _verify_num_sequences(self.n, "n")
+         if not -2.0 <= self.presence_penalty <= 2.0:
+             raise VLLMValidationError(
+                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
+@@ -677,6 +685,7 @@ class SamplingParams(
+         if not self.bad_words:
+             return
+         self._bad_words_token_ids = []
++        max_num_bad_words = envs.VLLM_MAX_NUM_BAD_WORDS
+         for bad_word in self.bad_words:
+             # To prohibit words both at the beginning
+             # and in the middle of text
+@@ -696,6 +705,14 @@ class SamplingParams(
+                     and len(prompt_token_ids) == len(self._bad_words_token_ids[-1])
+                 ):
+                     self._bad_words_token_ids.append(prompt_token_ids)
++                    if len(self._bad_words_token_ids) > max_num_bad_words:
++                        raise VLLMValidationError(
++                            f"Too many bad words after tokenization: "
++                            f"{len(self._bad_words_token_ids)}. "
++                            f"The max number is {max_num_bad_words}.",
++                            parameter="bad_words",
++                            value=self.bad_words,
++                        )
+ 
+         invalid_token_ids = [
+             token_id
+@@ -1147,3 +1164,6 @@ class BeamSearchParams(
+     length_penalty: float = 1.0
+     include_stop_str_in_output: bool = False
+     structured_outputs: StructuredOutputsParams | None = None
++
++    def __post_init__(self) -> None:
++        _verify_num_sequences(self.beam_width, "beam_width")
+diff --git a/vllm/tokenizers/deepseek_v32_encoding.py b/vllm/tokenizers/deepseek_v32_encoding.py
+index b02449020e..dfe4e478f0 100644
+--- a/vllm/tokenizers/deepseek_v32_encoding.py
++++ b/vllm/tokenizers/deepseek_v32_encoding.py
+@@ -119,7 +119,10 @@ def find_last_user_index(messages: list[dict[str, Any]]) -> int:
+ 
+ 
+ def render_message(
+-    index: int, messages: list[dict[str, Any]], thinking_mode: str
++    index: int,
++    messages: list[dict[str, Any]],
++    thinking_mode: str,
++    last_user_idx: int | None = None,
+ ) -> str:
+     if not (0 <= index < len(messages)):
+         raise ValueError(
+@@ -130,7 +133,9 @@ def render_message(
+ 
+     prompt = ""
+     msg = messages[index]
+-    last_user_idx = find_last_user_index(messages)
++    last_user_idx = (
++        find_last_user_index(messages) if last_user_idx is None else last_user_idx
++    )
+ 
+     role = msg.get("role")
+     content = msg.get("content")
+@@ -294,9 +299,14 @@ def encode_messages(
+     if thinking_mode == "thinking" and drop_thinking:
+         full_messages = drop_thinking_messages(full_messages)
+ 
++    last_user_idx = find_last_user_index(full_messages)
++
+     for idx in range(len(messages)):
+         prompt += render_message(
+-            idx + len(context), full_messages, thinking_mode=thinking_mode
++            idx + len(context),
++            full_messages,
++            thinking_mode=thinking_mode,
++            last_user_idx=last_user_idx,
+         )
+ 
+     return prompt
+diff --git a/vllm/tokenizers/deepseek_v4_encoding.py b/vllm/tokenizers/deepseek_v4_encoding.py
+index c7c74a396f..461f7f391d 100644
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -199,7 +199,14 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+ # Message Rendering
+ # ============================================================
+ 
+-def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None) -> str:
++def render_message(
++    index: int,
++    messages: List[Dict[str, Any]],
++    thinking_mode: str,
++    drop_thinking: bool = True,
++    reasoning_effort: Optional[str] = None,
++    last_user_idx: Optional[int] = None,
++) -> str:
+     """
+     Render a single message at the given index into its encoded string form.
+ 
+@@ -213,6 +220,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+         drop_thinking: Whether to drop reasoning content from earlier turns.
+         reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+             None is treated as "low".
++        last_user_idx: Cached index of the last user/developer message.
+ 
+     Returns:
+         Encoded string for this message.
+@@ -222,7 +230,9 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+ 
+     prompt = ""
+     msg = messages[index]
+-    last_user_idx = find_last_user_index(messages)
++    last_user_idx = (
++        find_last_user_index(messages) if last_user_idx is None else last_user_idx
++    )
+ 
+     role = msg.get("role")
+     content = msg.get("content")
+@@ -544,6 +554,8 @@ def encode_messages(
+         num_to_render = len(messages)
+         context_len = len(context)
+ 
++    last_user_idx = find_last_user_index(full_messages)
++
+     for idx in range(num_to_render):
+         prompt += render_message(
+             idx + context_len,
+@@ -551,6 +563,7 @@ def encode_messages(
+             thinking_mode=thinking_mode,
+             drop_thinking=effective_drop_thinking,
+             reasoning_effort=reasoning_effort,
++            last_user_idx=last_user_idx,
+         )
+ 
+     return prompt
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 0a188875b6..0e133a3773 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -887,7 +887,15 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
+     from vllm.platforms import current_platform
+ 
+     if current_platform.is_xpu():
+-        assert cpu_tensor.is_pinned(), "CPU tensor must be pinned"
++        # Remove once the vllm-xpu-kernels fix for empty and non-pinned inputs
++        # (vllm-project/vllm-xpu-kernels#513) is in a released package.
++        if cpu_tensor.numel() == 0:
++            return torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device="xpu")
++        if not cpu_tensor.is_pinned():
++            contiguous_cpu = cpu_tensor.contiguous()
++            pinned = torch.empty_like(contiguous_cpu, pin_memory=True)
++            pinned.copy_(contiguous_cpu)
++            cpu_tensor = pinned
+         return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+     elif current_platform.is_cuda_alike():
+         return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index d4698520f1..32e932e3b8 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -633,6 +633,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+     supports_update_block_table: bool = False
+     # Whether the builder constructor requires the block-table width.
+     requires_block_table_width: ClassVar[bool] = False
++    # Whether all step-dependent draft decode metadata can be updated in place,
++    # allowing one metadata build to be reused across autoregressive draft steps.
++    supports_draft_decode_metadata_update: bool = False
+ 
+     @abstractmethod
+     def __init__(
+@@ -757,6 +760,16 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+             fast_build=True,
+         )
+ 
++    def update_draft_decode_metadata(self, metadata: M) -> None:
++        """Update step-dependent draft decode metadata in place.
++
++        The fused draft loop may call this method during full CUDA graph
++        capture. CUDA graph replay does not run this Python method, so
++        implementations must emit capture-safe operations and keep replayed
++        tensor state in persistent storage.
++        """
++        raise NotImplementedError
++
+     def use_cascade_attention(
+         self,
+         common_prefix_len: int,
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 97f30736fd..acdb1661dc 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -370,6 +370,57 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+     ) -> AttentionCGSupport:
+         return cls._cudagraph_support
+ 
++    def _get_scheduler_metadata(
++        self,
++        *,
++        aot_schedule: bool,
++        batch_size: int,
++        cu_query_lens: torch.Tensor,
++        max_query_len: int,
++        seqlens: torch.Tensor,
++        max_seq_len: int,
++        causal: bool | torch.Tensor,
++        max_num_splits: int,
++    ) -> torch.Tensor | None:
++        if not aot_schedule:
++            return None
++
++        cache_dtype = self.cache_config.cache_dtype
++        if is_quantized_kv_cache(cache_dtype):
++            qkv_dtype = current_platform.fp8_dtype()
++        else:
++            qkv_dtype = self.kv_cache_dtype
++        return get_scheduler_metadata(
++            batch_size=batch_size,
++            max_seqlen_q=max_query_len,
++            max_seqlen_k=max_seq_len,
++            num_heads_q=self.num_heads_q * self.dcp_world_size,
++            num_heads_kv=self.num_heads_kv,
++            headdim=self.headdim,
++            cache_seqlens=seqlens,
++            qkv_dtype=qkv_dtype,
++            cu_seqlens_q=cu_query_lens,
++            page_size=self.block_size,
++            causal=causal,
++            window_size=_maybe_symmetrize_window(self.aot_sliding_window, causal),
++            num_splits=max_num_splits,
++        )
++
++    def _store_scheduler_metadata(
++        self, scheduler_metadata: torch.Tensor | None
++    ) -> torch.Tensor | None:
++        if self.use_full_cuda_graph and scheduler_metadata is not None:
++            n = scheduler_metadata.shape[0]
++            assert self.scheduler_metadata is not None
++            self.scheduler_metadata[:n] = scheduler_metadata
++            # NOTE(woosuk): We should zero out the rest of the scheduler
++            # metadata to guarantee the correctness. Otherwise, some thread
++            # blocks may use the invalid scheduler metadata and overwrite the
++            # output buffer.
++            self.scheduler_metadata[n:] = 0
++            return self.scheduler_metadata[:n]
++        return scheduler_metadata
++
+     def __init__(
+         self,
+         kv_cache_spec: AttentionSpec,
+@@ -405,6 +456,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             self.dcp_world_size = 1
+             self.dcp_rank = 0
+ 
++        # Fused draft decode reuses the captured metadata object across draft
++        # steps. For DCP, build-time host-side decisions such as
++        # skip_dcp_context_attention() can change the metadata shape/control
++        # path (for example max_dcp_context_kv_len), and those Python-side
++        # fields are not refreshed in-place between graph replays. Keep the
++        # fused path disabled until DCP gets a full replay-safe refresh model.
++        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
++
+         self.cp_kv_cache_interleave_size = (
+             self.parallel_config.cp_kv_cache_interleave_size
+         )
+@@ -533,34 +592,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         if envs.VLLM_BATCH_INVARIANT:
+             max_num_splits = 1
+ 
+-        def schedule(
+-            batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
+-        ):
+-            cache_dtype = self.cache_config.cache_dtype
+-            if is_quantized_kv_cache(cache_dtype):
+-                qkv_dtype = current_platform.fp8_dtype()
+-            else:
+-                qkv_dtype = self.kv_cache_dtype
+-            if aot_schedule:
+-                return get_scheduler_metadata(
+-                    batch_size=batch_size,
+-                    max_seqlen_q=max_query_len,
+-                    max_seqlen_k=max_seq_len,
+-                    num_heads_q=self.num_heads_q * self.dcp_world_size,
+-                    num_heads_kv=self.num_heads_kv,
+-                    headdim=self.headdim,
+-                    cache_seqlens=seqlens,
+-                    qkv_dtype=qkv_dtype,
+-                    cu_seqlens_q=cu_query_lens,
+-                    page_size=self.block_size,
+-                    causal=causal,
+-                    window_size=_maybe_symmetrize_window(
+-                        self.aot_sliding_window, causal
+-                    ),
+-                    num_splits=max_num_splits,
+-                )
+-            return None
+-
+         use_cascade = common_prefix_len > 0
+         max_dcp_context_kv_len = 0
+         dcp_context_kv_lens = None
+@@ -627,13 +658,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+                     (max_seq_len + num_partitions - 1) // num_partitions
+                 ) * self.cp_kv_cache_interleave_size
+ 
+-                scheduler_metadata = schedule(
++                scheduler_metadata = self._get_scheduler_metadata(
++                    aot_schedule=aot_schedule,
+                     batch_size=num_reqs,
+                     cu_query_lens=query_start_loc,
+                     max_query_len=max_query_len,
+                     seqlens=dcp_context_kv_lens,
+                     max_seq_len=max_dcp_context_kv_len,
+                     causal=False,
++                    max_num_splits=max_num_splits,
+                 )
+         elif use_cascade:
+             cu_prefix_query_lens = torch.tensor(
+@@ -644,41 +677,38 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             )
+             # Use GPU tensor directly - no CPU sync needed
+             suffix_kv_lens = seq_lens[:num_reqs] - common_prefix_len
+-            prefix_scheduler_metadata = schedule(
++            prefix_scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=1,
+                 cu_query_lens=cu_prefix_query_lens,
+                 max_query_len=num_actual_tokens,
+                 seqlens=prefix_kv_lens,
+                 max_seq_len=common_prefix_len,
+                 causal=False,
++                max_num_splits=max_num_splits,
+             )
+-            scheduler_metadata = schedule(
++            scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=num_reqs,
+                 cu_query_lens=query_start_loc,
+                 max_query_len=max_query_len,
+                 seqlens=suffix_kv_lens,
+                 max_seq_len=max_seq_len - common_prefix_len,
+                 causal=True,
++                max_num_splits=max_num_splits,
+             )
+         else:
+-            scheduler_metadata = schedule(
++            scheduler_metadata = self._get_scheduler_metadata(
++                aot_schedule=aot_schedule,
+                 batch_size=num_reqs,
+                 cu_query_lens=query_start_loc,
+                 max_query_len=max_query_len,
+                 seqlens=seq_lens,
+                 max_seq_len=max_seq_len,
+                 causal=causal,
++                max_num_splits=max_num_splits,
+             )
+-        # For FA3 + full cudagraph
+-        if self.use_full_cuda_graph and scheduler_metadata is not None:
+-            n = scheduler_metadata.shape[0]
+-            self.scheduler_metadata[:n] = scheduler_metadata
+-            # NOTE(woosuk): We should zero out the rest of the scheduler
+-            # metadata to guarantee the correctness. Otherwise, some thread
+-            # blocks may use the invalid scheduler metadata and overwrite the
+-            # output buffer.
+-            self.scheduler_metadata[n:] = 0
+-            scheduler_metadata = self.scheduler_metadata[:n]
++        scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
+ 
+         if isinstance(causal, torch.Tensor) and causal.dtype != torch.int32:
+             causal = causal.to(torch.int32)
+@@ -772,6 +802,28 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         new_metadata.slot_mapping = slot_mapping
+         return new_metadata
+ 
++    def update_draft_decode_metadata(self, metadata: FlashAttentionMetadata) -> None:
++        if metadata.scheduler_metadata is None:
++            return
++
++        num_reqs = metadata.num_decode_reqs or metadata.seq_lens.shape[0]
++
++        assert self.dcp_world_size == 1
++        assert not metadata.use_cascade
++
++        scheduler_metadata = self._get_scheduler_metadata(
++            aot_schedule=True,
++            batch_size=num_reqs,
++            cu_query_lens=metadata.query_start_loc,
++            max_query_len=metadata.max_query_len,
++            seqlens=metadata.seq_lens,
++            max_seq_len=metadata.max_seq_len,
++            causal=metadata.causal,
++            max_num_splits=metadata.max_num_splits,
++        )
++
++        metadata.scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
++
+     def use_cascade_attention(self, *args, **kwargs) -> bool:
+         return use_cascade_attention(*args, **kwargs)
+ 
+diff --git a/vllm/v1/attention/backends/mla/prefill/flash_attn.py b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+index 97cb57c18a..ce81be07f1 100644
+--- a/vllm/v1/attention/backends/mla/prefill/flash_attn.py
++++ b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+@@ -13,7 +13,7 @@ import vllm.envs as envs
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     kFp8StaticTensorSym,
+ )
+-from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
++from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, zip_inputs
+ from vllm.platforms import current_platform
+ from vllm.v1.attention.backends.fa_utils import (
+     compile_flash_attn_varlen_func_from_specs,
+@@ -57,12 +57,6 @@ FA4_MLA_PREFILL_CAUSAL_OPTIONS = (False, True)
+ FA4_MLA_PREFILL_LSE_OPTIONS = (False, True)
+ 
+ 
+-@dataclass(frozen=True)
+-class _FA4MLAPrefillShapeProbe:
+-    max_seqlen_q: int
+-    max_seqlen_k: int
+-
+-
+ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+     """FA4 MLA prefill compile-key wrapper used by generic JIT warmup."""
+ 
+@@ -92,6 +86,16 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+         return_softmax_lse: bool = False
+         num_splits: int = 0
+ 
++    @staticmethod
++    def kernel(
++        *args: Any,
++        runtime_kernel: Callable[..., Any] | None = None,
++        **kwargs: Any,
++    ) -> Any:
++        kernel = flash_attn_varlen_func if runtime_kernel is None else runtime_kernel
++        assert kernel is not None
++        return kernel(*args, **kwargs)
++
+     def dispatch(  # type: ignore[override]
+         self,
+         *,
+@@ -99,7 +103,8 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+         dtype: torch.dtype,
+         num_heads: int,
+         mla_dims: "MLADims",
+-        shape_probe: _FA4MLAPrefillShapeProbe,
++        max_seqlen_q: int,
++        max_seqlen_k: int,
+         requires_v_padding: bool,
+         causal: bool,
+         fa_version: int,
+@@ -109,17 +114,17 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+     ) -> CompileKey:
+         return self.CompileKey(
+             q_shape=(
+-                batch_size * shape_probe.max_seqlen_q,
++                batch_size * max_seqlen_q,
+                 num_heads,
+                 mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim,
+             ),
+             k_shape=(
+-                batch_size * shape_probe.max_seqlen_k,
++                batch_size * max_seqlen_k,
+                 num_heads,
+                 mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim,
+             ),
+             v_shape=(
+-                batch_size * shape_probe.max_seqlen_k,
++                batch_size * max_seqlen_k,
+                 num_heads,
+                 (
+                     mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim
+@@ -128,8 +133,8 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+                 ),
+             ),
+             q_dtype=dtype,
+-            max_seqlen_q=shape_probe.max_seqlen_q,
+-            max_seqlen_k=shape_probe.max_seqlen_k,
++            max_seqlen_q=max_seqlen_q,
++            max_seqlen_k=max_seqlen_k,
+             softmax_scale=(mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim)
+             ** -0.5,
+             causal=causal,
+@@ -150,6 +155,28 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+             num_splits=num_splits,
+         )
+ 
++    def _is_valid_warmup_shape_probe(
++        self,
++        *,
++        max_seqlen_k: int,
++        num_splits: int,
++        is_sm90: bool,
++        qk_head_dim: int,
++        effective_v_head_dim: int,
++    ) -> bool:
++        long_k = FA4_MLA_PREFILL_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE
++        very_long_k = FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE
++        return (
++            max_seqlen_k < long_k
++            or (num_splits != 1 and max_seqlen_k == long_k)
++            or (
++                num_splits != 1
++                and max_seqlen_k == very_long_k
++                and not is_sm90
++                and qk_head_dim != effective_v_head_dim
++            )
++        )
++
+     def get_warmup_keys(self, vllm_config: "VllmConfig") -> list[CompileKey]:
+         from vllm.model_executor.layers.attention.mla_attention import (
+             get_mla_dims,
+@@ -185,58 +212,49 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+         effective_v_head_dim = (
+             qk_head_dim if requires_v_padding else mla_dims.v_head_dim
+         )
+-        shape_probes = [
+-            _FA4MLAPrefillShapeProbe(1, FA4_MLA_PREFILL_K_TILE),
+-            _FA4MLAPrefillShapeProbe(
+-                FA4_MLA_PREFILL_Q_TILE + 1,
+-                4 * FA4_MLA_PREFILL_K_TILE,
++        shape_probes = (
++            dict(max_seqlen_q=1, max_seqlen_k=FA4_MLA_PREFILL_K_TILE),
++            dict(
++                max_seqlen_q=FA4_MLA_PREFILL_Q_TILE + 1,
++                max_seqlen_k=4 * FA4_MLA_PREFILL_K_TILE,
+             ),
+-        ]
+-        if num_splits != 1:
+-            shape_probes.extend(
+-                (
+-                    _FA4MLAPrefillShapeProbe(
+-                        1,
+-                        FA4_MLA_PREFILL_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
+-                    ),
+-                    _FA4MLAPrefillShapeProbe(
+-                        FA4_MLA_PREFILL_Q_TILE + 1,
+-                        FA4_MLA_PREFILL_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
+-                    ),
+-                )
+-            )
+-            if not is_sm90 and qk_head_dim != effective_v_head_dim:
+-                shape_probes.extend(
+-                    (
+-                        _FA4MLAPrefillShapeProbe(
+-                            1,
+-                            FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
+-                        ),
+-                        _FA4MLAPrefillShapeProbe(
+-                            FA4_MLA_PREFILL_Q_TILE + 1,
+-                            FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
+-                        ),
+-                    )
+-                )
++            dict(
++                max_seqlen_q=1,
++                max_seqlen_k=FA4_MLA_PREFILL_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
++            ),
++            dict(
++                max_seqlen_q=FA4_MLA_PREFILL_Q_TILE + 1,
++                max_seqlen_k=FA4_MLA_PREFILL_LONG_K_BLOCKS * FA4_MLA_PREFILL_K_TILE,
++            ),
++            dict(
++                max_seqlen_q=1,
++                max_seqlen_k=FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS
++                * FA4_MLA_PREFILL_K_TILE,
++            ),
++            dict(
++                max_seqlen_q=FA4_MLA_PREFILL_Q_TILE + 1,
++                max_seqlen_k=FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS
++                * FA4_MLA_PREFILL_K_TILE,
++            ),
++        )
+ 
+         return self._trace_dispatch(self.dispatch)(
++            zip_inputs(*shape_probes),
+             batch_size=FA4_MLA_PREFILL_COMPILE_BATCH_SIZE,
+             dtype=dtype,
+             num_heads=num_heads,
+             mla_dims=mla_dims,
+-            shape_probe=shape_probes,
+             requires_v_padding=requires_v_padding,
++            is_sm90=is_sm90,
++            qk_head_dim=qk_head_dim,
++            effective_v_head_dim=effective_v_head_dim,
+             causal=FA4_MLA_PREFILL_CAUSAL_OPTIONS,
+             return_lse=FA4_MLA_PREFILL_LSE_OPTIONS,
+             num_splits=num_splits,
+             fa_version=fa_version,
++            _when=self._is_valid_warmup_shape_probe,
+         )
+ 
+-    @staticmethod
+-    def kernel(*args: Any, **kwargs: Any) -> Any:
+-        assert flash_attn_varlen_func is not None
+-        return flash_attn_varlen_func(*args, **kwargs)
+-
+     def compile(self, compile_key: CompileKey) -> None:
+         assert compile_flash_attn_varlen_func_from_specs is not None
+         window_size = (
+@@ -271,11 +289,13 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
+         runtime_kernel: Callable[..., Any] | None = None,
+         **kwargs: Any,
+     ) -> Any:
+-        kernel = self.kernel if runtime_kernel is None else runtime_kernel
+-        return kernel(q=q, k=k, v=v, **kwargs)
+-
+-
+-FA4_MLA_PREFILL_KERNEL = FA4MLAPrefillKernel()
++        return self.kernel(
++            q=q,
++            k=k,
++            v=v,
++            runtime_kernel=runtime_kernel,
++            **kwargs,
++        )
+ 
+ 
+ class FlashAttnPrefillBackend(MLAPrefillBackend):
+@@ -470,3 +490,6 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
+             causal=False,  # Context is unmasked
+             return_softmax_lse=True,
+         )
++
++
++FA4_MLA_PREFILL_KERNEL = FA4MLAPrefillKernel()
+diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
+index c823f82be2..c11698335a 100644
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -400,6 +400,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+ 
+     reorder_batch_threshold: int | None = None
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++    supports_draft_decode_metadata_update = True
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -649,6 +650,40 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+             **deepseek_v4_fields,  # type: ignore[arg-type]
+         )
+ 
++    def update_draft_decode_metadata(
++        self,
++        metadata: DeepseekSparseSWAMetadata,
++    ) -> None:
++        if metadata.num_decode_tokens == 0:
++            return
++        assert metadata.query_start_loc is not None
++        assert metadata.seq_lens is not None
++        assert metadata.token_to_req_indices is not None
++        assert metadata.is_valid_token is not None
++        assert metadata.decode_swa_indices is not None
++        assert metadata.decode_swa_lens is not None
++
++        _compute_swa_indices_and_lens_kernel[(metadata.num_decode_tokens,)](
++            metadata.decode_swa_indices,
++            metadata.decode_swa_indices.stride(0),
++            metadata.decode_swa_lens,
++            metadata.decode_swa_indices.shape[-1],
++            metadata.query_start_loc,
++            metadata.seq_lens,
++            metadata.token_to_req_indices,
++            metadata.is_valid_token,
++            metadata.block_table,
++            metadata.block_table.stride(0),
++            self.block_size,
++            token_offset=0,
++            TRITON_BLOCK_SIZE=1024,
++        )
++        tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
++        metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
++        metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
++        metadata.tile_sched_c128a = tile_sched[_LAYER_TYPE_C128A]
++        metadata.flashinfer_sparse_index_cache.clear()
++
+     def build_tile_scheduler(
+         self, num_decode_tokens: int
+     ) -> dict[str, FlashMLASchedMeta | None]:
+diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+index 8ab81c438f..6a09458729 100644
+--- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
++++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
+ 
++import os
+ from typing import TYPE_CHECKING, ClassVar
+ 
+ import torch
+@@ -31,6 +32,14 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# OFF by default. Restored purely to answer one question with GSM8K: every
++# measurement showing DSpark accuracy-neutral (0.951 at DCP=1 and DCP=4, pipeline
++# 61661482) was taken with this block present, and the first measurement without
++# it came back 0.923 against 0.950 no-spec. It was removed on an acceptance A/B,
++# and acceptance is exactly what a "target sees the drafted KV" defect inflates,
++# so acceptance could not have settled it.
++_DCP_FLATTEN = os.environ.get("VLLM_TS_MLA_DCP_FLATTEN", "0") == "1"
++
+ # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
+ #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
+ # Matches the kernel's `get_workspace_size` formula. MAX_Q_LEN=8 covers up to
+@@ -266,9 +275,47 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+         seq_lens = attn_metadata.decode.seq_lens
+         causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
+ 
++        # Per-query causal bounds for a causal multi-token block under DCP.
++        # causal_seqs is ONE global bound per request, but query j of a q_len
++        # block ending at global length L must see KV only up to
++        # L - (q_len - 1 - j). The kernel does compute that -- k_bound =
++        # ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world) -- which
++        # is why this was removed. Off by default; the flag exists so GSM8K can
++        # decide, because acceptance already gave the wrong answer once.
++        q_len_per_req = num_decode_tokens // num_decodes if num_decodes else 0
++        if (
++            _DCP_FLATTEN
++            and attn_metadata.causal
++            and self.dcp_world_size > 1
++            and q_len_per_req > 1
++            and num_decode_tokens % num_decodes == 0
++            and causal_seqs is not None
++        ):
++            offsets = torch.arange(
++                q_len_per_req - 1, -1, -1,
++                device=causal_seqs.device, dtype=causal_seqs.dtype,
++            )
++            per_q_global = torch.clamp(
++                (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1), min=0
++            )
++            # Rank-local length of each global bound, matching
++            # prepare_dcp_local_seq_lens in vllm/v1/worker/gpu/cp_utils.py.
++            interleave = self.cp_kv_cache_interleave_size
++            span = self.dcp_world_size * interleave
++            remainder = torch.clamp(
++                per_q_global % span - self.dcp_rank * interleave, min=0
++            )
++            seq_lens = (per_q_global // span) * interleave + torch.clamp(
++                remainder, max=interleave
++            )
++            causal_seqs = per_q_global
++            block_tables = block_tables.repeat_interleave(q_len_per_req, dim=0)
++            q = q.view(num_decodes * q_len_per_req, 1, q.shape[-2], q.shape[-1])
+         # tokenspeed_mla_decode expects query shape
+-        # (num_decodes, q_len_per_request, num_heads, head_dim).
+-        if num_decode_tokens % num_decodes != 0:
++        # (num_decodes, q_len_per_request, num_heads, head_dim). Standalone `if`,
++        # never chained to the block above: chaining skips the reshape on exactly
++        # the DCP multi-token path and the kernel gets a 3D query.
++        elif num_decode_tokens % num_decodes != 0:
+             logger.warning_once(
+                 """TokenspeedMLAImpl got a query of uneven length.
+                 This usually indicates an issue in batch reordering
+diff --git a/vllm/v1/attention/backends/mla/triton_mla.py b/vllm/v1/attention/backends/mla/triton_mla.py
+index 71a38e95d0..e55076700f 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla.py
++++ b/vllm/v1/attention/backends/mla/triton_mla.py
+@@ -57,6 +57,8 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+ 
+     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # DCP local sequence lengths are not advanced between draft steps.
++        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
+         # Only the non-causal DSpark draft group serves multi-token blocks via
+         # the decode path; raise its reorder threshold to the spec block length
+         # so full-cudagraph capture admits it. Causal usage stays single-token.
+@@ -64,6 +66,9 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+             self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+         self._reserve_attn_logits_workspace()
+ 
++    def update_draft_decode_metadata(self, _metadata: MLACommonMetadata) -> None:
++        pass
++
+     def _reserve_attn_logits_workspace(self) -> None:
+         """Pre-size the shared workspace for the decode split-KV attn logits.
+ 
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 3f9b9ed0c1..7814a8c0f8 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -100,6 +100,8 @@ class TritonAttentionMetadata:
+ 
+ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    # Step-dependent fields reference persistent input buffers directly.
++    supports_draft_decode_metadata_update = True
+ 
+     def __init__(
+         self,
+@@ -267,6 +269,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         return attn_metadata
+ 
++    def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
++        pass
++
+ 
+ class TritonAttentionBackend(AttentionBackend):
+     supported_dtypes: ClassVar[list[torch.dtype]] = [
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 70cd267506..cc0232ec42 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -578,15 +578,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                     "full-attention and Mamba groups, got: "
+                     f"{type(g.kv_cache_spec).__name__}."
+                 )
+-        # Partial hash hits are limited to full-attention + mamba ("align")
+-        # without context parallelism.
+-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
++        self.verify_and_split_kv_cache_groups()
++
++        # TP needs hashing finer than the Mamba block. DCP accepts equality
++        # because it scales the effective full-attention block instead.
++        self.enable_partial_hash_hits = any(
+             isinstance(g.kv_cache_spec, MambaSpec)
+             and g.kv_cache_spec.mamba_cache_mode == "align"
+-            and g.kv_cache_spec.block_size > hash_block_size
++            and (
++                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
++                or (
++                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
++                )
++            )
+             for g in kv_cache_config.kv_cache_groups
+         )
+-        self.verify_and_split_kv_cache_groups()
+ 
+     @property
+     def _cache_hit_alignment_tokens(self) -> int:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a781b45801..e2055ee914 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2808,14 +2808,37 @@ class Scheduler(SchedulerInterface):
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            # TODO (davidb): add support for hybrid memory allocator
+-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
++            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+             )
+ 
++            if len(req_block_id_groups) != 1:
++                # Mooncake reports load failures as physical block IDs without
++                # identifying the hybrid KV group. Attention and Mamba groups
++                # can use different logical block sizes, so there is no safe
++                # common token boundary at which to truncate them. Conservatively
++                # recompute the complete prefix for every matching hybrid request.
++                # This is a rare eviction-race path and preserves correctness.
++                req_hybrid_block_ids = {
++                    block_id
++                    for group_block_ids in req_block_id_groups
++                    for block_id in group_block_ids
++                }
++                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
++                    continue
++
++                request.num_computed_tokens = 0
++                total_affected_tokens += max(req_num_computed_tokens, 0)
++                if evict_blocks:
++                    blocks_to_evict.update(req_hybrid_block_ids)
++                affected_req_ids.add(req_id)
++                continue
++
++            (req_block_ids,) = req_block_id_groups
++
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f4f4..dbf223ec9b 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1559,6 +1559,7 @@ class MambaManager(SingleTypeKVCacheManager):
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
++                self._allocated_block_reqs.add(request_id)
+                 return []
+             else:
+                 prev_block_len = len(req_blocks)
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index c7d75b636c..ab4fedcbe0 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -248,7 +248,6 @@ class SingleDirectionOffloadingHandler:
+         blocks_per_chunk: int,
+         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
+         gpu_to_cpu: bool,
+-        mmap_region: SharedOffloadRegion | None = None,
+         canonical_layout: bool = False,
+     ):
+         """
+@@ -326,8 +325,6 @@ class SingleDirectionOffloadingHandler:
+         self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
+         self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
+ 
+-        # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
+-        self._mmap_region = mmap_region
+         # job_id -> event
+         self._transfer_events: dict[int, torch.Event] = {}
+         # queue of transfers (job_id, stream, event)
+@@ -711,18 +708,31 @@ class SingleDirectionOffloadingHandler:
+                 event.synchronize()
+ 
+     def shutdown(self) -> None:
++        """Drain this direction and release its transfer-side resources."""
++        sync_error: Exception | None = None
+         while self._transfers:
+-            transfer = self._transfers.popleft()
+-            transfer.end_event.synchronize()
++            transfer = self._transfers[0]
++            try:
++                transfer.end_event.synchronize()
++            except Exception as e:
++                logger.exception(
++                    "Failed to synchronize transfer end event; "
++                    "skipping %d remaining transfers",
++                    len(self._transfers) - 1,
++                )
++                self._transfers.clear()
++                sync_error = e
++                break
++            self._transfers.popleft()
++
+         self._transfer_events.clear()
+         self._stream_pool.clear()
+         self._event_pool.clear()
+         self._buffer_pool.clear()
+         self.src_tensors.clear()
+         self.dst_tensors.clear()
+-        if self._mmap_region is not None:
+-            self._mmap_region.cleanup()
+-            self._mmap_region = None
++        if sync_error is not None:
++            raise sync_error
+ 
+ 
+ class CPUOffloadingWorker(OffloadingWorker):
+@@ -742,6 +752,10 @@ class CPUOffloadingWorker(OffloadingWorker):
+         canonical_layout: bool = False,
+     ):
+         assert not canonical_layout or mmap_region is not None
++        # The caller owns mmap_region until this constructor returns. After a
++        # successful construction, the worker is the sole owner and releases
++        # it after both transfer directions have stopped.
++        self._mmap_region = mmap_region
+         pin_memory = PIN_MEMORY
+         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+         if mmap_region is not None and pin_memory:
+@@ -794,7 +808,6 @@ class CPUOffloadingWorker(OffloadingWorker):
+             blocks_per_chunk=blocks_per_chunk,
+             layer_refs_per_group=kv_caches.group_data_refs,
+             gpu_to_cpu=True,
+-            mmap_region=mmap_region,
+             canonical_layout=canonical_layout,
+         )
+ 
+@@ -827,5 +840,28 @@ class CPUOffloadingWorker(OffloadingWorker):
+         self._load_handler.wait(job_ids)
+ 
+     def shutdown(self) -> None:
+-        self._store_handler.shutdown()
+-        self._load_handler.shutdown()
++        handler_failed = False
++        try:
++            self._store_handler.shutdown()
++        except Exception:
++            logger.exception("Failed to shut down store offloading handler")
++            handler_failed = True
++
++        try:
++            self._load_handler.shutdown()
++        except Exception:
++            logger.exception("Failed to shut down load offloading handler")
++            handler_failed = True
++
++        if self._mmap_region is not None:
++            if handler_failed:
++                try:
++                    torch.accelerator.synchronize()
++                except Exception:
++                    logger.warning(
++                        "Device sync before mmap cleanup failed; "
++                        "proceeding with cleanup anyway",
++                        exc_info=True,
++                    )
++            self._mmap_region.cleanup()
++            self._mmap_region = None
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 2e6839fef5..a60a1cfd1b 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_coordinator import (
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
++    KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
+ )
+@@ -107,11 +108,8 @@ class SimpleCPUOffloadScheduler:
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+         # FA group's own block_size; divides scheduler_block_size (the LCM)
+         # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        self.fa_block_size: int = self._group_block_size(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec
+         )
+         assert self.block_size % self.fa_block_size == 0
+ 
+@@ -221,6 +219,22 @@ class SimpleCPUOffloadScheduler:
+             kv_cache_groups=gpu_config.kv_cache_groups,
+         )
+ 
++    def _group_block_size(self, spec: KVCacheSpec) -> int:
++        """Tokens one block of this group covers across the DCP ranks.
++
++        Mirrors ``resolve_kv_cache_block_sizes`` and the ``dcp_world_size`` that
++        ``HybridKVCacheCoordinator.find_longest_cache_hit`` passes down: DCP
++        shards the sequence for full-attention groups only, so a full-attention
++        block spans ``block_size * dcp`` tokens while a Mamba group keeps its
++        full per-rank state and spans ``block_size``. Scaling every group is a
++        no-op at dcp=1, which is why it went unnoticed; on a hybrid model at
++        dcp=4 it makes this manager take a quarter of the Mamba blocks it
++        should.
++        """
++        if isinstance(spec, FullAttentionSpec):
++            return spec.block_size * self.cp_world_size
++        return spec.block_size
++
+     @staticmethod
+     def _estimate_lazy_target_blocks(
+         kv_cache_config: "KVCacheConfig",
+@@ -272,6 +286,12 @@ class SimpleCPUOffloadScheduler:
+             remaining_hashes, max_hit_len
+         )
+ 
++        # update_state_after_alloc() indexes whole scheduler blocks per group and
++        # asserts that contract. Partial hash hits can return a finer length --
++        # under DCP the full-attention block is dcp x the hash block, so a hybrid
++        # model reports multiples of the hash block -- so re-align here. The
++        # surplus blocks stay pinned and are released with the rest.
++        hit_length = hit_length // self.block_size * self.block_size
+         if hit_length > 0:
+             pin_blocks = [
+                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
+@@ -355,9 +375,7 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+                 f"group {g} block_size={g_block_size}"
+@@ -376,9 +394,7 @@ class SimpleCPUOffloadScheduler:
+                 continue
+ 
+             # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+ 
+             # Back-trace: ext blocks sit at the tail of the computed range.
+@@ -595,9 +611,7 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-                )
++                g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+                 ready_blocks_g = aligned_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
+diff --git a/vllm/v1/worker/gpu/cp_utils.py b/vllm/v1/worker/gpu/cp_utils.py
+index 6dd8fd3474..c1b62290a6 100644
+--- a/vllm/v1/worker/gpu/cp_utils.py
++++ b/vllm/v1/worker/gpu/cp_utils.py
+@@ -59,3 +59,32 @@ def _dcp_local_seq_lens_kernel(
+     # For [num_reqs, max_num_reqs), pad with 0
+     local_seq_lens = tl.where(block < num_reqs, local_seq_lens, 0)
+     tl.store(out_ptr + block, local_seq_lens, mask=block < max_num_reqs)
++
++
++@triton.jit
++def cp_local_slot(
++    positions,
++    block_numbers,
++    block_size,
++    cp_rank,
++    CP_SIZE: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
++    PAD_ID: tl.constexpr,
++):
++    """KV slot for `positions` on this CP rank, or PAD_ID if not owned here.
++
++    DCP distributes a sequence round-robin over the CP ranks in chunks of
++    CP_INTERLEAVE, so a token's rank-local offset is not its global offset.
++    At CP_SIZE == 1 this reduces to the non-CP expression exactly.
++
++    `block_numbers` must have been loaded with the matching block index,
++    `positions // (block_size * CP_SIZE)`.
++    """
++    block_offsets = positions % (block_size * CP_SIZE)
++    if CP_SIZE == 1:
++        return block_numbers * block_size + block_offsets
++    is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
++    rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
++    remainder = block_offsets % CP_INTERLEAVE
++    local_offsets = rounds * CP_INTERLEAVE + remainder
++    return tl.where(is_local, block_numbers * block_size + local_offsets, PAD_ID)
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3a174cba80..9d7e70eccf 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -35,7 +35,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, is_uniform_query_len
+ 
+ logger = init_logger(__name__)
+ 
+@@ -97,10 +97,13 @@ def get_uniform_token_count(
+     """
+     Return the uniform token count if batch is uniform, else None.
+     A batch is uniform if all requests have the same number of tokens.
++
++    This is a shape test, so it is only valid for batches whose requests are
++    known to be decoding by construction (e.g. dummy runs, or a drafter step
++    that emits a fixed number of tokens per request). Batches coming from a
++    scheduler step must go through `get_uniform_decode_token_count`.
+     """
+-    if (max_query_len == num_tokens // num_reqs) and (
+-        num_tokens == max_query_len * num_reqs
+-    ):
++    if is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+         return max_query_len
+     return None
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a6ac6eb67e..05302347bc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -133,7 +133,12 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+ from vllm.v1.worker.gpu.states import RequestState
+ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
++from vllm.v1.worker.utils import (
++    KVBlockZeroer,
++    copy_kv_cache_blocks_inplace,
++    get_uniform_decode_token_count,
++    is_uniform_query_len,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -479,9 +484,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             block_sizes.append(spec.block_size)
+             # When using DCP, each request's KV cache is sharded among different ranks.
+             # As a result, one block on the current rank covers `block_size * cp_size`
+-            # tokens in the full, global (unsharded) sequence.
++            # tokens in the full, global (unsharded) sequence. Mamba state is
++            # replicated across DCP/PCP ranks and never sharded, so its rows stay
++            # position-indexed over the unsharded sequence -- the same rule
++            # MambaSpec.max_num_blocks_per_req states.
++            kv_shard_count = 1 if isinstance(spec, MambaSpec) else self.dcp_size
+             max_num_blocks = cdiv(
+-                block_table_max_model_len, spec.block_size * self.dcp_size
++                block_table_max_model_len, spec.block_size * kv_shard_count
+             )
+             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
+             if isinstance(spec, MambaSpec):
+@@ -1244,6 +1253,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+         )
+ 
++    def _get_uniform_token_count(
++        self,
++        scheduler_output: SchedulerOutput,
++        num_reqs: int,
++        num_tokens: int,
++        max_query_len: int,
++        dummy_run: bool,
++    ) -> int | None:
++        """Per-request token count of a uniform decode batch, or None.
++
++        Dummy batches (DP padding, memory profiling, warmup) are uniform by
++        construction and have no request state to consult, so they are
++        classified by shape alone. This mirrors `InputBatch.make_dummy`, which
++        marks every dummy request as not prefilling.
++        """
++        if dummy_run:
++            return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
++        # Shape first. This is the same test get_uniform_decode_token_count
++        # runs before it looks at any request state, and it rejects every
++        # mixed prefill/decode batch, which is most of them. Checking it here
++        # keeps the gather below off the hot path in that case.
++        if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++            return None
++        idx_mapping_np = np.fromiter(
++            map(
++                self.req_states.req_id_to_index.__getitem__,
++                scheduler_output.num_scheduled_tokens,
++            ),
++            dtype=np.intp,
++            count=num_reqs,
++        )
++        return get_uniform_decode_token_count(
++            num_reqs,
++            num_tokens,
++            max_query_len,
++            self.req_states.num_computed_prefill_tokens[idx_mapping_np],
++            self.req_states.prefill_len.np[idx_mapping_np],
++        )
++
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -1270,7 +1318,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
++        uniform_tok_count = self._get_uniform_token_count(
++            scheduler_output, num_reqs, num_toks, max_query_len, dummy_run
++        )
+ 
+         num_active_loras = 0
+         if self.lora_config:
+diff --git a/vllm/v1/worker/gpu/sample/bad_words.py b/vllm/v1/worker/gpu/sample/bad_words.py
+index b5517dee1b..768ff30a0f 100644
+--- a/vllm/v1/worker/gpu/sample/bad_words.py
++++ b/vllm/v1/worker/gpu/sample/bad_words.py
+@@ -3,14 +3,12 @@
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+-MAX_BAD_WORDS_TOTAL_TOKENS = 1024  # Max total tokens for all bad words per request
+-MAX_NUM_BAD_WORDS = 128  # Max number of bad words per request
+-
+ 
+ class BadWordsState:
+     def __init__(self, req_states: RequestState):
+@@ -18,15 +16,17 @@ class BadWordsState:
+         self.max_num_reqs = req_states.max_num_reqs
+         self.device = req_states.device
+ 
+-        # flattened bad word tokens: [max_num_reqs, MAX_BAD_WORDS_TOTAL_TOKENS]
++        max_total_tokens = envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS
++        max_num_bad_words = envs.VLLM_MAX_NUM_BAD_WORDS
++        # flattened bad word tokens: [max_num_reqs, VLLM_MAX_BAD_WORDS_TOTAL_TOKENS]
+         self.bad_word_token_ids = StagedWriteTensor(
+-            (self.max_num_reqs, MAX_BAD_WORDS_TOTAL_TOKENS),
++            (self.max_num_reqs, max_total_tokens),
+             dtype=torch.int32,
+             device=self.device,
+         )
+-        # cumulative offsets of bad words: [max_num_reqs, MAX_NUM_BAD_WORDS + 1]
++        # cumulative offsets of bad words: [max_num_reqs, VLLM_MAX_NUM_BAD_WORDS + 1]
+         self.bad_word_offsets = StagedWriteTensor(
+-            (self.max_num_reqs, MAX_NUM_BAD_WORDS + 1),
++            (self.max_num_reqs, max_num_bad_words + 1),
+             dtype=torch.int32,
+             device=self.device,
+         )
+@@ -40,10 +40,11 @@ class BadWordsState:
+             return
+ 
+         num_bad_words = len(bad_words_token_ids)
+-        if num_bad_words > MAX_NUM_BAD_WORDS:
++        max_num_bad_words = envs.VLLM_MAX_NUM_BAD_WORDS
++        if num_bad_words > max_num_bad_words:
+             raise ValueError(
+                 f"Too many bad words: {num_bad_words}. "
+-                f"The max number is {MAX_NUM_BAD_WORDS}."
++                f"The max number is {max_num_bad_words}."
+             )
+ 
+         # Flatten bad words and compute offsets
+@@ -53,10 +54,11 @@ class BadWordsState:
+             flattened_tokens.extend(bad_word)
+             offsets.append(len(flattened_tokens))
+ 
+-        if len(flattened_tokens) > MAX_BAD_WORDS_TOTAL_TOKENS:
++        max_total_tokens = envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS
++        if len(flattened_tokens) > max_total_tokens:
+             raise ValueError(
+                 f"Too many total bad word tokens: {len(flattened_tokens)}. "
+-                f"The max is {MAX_BAD_WORDS_TOTAL_TOKENS}."
++                f"The max is {max_total_tokens}."
+             )
+ 
+         # Stage writes
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 5ceb6c7558..2b269a4025 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -10,17 +10,18 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
++from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    BatchExecutionDescriptor,
+-    get_uniform_token_count,
+-)
++from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++from vllm.v1.worker.gpu.model_states.interface import ModelState
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+ )
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -41,6 +42,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
++        self.use_fused_multi_step_decode = False
+ 
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+@@ -76,6 +78,49 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         """
+         return True
+ 
++    def set_attn(
++        self,
++        model_state: ModelState,
++        kv_cache_config: KVCacheConfig,
++        block_tables: BlockTables,
++        target_input_buffers: InputBuffers,
++        target_attn_groups: list[list[AttentionGroup]],
++    ) -> None:
++        super().set_attn(
++            model_state,
++            kv_cache_config,
++            block_tables,
++            target_input_buffers,
++            target_attn_groups,
++        )
++        self._configure_fused_multi_step_decode()
++
++    def _configure_fused_multi_step_decode(self) -> None:
++        if self.num_speculative_steps == 1:
++            self.use_fused_multi_step_decode = False
++            return
++
++        if not self.advance_draft_positions:
++            self.use_fused_multi_step_decode = True
++            return
++
++        unsupported_backends = sorted(
++            {
++                attn_group.backend.get_name()
++                for attn_groups in self.attn_groups
++                for attn_group in attn_groups
++                if not attn_group.supports_draft_decode_metadata_update
++            }
++        )
++        self.use_fused_multi_step_decode = not unsupported_backends
++        if unsupported_backends:
++            logger.info_once(
++                "Fused multi-step draft decode is not supported by attention "
++                "backend(s) %s; falling back to rebuilding attention metadata "
++                "between draft steps.",
++                ", ".join(unsupported_backends),
++            )
++
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+         # Initialize cudagraph manager for draft prefill (draft position 0).
+         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+@@ -104,6 +149,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         # Reset indices to zeros to prevent stale values from prior
+         # dummy runs to cause out-of-bounds indexing during capture.
+         self.last_token_indices.zero_()
++        self.idx_mapping.zero_()
+ 
+         # Capture the prefill routine (model forward + compute_logits +
+         # sample).
+@@ -133,12 +179,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             return
+ 
+         self.on_multi_step_decode_begin(self.max_num_reqs)
+-        # Capture the decode draft generation routine (model forward +
+-        # sample + update_draft_inputs) for a single
+-        # step.
++        # Capture either the fused decode loop or one decode step per graph.
+         assert self.decode_cudagraph_manager is not None
++        decode_fn = (
++            self._generate_fused_drafts
++            if self.use_fused_multi_step_decode
++            else self._generate_draft
++        )
+         self.decode_cudagraph_manager.capture(
+-            self._generate_draft,
++            decode_fn,
+             self.model_state,
+             self.input_buffers,
+             self.block_tables,
+@@ -222,12 +271,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             # Use the actual number of tokens without padding added by
+             # the target model during FULL cudagraph.
+             num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.prefill_cudagraph_manager,
+@@ -290,7 +341,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         self.on_multi_step_decode_begin(num_reqs)
+         # Generate the remaining num_speculative_steps - 1 draft tokens.
+-        self._multi_step_decode(
++        decode_fn = (
++            self._fused_multi_step_decode
++            if self.use_fused_multi_step_decode
++            else self._multi_step_decode
++        )
++        decode_fn(
+             num_reqs,
+             dummy_run and skip_attn_for_dummy_run,
+             decode_batch_desc,
+@@ -435,10 +491,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     step=step,
+                 )
+ 
+-            # Update the current draft step.
+             self.current_draft_step.fill_(step)
+ 
+-            # Generate draft tokens for the current step.
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                 assert self.decode_cudagraph_manager is not None
+                 self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+@@ -452,6 +506,95 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                 )
+ 
++    def _fused_multi_step_decode(
++        self,
++        num_reqs: int,
++        skip_attn: bool,
++        batch_desc: BatchExecutionDescriptor,
++        num_tokens_across_dp: torch.Tensor | None,
++        seq_lens_cpu_upper_bound: torch.Tensor,
++    ) -> None:
++        positions = self.input_buffers.positions[:num_reqs]
++        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
++        idx_mapping = self.idx_mapping[:num_reqs]
++
++        attn_metadata = None
++        slot_mappings_by_layer = None
++        if not skip_attn:
++            slot_mappings = self.block_tables.compute_slot_mappings(
++                idx_mapping,
++                query_start_loc,
++                positions,
++                batch_desc.num_tokens,
++            )
++            if batch_desc.cg_mode != CUDAGraphMode.FULL:
++                slot_mappings_by_layer = build_slot_mappings_by_layer(
++                    slot_mappings, self.kv_cache_config
++                )
++            attn_metadata = self._build_draft_attn_metadata(
++                num_reqs=num_reqs,
++                num_reqs_padded=batch_desc.num_reqs or num_reqs,
++                num_tokens_padded=batch_desc.num_tokens,
++                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++                step=1,
++            )
++
++        if batch_desc.cg_mode == CUDAGraphMode.FULL:
++            assert self.decode_cudagraph_manager is not None
++            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
++            return
++
++        self._generate_fused_drafts(
++            num_reqs,
++            batch_desc.num_tokens,
++            attn_metadata,
++            slot_mappings_by_layer,
++            num_tokens_across_dp,
++            batch_desc.cg_mode,
++        )
++
++    def _generate_fused_drafts(
++        self,
++        num_reqs: int,
++        num_tokens_padded: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> None:
++        idx_mapping = self.idx_mapping[:num_reqs]
++        positions = self.input_buffers.positions[:num_reqs]
++        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
++        attn_groups = (
++            [group for groups in self.attn_groups for group in groups]
++            if attn_metadata is not None
++            else []
++        )
++
++        for step in range(1, self.num_speculative_steps):
++            self.current_draft_step.fill_(step)
++            self._generate_draft(
++                num_reqs,
++                num_tokens_padded,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp,
++                cudagraph_runtime_mode,
++            )
++            if (
++                step < self.num_speculative_steps - 1
++                and attn_metadata is not None
++                and self.advance_draft_positions
++            ):
++                self.block_tables.compute_slot_mappings(
++                    idx_mapping,
++                    query_start_loc,
++                    positions,
++                    num_tokens_padded,
++                )
++                for attn_group in attn_groups:
++                    attn_group.update_draft_decode_metadata(attn_metadata)
++
+     def _generate_draft(
+         self,
+         num_reqs: int,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index e59202c879..93dbb5aa14 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     build_slot_mappings_by_layer,
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     AttentionState,
+     BatchExecutionDescriptor,
+@@ -41,6 +42,21 @@ def _prepare_dflash_inputs_to_capture(
+     attn_metadata = None
+     if not skip_attn:
+         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
++        # The draft has two independent metadata paths -- this one for capture
++        # and DFlashSpeculator._build_draft_attn_metadata for serving. Only the
++        # serving one was DCP-aware, so build() dereferenced a None
++        # dcp_local_seq_lens during capture.
++        dcp_local_seq_lens = None
++        if block_tables.cp_size > 1:
++            prepare_dcp_local_seq_lens(
++                input_buffers.dcp_local_seq_lens,
++                input_buffers.seq_lens,
++                num_reqs,
++                block_tables.cp_size,
++                block_tables.cp_rank,
++                block_tables.cp_interleave,
++            )
++            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+@@ -49,6 +65,7 @@ def _prepare_dflash_inputs_to_capture(
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=num_tokens // num_reqs,
+             seq_lens=input_batch.seq_lens,
++            dcp_local_seq_lens=dcp_local_seq_lens,
+             max_seq_len=max_model_len,
+             block_tables=input_block_tables,
+             slot_mappings=slot_mappings,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 333648637b..a05cafd652 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+ from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+@@ -288,6 +289,20 @@ class DFlashSpeculator(DraftModelSpeculator):
+         if not self.draft_attn_layer_names:
+             return None
+         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
++        dcp_local_seq_lens = None
++        if self.block_tables.cp_size > 1:
++            # prepare_dflash_inputs has already written the draft's absolute
++            # sequence length (context + query block) into input_buffers.seq_lens,
++            # so this is the same call the target makes.
++            prepare_dcp_local_seq_lens(
++                self.input_buffers.dcp_local_seq_lens,
++                self.input_buffers.seq_lens,
++                num_reqs,
++                self.block_tables.cp_size,
++                self.block_tables.cp_rank,
++                self.block_tables.cp_interleave,
++            )
++            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+         return super()._build_draft_attn_metadata(
+             num_reqs,
+             num_reqs_padded,
+@@ -297,6 +312,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             num_query_per_req=self.num_query_per_req,
+             causal=causal,
+             query_start_loc_np=query_start_loc_np,
++            dcp_local_seq_lens=dcp_local_seq_lens,
+         )
+ 
+     @torch.inference_mode()
+@@ -392,6 +408,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 seeds,
+                 self.block_tables.input_block_tables[gid],
+                 self.block_tables.kernel_block_sizes[gid],
++                self.block_tables.cp_rank,
++                self.block_tables.cp_size,
++                self.block_tables.cp_interleave,
+                 self.parallel_drafting_token_id,
+                 self.num_query_per_req,
+                 self.num_speculative_steps,
+@@ -506,8 +525,11 @@ def _prepare_dflash_inputs_kernel(
+     max_num_reqs,
+     max_num_tokens,
+     max_model_len,
++    cp_rank,
+     SAMPLE_FROM_ANCHOR: tl.constexpr,
+     PAD_SLOT_ID: tl.constexpr,
++    CP_SIZE: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
+@@ -540,14 +562,16 @@ def _prepare_dflash_inputs_kernel(
+     # --- Context positions / slots ---
+     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
+     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+-    ctx_block_num = ctx_pos // block_size
++    ctx_block_num = ctx_pos // (block_size * CP_SIZE)
+     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
+     ctx_block_id = tl.load(
+         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
+         mask=is_ctx,
+         other=0,
+     ).to(tl.int64)
+-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
++    ctx_slot = cp_local_slot(
++        ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
++    )
+     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+ 
+@@ -557,14 +581,16 @@ def _prepare_dflash_inputs_kernel(
+     is_bonus = is_query & (query_off == 0)
+     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
+ 
+-    q_block_num = query_pos // block_size
++    q_block_num = query_pos // (block_size * CP_SIZE)
+     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
+     q_block_id = tl.load(
+         block_table_ptr + req_idx * block_table_stride + q_block_num,
+         mask=is_query,
+         other=0,
+     ).to(tl.int64)
+-    q_slot = q_block_id * block_size + (query_pos % block_size)
++    q_slot = cp_local_slot(
++        query_pos, q_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
++    )
+ 
+     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
+@@ -655,6 +681,9 @@ def prepare_dflash_inputs(
+     # [max_num_reqs, max_num_blocks]
+     block_table: torch.Tensor,
+     block_size: int,
++    cp_rank: int,
++    cp_size: int,
++    cp_interleave: int,
+     parallel_drafting_token_id: int,
+     num_query_per_req: int,
+     num_speculative_steps: int,
+@@ -702,7 +731,10 @@ def prepare_dflash_inputs(
+         max_num_reqs,
+         max_num_tokens,
+         max_model_len,
++        cp_rank,
+         SAMPLE_FROM_ANCHOR=sample_from_anchor,
+         PAD_SLOT_ID=PAD_SLOT_ID,
++        CP_SIZE=cp_size,
++        CP_INTERLEAVE=cp_interleave,
+         BLOCK_SIZE=BLOCK_SIZE,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index 4be22b4474..61d1c0003f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -12,9 +12,6 @@ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    get_uniform_token_count,
+-)
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+@@ -22,6 +19,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++from vllm.v1.worker.utils import get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -190,10 +188,12 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+ 
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             num_tokens,
+             max_query_len,
++            input_batch.num_computed_prefill_tokens_np,
++            input_batch.prefill_len_np,
+         )
+         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.cudagraph_manager,
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 69e0cc1091..80de83109b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -234,6 +234,7 @@ class DraftModelSpeculator(BaseSpeculator):
+         num_query_per_req: int = 1,
+         causal: bool | Mapping[int, bool] = True,
+         query_start_loc_np: np.ndarray | None = None,
++        dcp_local_seq_lens: torch.Tensor | None = None,
+     ) -> dict[str, Any] | None:
+         if query_start_loc_np is not None:
+             # Non-uniform query layout (e.g. multi-module MTP's mixed
+@@ -278,6 +279,11 @@ class DraftModelSpeculator(BaseSpeculator):
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=max_query_len,
+             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
++            dcp_local_seq_lens=(
++                None
++                if dcp_local_seq_lens is None
++                else dcp_local_seq_lens[:num_reqs_padded]
++            ),
+             max_seq_len=self.draft_max_seq_len,
+             block_tables=block_tables,
+             slot_mappings=slot_mappings,
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9d056cc67c..7b66dc2e44 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -299,6 +299,17 @@ class AttentionGroup:
+         assert len(self.metadata_builders) > ubatch_id
+         return self.metadata_builders[ubatch_id]
+ 
++    @property
++    def supports_draft_decode_metadata_update(self) -> bool:
++        return self.get_metadata_builder().supports_draft_decode_metadata_update
++
++    def update_draft_decode_metadata(
++        self,
++        attn_metadata: Mapping[str, Any],
++    ) -> None:
++        metadata = attn_metadata[self.layer_names[0]]
++        self.get_metadata_builder().update_draft_decode_metadata(metadata)
++
+ 
+ def select_common_block_size(
+     kv_manager_block_size: int,
+@@ -601,6 +612,63 @@ def copy_kv_cache_blocks_inplace(
+         blocks[dst_indices] = blocks[src_indices]
+ 
+ 
++def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
++    """Whether every request in the batch has the same query length.
++
++    This tests the batch shape only. Callers classifying a scheduled batch as a
++    decode batch must use ``get_uniform_decode_token_count`` instead, because a
++    prompt chunk can have a decode batch's shape.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++    """
++    return num_reqs > 0 and num_tokens == max_query_len * num_reqs
++
++
++def get_uniform_decode_token_count(
++    num_reqs: int,
++    num_tokens: int,
++    max_query_len: int,
++    num_computed_tokens: np.ndarray,
++    prefill_lens: np.ndarray,
++) -> int | None:
++    """Per-request token count of a uniform decode batch, or None.
++
++    A batch is a uniform decode batch only if every request has the same query
++    length *and* no request is still prefilling. Query length alone is a shape
++    test that a prompt chunk satisfies by coincidence: a prompt chunk of
++    ``1 + num_speculative_tokens`` tokens has the shape of a spec-decode step,
++    and a 1-token chunk has the shape of a plain decode step. Classifying such
++    a batch as a decode batch replays a decode-captured cudagraph over prompt
++    tokens, whose captured kernels read per-request state that a prefill
++    metadata build does not refresh.
++
++    Args:
++        num_reqs: Number of requests in the batch.
++        num_tokens: Total number of tokens in the batch.
++        max_query_len: Largest per-request query length in the batch.
++        num_computed_tokens: Per-request tokens computed before this step, in
++            batch order. Must be exactly ``num_reqs`` long; a full
++            ``max_num_reqs`` state array would compare the wrong requests.
++        prefill_lens: Per-request prefill length, i.e. the prompt plus any
++            output tokens recomputed after preemption, in batch order. Same
++            length requirement.
++
++    Returns:
++        The shared per-request query length, or None if the batch is not a
++        uniform decode batch.
++    """
++    if not is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++        return None
++    # Equivalent to `InputBatch.is_prefilling_np.any()`, which the drafter's
++    # call site derives from the same two arrays.
++    if np.any(num_computed_tokens < prefill_lens):
++        return None
++    return max_query_len
++
++
+ def is_residual_scattered_for_sp(
+     vllm_config: VllmConfig, num_input_tokens: int
+ ) -> bool:
