@@ -45,42 +45,68 @@ sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null && echo "[mooncake] enabled tcp_tw
 
 # ---- Mooncake store install (cu13 wheel for B300/GB300) ----------------------
 MOONCAKE_VERSION="${MOONCAKE_VERSION:-0.3.11.post1}"
-# Arch-aware, and the glibc floor below is a moving target -- read it before
-# trusting it. The cuda13 aarch64 wheels WERE manylinux_2_39; as of
-# 0.3.12.post1 they are manylinux_2_28, which installs on glibc 2.35. Leaving
-# the old 2.39 floor in place silently downgraded every GB300 run to
-# mooncake-transfer-engine 0.3.9, whose register_buffer signature does not match
-# what vLLM's MooncakeStoreConnector calls: 96 registrations per worker rejected
+# Pick the wheel by (arch, CUDA major), then let pip decide whether it INSTALLS.
+#
+# The wheel has to satisfy two independent things: glibc (does it install) and
+# libcudart.so.<major> (does it import). CUDA major is a property of the image,
+# so it is tested here. glibc is NOT -- it is a property of the wheel, and it
+# moves per release:
+#
+#   mooncake-transfer-engine-cuda13   0.3.11.post1  manylinux_2_39_aarch64
+#                                     0.3.12.post1  manylinux_2_28_aarch64
+#
+# This block used to hardcode "glibc < 2.39 -> fall back". That was correct at
+# the 0.3.11.post1 pin and became wrong the moment we pinned 0.3.12.post1: on
+# GB300 (glibc 2.35) it rejected a wheel that installs fine, and silently ran
+# mooncake-transfer-engine 0.3.9 instead. 0.3.9's register_buffer is not what
+# vLLM's MooncakeStoreConnector calls -- 96 registrations per worker rejected
 # with ErrorCode::INVALID_PARAMS (-600), then 82,760 AddressNotRegistered, and
 # an offload tier that moved zero bytes while every arm was still labelled
 # "dram-mooncake".
-# Pick the wheel by (arch, CUDA major) so it both INSTALLS (glibc) and IMPORTS
-# (libcudart.so.<major>):
-#   - x86: cuda13 wheel (manylinux_2_35, glibc 2.35 ok on bia 22.04).
-#   - aarch64 + cu13 container (24.04, glibc 2.39): cuda13 wheel (manylinux_2_39).
-#   - aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35 + needs libcudart.so.12).
-# The cu13 aarch64 wheel needs glibc 2.39, so it ONLY works on a 24.04 cu13 image.
+#
+# So do not encode a floor at all. Ask pip -- it knows the tags of the wheel it
+# is actually being asked for. Ask it by attempting the install rather than with
+# --dry-run: --dry-run needs pip>=22.2, and a probe that errors for the wrong
+# reason would fall back silently, which is the exact failure being fixed here.
+# A platform mismatch is resolver-stage, so it costs a metadata fetch, not a
+# 100 MB wheel.
 CU_MAJOR=$(ldconfig -p 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | grep -oE '[0-9]+$' | sort -un | tail -1)
-# glibc minor (e.g. 35 for 2.35). The cuda13 aarch64 wheels are manylinux_2_39
-# (glibc>=2.39, Ubuntu 24.04); older cu13 images (22.04, glibc 2.35) can't install them.
 GLIBC_MINOR=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+$')
 echo "[mooncake] arch=$(uname -m) cuda_major=${CU_MAJOR:-unknown} glibc=2.${GLIBC_MINOR:-?}"
+
+# Clear BOTH distributions first. They provide the same `mooncake` package, so
+# with both installed --force-reinstall only overwrites files and leaves the
+# loser's metadata behind: `pip show <name>` then answers for a version that is
+# not the one importing. Uninstalling afterwards is worse -- it deletes the files
+# the winner just wrote. Start from zero and there is one answer.
+for _mc in mooncake-transfer-engine-cuda13 mooncake-transfer-engine; do
+    if pip show "${_mc}" >/dev/null 2>&1; then
+        echo "[mooncake] removing pre-existing ${_mc}"
+        pip uninstall --quiet -y "${_mc}" >/dev/null 2>&1 || true
+    fi
+done
+
+MOONCAKE_FALLBACK_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
 NEED_CUDART12_SHIM=0
+MOONCAKE_INSTALLED=0
 if [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "12" ]; then
-    # aarch64 + cu12 container: non-cuda13 wheel (manylinux_2_35, links libcudart.so.12).
-    MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
-elif [ "$(uname -m)" = "aarch64" ] && [ "${CU_MAJOR}" = "13" ] && [ -n "${GLIBC_MINOR}" ] && [ "${GLIBC_MINOR}" -lt "${MOONCAKE_CU13_GLIBC_MIN:-28}" ]; then
-    # aarch64 + cu13 container but glibc<2.39 (e.g. vLLM nightly arm64 on 22.04): the
-    # cuda13 wheel (manylinux_2_39) won't install. Fall back to the non-cuda13 2.35 wheel
-    # (0.3.9 satisfies vLLM's kv_connectors floor >=0.3.8) and provide libcudart.so.12 via
-    # the cu12 runtime pip pkg so it IMPORTS on the cu13 container.
-    MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_AARCH_VERSION:-0.3.9}"
-    NEED_CUDART12_SHIM=1
+    # aarch64 + cu12 image: the cuda13 wheel would install and then fail to
+    # import (libcudart.so.13). Not a glibc question -- go straight to non-cu13.
+    MOONCAKE_PKG="${MOONCAKE_FALLBACK_PKG}"
 else
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
+    echo "[mooncake] trying ${MOONCAKE_PKG}"
+    if pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"; then
+        MOONCAKE_INSTALLED=1
+    else
+        echo "[mooncake] pip rejected ${MOONCAKE_PKG} on this platform (glibc 2.${GLIBC_MINOR:-?})"
+        echo "[mooncake] falling back to ${MOONCAKE_FALLBACK_PKG} + cu12 runtime shim"
+        MOONCAKE_PKG="${MOONCAKE_FALLBACK_PKG}"
+        [ "${CU_MAJOR}" = "13" ] && NEED_CUDART12_SHIM=1
+    fi
 fi
 if [ "${NEED_CUDART12_SHIM}" = "1" ]; then
-    echo "[mooncake] cu13 image + glibc<2.39 -> installing cu12 runtime shim (libcudart.so.12)"
+    echo "[mooncake] cu13 image + non-cu13 wheel -> installing cu12 runtime shim (libcudart.so.12)"
     pip install --quiet --no-cache-dir "nvidia-cuda-runtime-cu12"
     # Locate libcudart.so.12 via pip's install Location (importing the `nvidia` namespace
     # package is unreliable — it has no importable __init__), then a filesystem fallback.
@@ -103,9 +129,12 @@ if [ "${NEED_CUDART12_SHIM}" = "1" ]; then
         echo "[mooncake] WARN: could not locate cu12 libcudart.so.12 — mooncake import may fail"
     fi
 fi
-echo "[mooncake] installing ${MOONCAKE_PKG}"
-pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
+if [ "${MOONCAKE_INSTALLED}" != "1" ]; then
+    echo "[mooncake] installing ${MOONCAKE_PKG}"
+    pip install --quiet --no-cache-dir --no-deps --force-reinstall "${MOONCAKE_PKG}"
+fi
 python3 -c "from mooncake.store import MooncakeDistributedStore" >/dev/null
+pip list 2>/dev/null | grep -i "^mooncake" | sed 's/^/[mooncake] present: /'
 echo "[mooncake] installed ${MOONCAKE_PKG}"
 
 # Bound MooncakeStoreConnector transfer batches (InferenceX patch). Mooncake's TCP
