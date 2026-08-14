@@ -211,7 +211,11 @@ fi
 # Site 2: which keys are asked for. A string replacement rather than a diff --
 # two hand-made patches for this one hunk failed for reasons unrelated to the
 # change (wrong base tree, then a malformed @@ header), each costing a submit.
-python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
+if [ "${K3_MOONCAKE_LOOKUP_PATCHES:-0}" = "1" ]; then
+    python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
+else
+    echo "[patch] lookup-align skipped (K3_MOONCAKE_LOOKUP_PATCHES != 1)"
+fi
 # And one sample key from each side. The master says 19,224 keys are resident
 # and Get never fires, so written and queried keys disagree; a key is a string,
 # so print one of each and read the difference instead of deriving it.
@@ -229,7 +233,9 @@ python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
 # our alignment work), not against repo/vllm -- applying the branch commit
 # directly lands with fuzz 2 and a 44-line offset.
 REVAL_PATCH=/configs/patches/vllm-mooncake-50359-exact-hit-revalidate.patch
-if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${REVAL_PATCH}" >/dev/null 2>&1; then
+if [ "${K3_MOONCAKE_LOOKUP_PATCHES:-0}" != "1" ]; then
+    echo "[patch] #50359 revalidation skipped (K3_MOONCAKE_LOOKUP_PATCHES != 1)"
+elif patch --batch --forward --dry-run -d "${SITE}" -p1 < "${REVAL_PATCH}" >/dev/null 2>&1; then
     patch --batch --forward -d "${SITE}" -p1 < "${REVAL_PATCH}"
     echo "[patch] applied: #50359 exact-hit revalidation"
 elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${REVAL_PATCH}" >/dev/null 2>&1; then
