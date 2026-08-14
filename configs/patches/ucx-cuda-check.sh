@@ -1,0 +1,129 @@
+#!/bin/bash
+# shellcheck shell=bash
+
+# --- why UCX may not see CUDA -------------------------------------------
+# nixl's wheel does ship the CUDA plugins (libuct_cuda.so, libucm_cuda.so), so
+# "UCX CUDA support was not found" is a load failure, not a missing build. Their
+# NEEDED list is the tell:
+#   libuct_cuda.so -> libcuda.so.1, libnvidia-ml.so.1
+#   libucm_cuda.so -> libcuda.so.1, libcudart.so.13
+# torch only needs libcuda + libcudart, which is why the model loads and KV cache
+# is sized normally while UCX still refuses VRAM. libnvidia-ml.so.1 is injected by
+# the container runtime only when NVIDIA_DRIVER_CAPABILITIES includes `utility`.
+# Print the loader's view so the next failure names the missing library instead
+# of leaving us to infer it.
+echo "=== driver libraries the UCX CUDA plugin needs ==="
+echo "  NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-<unset>}"
+for _lib in libcuda.so.1 libnvidia-ml.so.1 libcudart.so.13; do
+    _found=$(ldconfig -p 2>/dev/null | grep -m1 "${_lib}" || true)
+    if [ -n "${_found}" ]; then
+        echo "  ok      ${_lib}: ${_found##*=> }"
+    else
+        echo "  MISSING ${_lib}"
+    fi
+done
+# Resolve the plugin dir from the library the loader actually binds, not from a
+# glob. With both cuda variants installed, `glob('nixl*.libs/ucx')` returns
+# nixl_cu12 first purely because it sorts first, which is what made the previous
+# guard kill every oci arm: it compared a correct UCX_MODULE_DIR against the
+# wrong sibling. ldd on the binding extension resolves the libucs that will be
+# loaded, and its own directory is the only one that matters.
+_plugdir=$(python3 -c "
+import pathlib, subprocess
+try:
+    import nixl
+    binding = nixl._bindings
+except Exception:
+    raise SystemExit(0)
+print('  binding:', binding.__file__)
+out = subprocess.run(['ldd', binding.__file__], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    if 'libucs' in line and '=>' in line:
+        print(pathlib.Path(line.split('=>')[1].split('(')[0].strip()).parent / 'ucx')
+        break
+" 2>/dev/null | tee /dev/stderr | tail -1)
+if [ -n "${_plugdir}" ]; then
+    echo "  ucx plugin dir (from the loaded libucs): ${_plugdir}"
+    for _p in "${_plugdir}"/libuct_cuda.so "${_plugdir}"/libucm_cuda.so; do
+        [ -e "${_p}" ] && echo "    present: $(basename ${_p})"
+    done
+    # ldd resolves exactly what the loader will, including the injected driver.
+    ldd "${_plugdir}/libuct_cuda.so" 2>/dev/null | grep -E "not found|libcuda|libnvidia-ml" | sed 's/^/    /' || true
+    # UCX_MODULE_DIR should NOT be set. libucs carries the compiled-in default
+    # "/usr/lib64/ucx", which is what we reasoned from, but it does not use it
+    # blindly: it exports ucs_sys_get_lib_path and ucs_module_loader_add_dl_dir,
+    # and calls dladdr on its own symbol to locate itself, then searches the
+    # module dir relative to where it actually lives. auditwheel's relocation is
+    # therefore already handled -- the plugins sit next to libucs in the wheel's
+    # .libs and UCX finds them.
+    #
+    # Setting the variable can only do harm here, because both cuda variants are
+    # installed: it forces one absolute directory on whichever libucs is loaded,
+    # so if the process binds nixl_cu12's libucs it is handed cu13's plugins.
+    if [ -n "${UCX_MODULE_DIR:-}" ] && [ "${UCX_MODULE_DIR}" != "${_plugdir}" ]; then
+        echo "[ucx] WARNING: UCX_MODULE_DIR=${UCX_MODULE_DIR} overrides the" \
+             "dir belonging to the loaded libucs (${_plugdir}). Unset it in the arm." >&2
+    fi
+    # The cu13 wheel has shipped a cu12 UCX before (1.3.0 and 1.3.1 both bundle
+    # nixl-cu12's libucp). Catch that here rather than 40 minutes later as
+    # "UCX CUDA support was not found" with every library resolving.
+    _ucp=$(ls "${_plugdir}"/../libucp-*.so.* 2>/dev/null | head -1)
+    if [ -n "${_ucp}" ]; then
+        echo "    bundled UCX: $(basename "${_ucp}")"
+        case "$(basename "${_ucp}")" in
+            libucp-fb7bfdea.*)
+                echo "[ucx] FATAL: this is nixl-cu12's UCX inside the cu13 wheel" \
+                     "(nixl-cu13 1.3.0/1.3.1). Its CUDA component will not load on a" \
+                     "CUDA 13 image. Pin NIXL_VER=1.3.2 or later." >&2
+                exit 1 ;;
+        esac
+    fi
+    # Is there a system UCX in this image at all? The wheel's copy is the only
+    # one vLLM's Dockerfile installs, but a base image or a transitive dep (e.g.
+    # OpenMPI) can drag one in -- and a properly installed UCX has its CUDA
+    # component where its own prefix expects it. If one exists, pointing at it
+    # is a better answer than routing NIXL around UCX, which changes the
+    # transport and therefore the numbers.
+    echo "  system UCX (outside the wheel):"
+    ldconfig -p 2>/dev/null | grep -E "libucp|libuct|libucs" | grep -v "nixl" | sed 's/^/    /' || echo "    none"
+    for _d in /usr/lib64/ucx /usr/lib/aarch64-linux-gnu/ucx /usr/local/ucx/lib/ucx /opt/hpcx/ucx/lib/ucx; do
+        [ -d "${_d}" ] && echo "    module dir exists: ${_d} ($(ls "${_d}" 2>/dev/null | grep -c cuda) cuda modules)"
+    done
+fi
+
+# --- functional probe -----------------------------------------------------
+# Everything above is static: which files exist, what ldd resolves. None of it
+# distinguishes "the plugin is present" from "the plugin is present and dlopen
+# rejects it", and that distinction is the whole open question on oci-aga. So
+# ask UCX to do the thing that fails. UCX_LOG_LEVEL=debug makes the module
+# loader print the dlerror for every module it declines, which no amount of
+# file listing can give us.
+#
+# This runs in the same container, on the same node, ~2 minutes in, instead of
+# surfacing as NIXL_ERR_BACKEND at KV-cache init ten minutes later.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    echo "=== probing UCX for CUDA support (debug log) ==="
+    _ucxlog=$(mktemp)
+    UCX_LOG_LEVEL=debug python3 - >"${_ucxlog}" 2>&1 <<'PROBE'
+import torch
+from nixl._api import nixl_agent, nixl_agent_config
+
+buf = torch.zeros(1024, dtype=torch.uint8, device="cuda:0")
+agent = nixl_agent("ucx-probe", nixl_agent_config(backends=["UCX"]))
+agent.register_memory([buf])
+print("PROBE_OK: UCX registered VRAM")
+PROBE
+    _rc=$?
+    grep -iE "cuda|module|PROBE_OK|Error|not found" "${_ucxlog}" | tail -40 | sed 's/^/    /'
+    if [ "${_rc}" -ne 0 ] || ! grep -q PROBE_OK "${_ucxlog}"; then
+        echo "[ucx] FATAL: UCX cannot register VRAM in this container." >&2
+        echo "[ucx]   The debug lines above name the module and the dlerror." >&2
+        tail -60 "${_ucxlog}" >&2
+        exit 1
+    fi
+    echo "  UCX registered VRAM"
+    rm -f "${_ucxlog}"
+else
+    echo "=== skipping UCX probe: no GPU visible in the setup context ==="
+fi
+
