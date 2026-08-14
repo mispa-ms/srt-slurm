@@ -161,25 +161,21 @@ fi
 #
 # Reverting this restores the sub-block tail from vllm#49502; measure before
 # keeping either way.
-# Two alignment sites, not one. find_longest_cache_hit decides how much of a hit
-# is reported; align_lookup_length decides which keys are asked for -- worker.py
-# fixes token_len from it and builds the candidate key list. Patching only the
-# first leaves the lookup still asking for sub-block keys, which is the bug both
-# are here to remove.
-for ALIGN_PATCH in \
-    /configs/patches/vllm-mooncake-external-hit-block-aligned.patch \
-    /configs/patches/vllm-mooncake-lookup-align.patch
-do
-    if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
-        patch --batch --forward -d "${SITE}" -p1 < "${ALIGN_PATCH}"
-        echo "[patch] applied: $(basename "${ALIGN_PATCH}")"
-    elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
-        echo "[patch] already present: $(basename "${ALIGN_PATCH}")"
-    else
-        echo "[patch] FATAL: $(basename "${ALIGN_PATCH}") does not apply" >&2
-        exit 1
-    fi
-done
+# Site 1: how much of a hit is reported. A .patch, cut against this tree.
+ALIGN_PATCH=/configs/patches/vllm-mooncake-external-hit-block-aligned.patch
+if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+    patch --batch --forward -d "${SITE}" -p1 < "${ALIGN_PATCH}"
+    echo "[patch] applied: external hit is block-aligned"
+elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+    echo "[patch] external-hit alignment already present"
+else
+    echo "[patch] FATAL: the external-hit alignment patch does not apply" >&2
+    exit 1
+fi
+# Site 2: which keys are asked for. A string replacement rather than a diff --
+# two hand-made patches for this one hunk failed for reasons unrelated to the
+# change (wrong base tree, then a malformed @@ header), each costing a submit.
+python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 
 echo "=== verifying the patched tree ==="
