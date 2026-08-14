@@ -1,0 +1,62 @@
+diff -ruN a/vllm/v1/core/sched/scheduler.py fix/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-08-14 09:07:20.313986720 -0700
++++ fix/vllm/v1/core/sched/scheduler.py	2026-08-14 09:07:20.355011889 -0700
+@@ -436,7 +436,37 @@
+         )
+         return blocks, num_local, shared_prefix_boundary, False
+ 
++    # Round 4 of the vllm#51766 hunt. Rounds 1-3 showed decode steps are ~35%
++    # slower with the fix while per-step event counts and prefill steps are
++    # unchanged, and that a wall-clock trace cannot settle it because the
++    # capture window's prefill/decode mix is not controllable. This splits the
++    # engine step two ways -- host time inside schedule(), everything else --
++    # which is the cheapest question that still has a decisive answer.
++    _sched_ns = 0
++    _sched_calls = 0
++    _steps = 0
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
++        _t0 = time.perf_counter_ns()
++        try:
++            return self._schedule_body(throttle_prefills)
++        finally:
++            Scheduler._sched_ns += time.perf_counter_ns() - _t0
++            Scheduler._sched_calls += 1
++            Scheduler._steps += 1
++            if Scheduler._steps % 500 == 0:
++                from vllm.v1.core.single_type_kv_cache_manager import MambaManager
++
++                logger.info(
++                    "step-split: steps=%d sched_total_ms=%.1f sched_per_call_us=%.1f "
++                    "early_return=%d",
++                    Scheduler._steps,
++                    Scheduler._sched_ns / 1e6,
++                    Scheduler._sched_ns / 1e3 / max(Scheduler._sched_calls, 1),
++                    MambaManager.n_early,
++                )
++
++    def _schedule_body(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+diff -ruN a/vllm/v1/core/single_type_kv_cache_manager.py fix/vllm/v1/core/single_type_kv_cache_manager.py
+--- a/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-14 09:07:20.315265799 -0700
++++ fix/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-14 09:07:20.355543032 -0700
+@@ -1249,6 +1249,9 @@
+ 
+ 
+ class MambaManager(SingleTypeKVCacheManager):
++    # Early returns taken on the path vllm#51766 marks.
++    n_early = 0
++
+     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+ 
+     def __init__(
+@@ -1557,6 +1560,7 @@
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
++                MambaManager.n_early += 1
+                 self._allocated_block_reqs.add(request_id)
+                 return []
+             else:
