@@ -187,9 +187,15 @@ PROBE
             # of lines before the failure, so grep for it by name rather than
             # taking a tail that will never reach back that far. The GDR lines
             # repeat once per rail; one is enough.
-            echo "[ucx] --- uct module loads ---"
-            grep -E "loading modules for uct|uct_cuda|libuct_cuda|module.c" "${_ucxlog}" \
-                | head -12
+            # Filter to the cuda components specifically. Taking the first N
+            # module.c lines fills the budget with uct_ib/mlx5/efa loads, which
+            # are known to work, and never reaches the one that matters. UCX
+            # dlopens libuct_cuda.so for the uct component; ctypes shows that
+            # library loads fine by hand, so whether UCX asks for it at all is
+            # the open half of the question.
+            echo "[ucx] --- uct cuda module ---"
+            grep -E "loading modules for uct$|module '(cuda|cuda_copy|cuda_ipc|gdr_copy)'|libuct_cuda|cuda_ipc|gdr_copy" \
+                "${_ucxlog}" | head -12 || echo "  (uct never asked for a cuda module)"
             echo "[ucx] --- memory domains ---"
             grep -E "memory domain|md open|query .* resources" "${_ucxlog}" | head -8
             # The IB memory domain will register CUDA memory through either
