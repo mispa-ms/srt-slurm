@@ -262,6 +262,32 @@ else
     exit 1
 fi
 
+# --- ours: block-align the external hit ------------------------------------
+# Not from Wei or Hanjie. The mooncake store keys one object per block_size
+# chunk, so the only lengths it can serve are multiples of the block size, but
+# the lookup aligns to hash_block_size whenever partial hash hits are on. The
+# reported hit then lands where nothing was written, the load finds nothing, and
+# nothing errors -- which is why every K3 DCP run here writes gigabytes and
+# reads back 0.0% external hit while save_put_failed_keys stays 0.
+#
+# configs/patches/test_mooncake_dcp_keyset.py has been failing on exactly this
+# at dcp=2/4/8 (and passing at dcp=1). I dismissed it twice as a stale test
+# before connecting it to the 0%.
+#
+# Reverting this restores the sub-block tail from vllm#49502; measure before
+# keeping either way.
+ALIGN_PATCH=/configs/patches/vllm-mooncake-external-hit-block-aligned.patch
+if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+    patch --batch --forward -d "${SITE}" -p1 < "${ALIGN_PATCH}"
+    echo "[patch] applied: external hit is block-aligned"
+elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+    echo "[patch] external-hit alignment already present"
+else
+    echo "[patch] FATAL: the external-hit alignment patch does not apply" >&2
+    exit 1
+fi
+python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
+
 echo "=== verifying the patched tree ==="
 # Read the tree rather than trust the applier's exit code: `patch --forward`
 # reports success when it decides a hunk is already applied, so a partially

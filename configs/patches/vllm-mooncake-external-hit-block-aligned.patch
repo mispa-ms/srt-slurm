@@ -1,0 +1,34 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index 7ab7b79945..bc1e66c036 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -316,11 +316,24 @@ class MooncakeStoreCoordinator:
+         used by ``load_mask`` to avoid popping a second block on top of the
+         one already removed by the lookup.
+         """
+-        alignment_tokens = (
+-            self.hash_block_size
+-            if self.enable_partial_hash_hits
+-            else self.lcm_block_size
+-        )
++        # The store keys one object per block_size chunk, by that chunk's last
++        # hash_block_size sub-hash (see chunk_hashes_for_block_size in data.py),
++        # so the only lengths it can serve are multiples of the block size.
++        # Aligning the lookup to hash_block_size lets it report a hit at a
++        # sub-block boundary, and loading that asks for a key nobody wrote: the
++        # request succeeds, finds nothing, and reports no error. That is why
++        # every K3 DCP run offloads gigabytes and reads back 0.0%.
++        #
++        # Under DCP the gap is unmissable -- block_size is scaled by
++        # dcp_world_size, so at DCP8 a block is 12288 tokens (96 hashes) while
++        # the reported hit lands on any multiple of 128. configs/patches/
++        # test_mooncake_dcp_keyset.py fails at dcp=2, 4 and 8 and passes at
++        # dcp=1 for exactly this reason.
++        #
++        # Round to what the store can answer. This gives up the sub-block tail
++        # that vllm#49502 added, which costs at most one block of prefix per
++        # request and cannot be worse than the 0% we measure today.
++        alignment_tokens = self.lcm_block_size
+         if len(self.attention_groups) == 1:
+             spec, group_ids, manager_cls, group_eagle = self.attention_groups[0]
+             hit_blocks, hit_length = manager_cls.find_longest_cache_hit(
