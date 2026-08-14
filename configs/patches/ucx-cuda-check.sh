@@ -91,6 +91,12 @@ if [ -n "${_plugdir}" ]; then
     done
 fi
 
+# --- read the run that works ----------------------------------------------
+# Before probing our own container again, diff it against Hanjie's working
+# run, whose logs are on this filesystem. Non-fatal: it is evidence, not a
+# gate, and it must run before the probe's exit 1.
+bash /configs/patches/diff-against-working-run.sh || true
+
 # --- functional probe -----------------------------------------------------
 # Everything above is static: which files exist, what ldd resolves. None of it
 # distinguishes "the plugin is present" from "the plugin is present and dlopen
