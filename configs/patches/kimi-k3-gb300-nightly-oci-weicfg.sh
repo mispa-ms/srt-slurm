@@ -73,6 +73,19 @@ if [ -z "${K3_STAGED_DIR:-}" ]; then
          "fall back to downloading 1.45 TB. Set K3_STAGED_DIR to the local copy." >&2
 fi
 
+# Optional: fill MOONCAKE_DEVICE and UCX_NET_DEVICES from this node's own
+# active RDMA devices. Sourced, not run -- the exports have to survive into
+# the worker command, which shares this shell -- and before the deps script,
+# which renders MOONCAKE_DEVICE into the mooncake config JSON.
+#
+# Behind a flag so it changes only the arm that asks for it. Every other arm
+# keeps the behaviour that produced the numbers we have.
+if [ "${K3_RDMA_AUTOPIN:-0}" = "1" ]; then
+    . /configs/patches/detect-rdma-devices.sh
+else
+    echo "[rdma] autopin off (K3_RDMA_AUTOPIN != 1)"
+fi
+
 # hfshim first -- the model has to resolve before anything else matters -- then
 # the Mooncake wheel, config and master.
 bash /configs/patches/vllm-container-deps-k3-mooncake.sh
