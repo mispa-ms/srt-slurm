@@ -197,6 +197,7 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
         nodes=SimpleNamespace(infra="infra-node", worker=["node-a"]),
         gpus_per_node=8,
         environment={},
+        environment_unset=(),
         container_image=Path("/container.sqsh"),
         container_mounts={},
         srun_options=[],
@@ -254,6 +255,7 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
         nodes=SimpleNamespace(infra="infra-node", worker=["node-a"]),
         gpus_per_node=8,
         environment={},
+        environment_unset=(),
         container_image=Path("/container.sqsh"),
         container_mounts={},
         srun_options=[],
@@ -425,6 +427,92 @@ def test_start_srun_omits_het_group_when_none() -> None:
         assert not str(arg).startswith("--het-group")
 
 
+def _worker_mixin(tmp_path: Path, environment_unset: tuple[str, ...]) -> "WorkerStageMixin":
+    """A WorkerStageMixin wired to a single-node vLLM endpoint."""
+    backend = MagicMock()
+    backend.type = "vllm"
+    backend.build_worker_command.return_value = ["python3", "-m", "worker"]
+    backend.get_environment_for_mode.return_value = {}
+    backend.get_process_environment.return_value = {}
+
+    mixin = WorkerStageMixin()
+    mixin.config = SimpleNamespace(
+        setup_script=None,
+        frontend=SimpleNamespace(type="sglang"),
+        dynamo=SimpleNamespace(install=False, request_plane="nats", event_plane=None),
+        observability=ObservabilityConfig(),
+        profiling=SimpleNamespace(enabled=False, is_nsys=False),
+        backend=backend,
+    )
+    mixin.runtime = SimpleNamespace(
+        log_dir=tmp_path,
+        head_node_ip="10.0.0.1",
+        infra_node_ip="10.0.0.1",
+        network_interface=None,
+        nodes=SimpleNamespace(infra="infra-node", worker=["node-a"]),
+        gpus_per_node=8,
+        environment={},
+        environment_unset=environment_unset,
+        container_image=Path("/container.sqsh"),
+        container_mounts={},
+        srun_options=[],
+    )
+    return mixin
+
+
+def _single_node_process() -> SimpleNamespace:
+    return SimpleNamespace(
+        endpoint_mode="decode",
+        endpoint_index=0,
+        node="node-a",
+        sys_port=5000,
+        gpu_indices=list(range(8)),
+        cuda_visible_devices="0,1,2,3,4,5,6,7",
+        het_group=None,
+    )
+
+
+def test_worker_stage_unsets_configured_environment(tmp_path: Path) -> None:
+    """config.environment_unset reaches the worker srun.
+
+    A cluster can hand a job variables the config never asked for -- oci-aga
+    sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0, which confine UCX to a transport
+    that registers no memory -- and an env dict can only assign. Without this,
+    "the config does not set it" and "it is not set" quietly differ.
+    """
+    mixin = _worker_mixin(tmp_path, ("UCX_TLS", "UCX_NET_DEVICES"))
+    process = _single_node_process()
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_worker(process, [process])
+
+    assert mock_srun.call_args.kwargs["env_to_unset"] == ["UCX_TLS", "UCX_NET_DEVICES"]
+
+
+def test_worker_stage_unset_defaults_to_none(tmp_path: Path) -> None:
+    """An empty environment_unset must not turn into an empty list.
+
+    start_srun_process treats None as "no unsets"; an empty list would still be
+    truthy-checked downstream, and the single-node case has no VLLM_PORT unset
+    to carry it.
+    """
+    mixin = _worker_mixin(tmp_path, ())
+    process = _single_node_process()
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_worker(process, [process])
+
+    assert mock_srun.call_args.kwargs["env_to_unset"] is None
+
+
 def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) -> None:
     backend = MagicMock()
     backend.type = "vllm"
@@ -449,6 +537,7 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
         nodes=SimpleNamespace(infra="infra-node", worker=["node-a", "node-b"]),
         gpus_per_node=8,
         environment={},
+        environment_unset=(),
         container_image=Path("/container.sqsh"),
         container_mounts={},
         srun_options=[],

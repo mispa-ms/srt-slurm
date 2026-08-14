@@ -536,6 +536,7 @@ def _dynamo_frontend_call(*, dynamo_install: bool, event_plane: str | None = "zm
         container_image=Path("/container.sqsh"),
         container_mounts={},
         environment={},
+        environment_unset=(),
     )
     config = SimpleNamespace(
         frontend=SimpleNamespace(args=None, env=None),

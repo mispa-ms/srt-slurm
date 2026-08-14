@@ -234,11 +234,17 @@ PROBE
         _ibmds=$(grep -c "md open by .* is successful" "${_log}" || true)
         _reason=$(grep -oE "no memory domain supports registering (host|cuda) memory|VRAM memory is detected as host|no selected transport resources" \
                   "${_log}" | sort -u | tr '\n' ';')
+        # And the exception, per variant. Unsetting UCX_TLS made the memory-domain
+        # messages disappear and the registration still failed, which means the
+        # variants fail for different reasons -- so a shared detail section taken
+        # from one of them describes the wrong failure for the others.
+        _exc=$(grep -E "^[A-Za-z_.]+(Error|Exception):" "${_log}" | tail -1)
         if grep -q PROBE_OK "${_log}"; then
             echo "  ${_variant}: VRAM registered (ib mds=${_ibmds})"
             [ -z "${_winner}" ] && _winner="${_variant}"
         else
-            echo "  ${_variant}: FAILED (ib mds=${_ibmds}) ${_reason:-<no known reason>}"
+            echo "  ${_variant}: FAILED (ib mds=${_ibmds}) ${_exc:-<no exception>}"
+            echo "      ${_reason:-<no known reason>}"
         fi
         [ "${_variant}" = asis ] && _asislog="${_log}"
     done

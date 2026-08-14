@@ -114,6 +114,7 @@ def _runtime(nodes: list[str]) -> RuntimeContext:
         network_interface=None,
         container_mounts={},
         environment={},
+        environment_unset=(),
     )
 
 

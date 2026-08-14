@@ -233,7 +233,8 @@ class WorkerStageMixin:
         # same value and can race while probing and binding remote TCP queues.
         # Let vLLM choose an ephemeral base port instead.
         endpoint_nodes = {endpoint_process.node for endpoint_process in endpoint_processes}
-        env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else None
+        env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else []
+        env_to_unset = [*env_to_unset, *self.runtime.environment_unset] or None
 
         proc = start_srun_process(
             command=cmd,
@@ -369,6 +370,7 @@ class WorkerStageMixin:
         srun_config = self.backend.get_srun_config()
 
         proc = start_srun_process(
+            env_to_unset=list(self.runtime.environment_unset) or None,
             command=cmd,
             nodes=num_nodes,
             ntasks=total_gpus,
