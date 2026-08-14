@@ -204,6 +204,16 @@ PROBE
             # installed correctly, or dmabuf is supported." peermem is absent on
             # oci-aga, so whether dmabuf works is the whole question, and UCX
             # already probes it and logs the verdict.
+            # What UCX said when the registration itself failed. Every summary so
+            # far has described the container's capabilities and none has quoted
+            # the error, which is why "dmabuf is supported on every rail" and
+            # "registerMem raises NIXL_ERR_BACKEND" can both be true and unmet.
+            echo "[ucx] --- registration ---"
+            grep -iE "ucx_utils|registerMem|failed to register|reg_mem|memory type|not supported" \
+                "${_ucxlog}" | grep -v PROBE_ | tail -12 || echo "  (nothing)"
+            echo "[ucx] --- fabric on this node ---"
+            grep -oE "(rdma_vf_rail[0-9]+|rdma_rail[0-9]+|mlx5_[0-9]+):" "${_ucxlog}" \
+                | sed 's/:$//' | sort -u | tr '\n' ' '; echo
             echo "[ucx] --- dmabuf ---"
             grep -iE "dmabuf" "${_ucxlog}" | head -10 || echo "  (no dmabuf lines)"
             echo "[ucx] --- GPUDirect (one rail) ---"
