@@ -108,17 +108,40 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
 import torch
 from nixl._api import nixl_agent, nixl_agent_config
 
-buf = torch.zeros(1024, dtype=torch.uint8, device="cuda:0")
+# Register DRAM first. It separates "UCX is broken here" from "UCX works and has
+# no CUDA memory type", which are different bugs with different fixes, and one
+# run should answer both.
 agent = nixl_agent("ucx-probe", nixl_agent_config(backends=["UCX"]))
+host = torch.zeros(1024, dtype=torch.uint8)
+try:
+    agent.register_memory([host])
+    print("PROBE_DRAM_OK: UCX registered host memory")
+except Exception as exc:
+    print(f"PROBE_DRAM_FAIL: {type(exc).__name__}: {exc}")
+
+buf = torch.zeros(1024, dtype=torch.uint8, device="cuda:0")
 agent.register_memory([buf])
 print("PROBE_OK: UCX registered VRAM")
 PROBE
     _rc=$?
-    grep -iE "cuda|module|PROBE_OK|Error|not found" "${_ucxlog}" | tail -40 | sed 's/^/    /'
     if [ "${_rc}" -ne 0 ] || ! grep -q PROBE_OK "${_ucxlog}"; then
-        echo "[ucx] FATAL: UCX cannot register VRAM in this container." >&2
-        echo "[ucx]   The debug lines above name the module and the dlerror." >&2
-        tail -60 "${_ucxlog}" >&2
+        # Print the decisive lines LAST and nothing after them. srt-slurm quotes
+        # only the "Last 50 lines" of a failed process log, and the first attempt
+        # at this dumped `tail -60` of a debug log whose final lines are agent
+        # teardown -- so the window showed ucp_ep destroy noise and cut off the
+        # module loader entirely. Everything that survives that window has to be
+        # signal.
+        {
+            echo "[ucx] FATAL: UCX cannot register VRAM in this container."
+            echo "[ucx] --- python ---"
+            grep -vE "UCX +(DEBUG|TRACE|INFO)" "${_ucxlog}" | tail -12
+            echo "[ucx] --- probe verdicts ---"
+            grep -E "PROBE_(OK|DRAM_OK|DRAM_FAIL)" "${_ucxlog}" || echo "  (none reached)"
+            echo "[ucx] --- module loader / cuda ---"
+            grep -iE "dlopen|module|cuda|not found|failed" "${_ucxlog}" \
+                | grep -viE "ucp_ep|mpool|async\.c|topo\.c|tcp_ep|tcp_cm|tcp_iface" \
+                | tail -25
+        } >&2
         exit 1
     fi
     echo "  UCX registered VRAM"
