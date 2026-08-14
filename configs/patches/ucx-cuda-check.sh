@@ -129,6 +129,30 @@ for p in ("/sys/kernel/mm/memory_peers/nv_mem/version",
           "/sys/module/nv_peer_mem/version"):
     print(f"PROBE_GDR: {p}: {'present' if pathlib.Path(p).exists() else 'absent'}")
 
+# Load the UCT cuda module by hand. UCX logs its own module loads at debug, but
+# the attempt happens during MD resource query, hundreds of lines before the
+# failure, and srt-slurm keeps only the tail -- so the one line that matters is
+# always off-screen. ctypes gives the dlerror directly, and distinguishes "the
+# module will not load" from "it loaded and produced no memory domain", which is
+# the open question: ucm's cuda module loads fine, yet UCX reports no MD able to
+# register cuda memory.
+import ctypes  # noqa: E402
+import glob  # noqa: E402
+
+import nixl  # noqa: E402
+
+_libs = pathlib.Path(nixl._bindings.__file__).parent.parent
+for _name in ("libuct_cuda.so*", "libuct_ib.so*"):
+    _hits = sorted(glob.glob(str(_libs / "*.libs" / "ucx" / _name)))
+    if not _hits:
+        print(f"PROBE_DLOPEN: {_name}: NOT FOUND under {_libs}")
+        continue
+    try:
+        ctypes.CDLL(_hits[-1], mode=ctypes.RTLD_GLOBAL)
+        print(f"PROBE_DLOPEN: {pathlib.Path(_hits[-1]).name}: ok")
+    except OSError as exc:
+        print(f"PROBE_DLOPEN: {pathlib.Path(_hits[-1]).name}: FAILED: {exc}")
+
 from nixl._api import nixl_agent, nixl_agent_config  # noqa: E402
 
 agent = nixl_agent("ucx-probe", nixl_agent_config(backends=["UCX"]))
@@ -159,10 +183,17 @@ PROBE
             grep -vE "UCX +(DEBUG|TRACE|INFO)" "${_ucxlog}" | tail -12
             echo "[ucx] --- probe verdicts ---"
             grep -E "PROBE_" "${_ucxlog}" || echo "  (none reached)"
-            echo "[ucx] --- module loader / cuda ---"
-            grep -iE "dlopen|module|cuda|not found|failed" "${_ucxlog}" \
-                | grep -viE "ucp_ep|mpool|async\.c|topo\.c|tcp_ep|tcp_cm|tcp_iface" \
-                | tail -25
+            # The uct cuda module load happens during MD resource query, hundreds
+            # of lines before the failure, so grep for it by name rather than
+            # taking a tail that will never reach back that far. The GDR lines
+            # repeat once per rail; one is enough.
+            echo "[ucx] --- uct module loads ---"
+            grep -E "loading modules for uct|uct_cuda|libuct_cuda|module.c" "${_ucxlog}" \
+                | head -12
+            echo "[ucx] --- memory domains ---"
+            grep -E "memory domain|md open|query .* resources" "${_ucxlog}" | head -8
+            echo "[ucx] --- GPUDirect (one rail) ---"
+            grep -E "GPUDirect RDMA is not detected" "${_ucxlog}" | head -3
         } >&2
         exit 1
     fi
