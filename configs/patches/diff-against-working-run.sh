@@ -14,9 +14,14 @@
 # log ("Env:" / "Command:" at INFO), so his working configuration is readable
 # rather than inferable. Diff ours against his and stop guessing.
 #
-# Prints only the delta: shared variables with equal values are noise, and the
-# 50-line window that srt-slurm quotes from a failed process log is the budget.
+# Writes to $UCX_DIFF_OUT rather than stdout. srt-slurm quotes only the LAST 50
+# lines of a failed process log, so anything printed before the probe's exit is
+# guaranteed to be pushed out of the window -- which is what happened to the
+# first version of this: it ran, found its answer, and none of it survived.
+# The caller prints this file last.
 set -uo pipefail
+
+exec >"${UCX_DIFF_OUT:-/dev/stdout}" 2>&1
 
 HANJIE_ROOTS="
 /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/srt-slurm/outputs

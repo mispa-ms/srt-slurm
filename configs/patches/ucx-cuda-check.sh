@@ -92,9 +92,11 @@ if [ -n "${_plugdir}" ]; then
 fi
 
 # --- read the run that works ----------------------------------------------
-# Before probing our own container again, diff it against Hanjie's working
-# run, whose logs are on this filesystem. Non-fatal: it is evidence, not a
-# gate, and it must run before the probe's exit 1.
+# Diff our container against Hanjie's working run, whose logs are on this
+# filesystem. Computed here, printed at the very end: only the last 50 lines of
+# a failed process log are quoted, so placement decides whether it is read.
+UCX_DIFF_OUT=$(mktemp)
+export UCX_DIFF_OUT
 bash /configs/patches/diff-against-working-run.sh || true
 
 # --- functional probe -----------------------------------------------------
@@ -280,19 +282,22 @@ PROBE
             grep -oE "(rdma_vf_rail[0-9]+|rdma_rail[0-9]+|mlx5_[0-9]+):" "${_asislog}" \
                 | sed 's/:$//' | sort -u | tr '\n' ' '; echo
             echo "[ucx] --- probe verdicts ---"
-            grep -E "PROBE_" "${_asislog}" || echo "  (none reached)"
+            grep -E "PROBE_(OK|DRAM|CTX)" "${_asislog}" || echo "  (none reached)"
             for _entry in ${_logs}; do
                 _vname=${_entry%%:*}
                 _vlog=${_entry#*:}
                 echo "[ucx] --- ${_vname} ---"
-                _detail=$(grep -hE "no memory domain|detected as host|ucx_utils|^[^ ]+(Error|Exception): |no selected transport" "${_vlog}" \
-                          | sed 's/^/      /' | sort -u | head -5)
+                _detail=$(grep -hE "no memory domain|detected as host|ucx_utils" "${_vlog}" \
+                          | sed 's/^/      /' | sort -u | head -3)
                 if [ -n "${_detail}" ]; then
                     echo "${_detail}"
                 else
                     echo "      (no matching line -- the variant failed silently)"
                 fi
             done
+            # Last, because last is what survives.
+            echo "[ucx] === diff against the run that works ==="
+            tail -24 "${UCX_DIFF_OUT}" 2>/dev/null || echo "  (diff produced nothing)"
         } >&2
         exit 1
     fi
