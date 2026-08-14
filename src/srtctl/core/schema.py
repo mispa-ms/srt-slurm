@@ -1683,6 +1683,12 @@ class SrtConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
 
     environment: dict[str, str] = field(default_factory=dict)
+    # Names to `unset` in the worker shell before anything else runs.
+    # A cluster can hand a job variables the config never asked for --
+    # oci-aga sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0, and the recipe for
+    # that cluster is to unset both -- and an env dict can only assign, so
+    # "we do not set it" and "it is not set" are different things.
+    environment_unset: tuple[str, ...] = ()
     container_mounts: dict[
         Annotated[FormattablePath, FormattablePathField()],
         Annotated[FormattablePath, FormattablePathField()],

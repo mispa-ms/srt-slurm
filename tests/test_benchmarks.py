@@ -353,6 +353,8 @@ class TestCustomBenchmarkRunner:
         )
         stage.runtime = SimpleNamespace(
             environment={},
+            environment_unset=(),
+        environment_unset=(),
             frontend_port=8000,
             network_interface="ibp1s0",
             nodes=SimpleNamespace(head="head-node"),
@@ -1408,6 +1410,8 @@ class TestRunPostEval:
             network_interface=None,
             container_mounts={},
             environment={},
+            environment_unset=(),
+        environment_unset=(),
         )
         return SweepOrchestrator(config=config, runtime=runtime)
 

@@ -273,7 +273,7 @@ def show_config_details(config: SrtConfig) -> None:
 
     # --- Environment Variables ---
     dynamo_environment = config.dynamo.get_wheel_environment()
-    has_env = bool(config.environment or dynamo_environment)
+    has_env = bool(config.environment or dynamo_environment or config.environment_unset)
     backend = config.backend
     mode_envs: list[tuple[str, dict[str, str]]] = []
     for mode_name, attr in [
@@ -305,6 +305,12 @@ def show_config_details(config: SrtConfig) -> None:
 
         for var, val in sorted(config.environment.items()):
             env_table.add_row("global", var, val)
+
+        # Unsets are as load-bearing as assignments when the cluster puts
+        # something in the environment that the job has to remove, and they are
+        # invisible in a table that only lists what is set.
+        for var in sorted(config.environment_unset):
+            env_table.add_row("global", var, "<unset>")
 
         for mode_name, env in mode_envs:
             for var, val in sorted(env.items()):
