@@ -42,11 +42,22 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 # size (950 GB on oci-aga, 955 on lyris), so the difference is not memory and
 # cannot be derived here. The arm names it: K3_MOONCAKE_TOTAL_GB.
 #
-# It matters. At 4 x 120 on oci-aga the master evicted 95,736 keys and 1.85 TB
-# while sitting at 79.2% of 480 GB, just under the 0.8 eviction watermark --
-# keys pushed out about as fast as they were written. (That is a contributing
-# factor, not the reason reads are zero: eviction lowers a hit rate, it does not
-# hold Get at exactly 0.00 for a whole run.)
+# MEASURED, and it cost a day: 150 GiB/rank does not boot here. At 4 x 120 the
+# arms reach "Server is healthy" 18 minutes after the job starts. At 4 x 150 the
+# second node of each role stops at "Reducing Torch threads for serving" -- the
+# step before KV-cache and connector registration -- and emits nothing for the
+# next hour, until the idle-GPU reaper claims it. Four ladders died that way
+# before the sweep log was read closely enough to see that the last line was at
+# 11:24 and the kill at 12:24.
+#
+# 600 GB is 63% of the node's 950 GB tray, and registering it through RDMA is
+# evidently not something two nodes can finish concurrently here. Wei runs 150 on
+# this cluster; his startup cost at that size was never checked before copying
+# the number.
+#
+# There is also no gain to weigh against it today: the offload tier reads back
+# 0.0%, so a larger store holds more of what nothing reads. Raise it again only
+# with a measurement of both boot time and offload hit rate.
 #
 # A new name rather than TOTAL_CPU_DRAM_GB, because the arms still carry the
 # B300 value under that one and reading it here would silently restore it.
