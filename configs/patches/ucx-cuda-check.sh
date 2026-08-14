@@ -219,7 +219,21 @@ PROBE
     _winner=""
     _asislog=""
     _logs=""
-    for _variant in asis nomemtype noucx tlsall; do
+    # Candidates, derived from nixl's source rather than guessed. ucx_utils.cpp
+    # ucp_mem_map()s the VRAM pointer -- which succeeds -- then ucp_mem_query()s
+    # the handle and rejects the registration when the type comes back HOST.
+    # UCX detects the type through a memory domain advertising detect_mem_types
+    # for CUDA, which is cuda_copy's, and silently answers HOST when no such MD
+    # is in the context. UCX_TLS=tcp is why there is none:
+    #
+    #   ucp_context.c:1773 closing md cma because it has no selected transport
+    #                      resources
+    #
+    # So the fix is to ADD cuda to the transport list, not to remove the list.
+    # Unsetting it entirely enables IB as well, which is a separate failure
+    # (ibv_reg_dmabuf_mr returning EAGAIN) and is why 'noucx' and 'tlsall' did
+    # not work either.
+    for _variant in asis noucx tlsall tcpcuda rccuda; do
         _log=$(mktemp)
         case "${_variant}" in
             asis)      env UCX_LOG_LEVEL=debug python3 "${_probe}" >"${_log}" 2>&1 ;;
@@ -233,6 +247,14 @@ PROBE
             # carries the same restriction only an explicit value beats it.
             tlsall)    env UCX_TLS=all UCX_NET_DEVICES=all UCX_LOG_LEVEL=debug \
                            python3 "${_probe}" >"${_log}" 2>&1 ;;
+            # Keep the cluster's tcp -- it is what works here for host memory --
+            # and add the cuda memory domains that make detection possible.
+            tcpcuda)   env UCX_TLS=tcp,cuda_copy,cuda_ipc UCX_LOG_LEVEL=debug \
+                           python3 "${_probe}" >"${_log}" 2>&1 ;;
+            # The B300 value, which is SA's, plus cuda_ipc: Po-Han Huang on the
+            # GB300 thread, "cuda_ipc should always be enabled in UCX_TLS".
+            rccuda)    env UCX_TLS=rc,cuda_copy,cuda_ipc UCX_LOG_LEVEL=debug \
+                           python3 "${_probe}" >"${_log}" 2>&1 ;;
         esac
         # Report every variant's evidence, not just its verdict. The previous
         # round ran four environments and quoted only the first one's log, so
@@ -241,7 +263,7 @@ PROBE
         # single job. Two numbers separate "the override did nothing" from "it
         # opened the fabric and something else stopped it".
         _ibmds=$(grep -c "md open by .* is successful" "${_log}" || true)
-        _reason=$(grep -oE "no memory domain supports registering (host|cuda) memory|VRAM memory is detected as host|no selected transport resources" \
+        _reason=$(grep -oE "no memory domain supports registering (host|cuda) memory|VRAM memory is detected as host|ibv_reg_dmabuf_mr[^,]*|ucp_mem_map[^,]*|Resource temporarily unavailable|no selected transport resources" \
                   "${_log}" | sort -u | tr '\n' ';')
         # And the exception, per variant. Unsetting UCX_TLS made the memory-domain
         # messages disappear and the registration still failed, which means the
