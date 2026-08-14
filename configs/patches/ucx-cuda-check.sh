@@ -192,8 +192,16 @@ PROBE
                 | head -12
             echo "[ucx] --- memory domains ---"
             grep -E "memory domain|md open|query .* resources" "${_ucxlog}" | head -8
+            # The IB memory domain will register CUDA memory through either
+            # nvidia_peermem or dmabuf -- libuct_ib says so itself: "Couldn't
+            # enable GPUDirect RDMA. Please make sure nv_peer_mem [...] is
+            # installed correctly, or dmabuf is supported." peermem is absent on
+            # oci-aga, so whether dmabuf works is the whole question, and UCX
+            # already probes it and logs the verdict.
+            echo "[ucx] --- dmabuf ---"
+            grep -iE "dmabuf" "${_ucxlog}" | head -10 || echo "  (no dmabuf lines)"
             echo "[ucx] --- GPUDirect (one rail) ---"
-            grep -E "GPUDirect RDMA is not detected" "${_ucxlog}" | head -3
+            grep -E "GPUDirect RDMA is not detected|Couldn't enable GPUDirect" "${_ucxlog}" | head -3
         } >&2
         exit 1
     fi
