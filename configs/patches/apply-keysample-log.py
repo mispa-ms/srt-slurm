@@ -37,14 +37,22 @@ LOOKUP_AFTER = '''        if not candidate_keys:
 
         if not getattr(self, "_logged_key_sample_lookup", False):
             self._logged_key_sample_lookup = True
+            # The whole prefix SET, not one key. A hash counts as a hit only if
+            # every namespace in this list exists (all(res[pos+j] == 1) below),
+            # while the save path writes exactly one -- this rank's own, from
+            # PoolKey.build_prefix(metadata) with no overrides. Printing a
+            # single candidate would invite comparing save's tp_rank against
+            # whichever namespace happens to sort first.
             logger.info(
-                "[mooncake-keysample] LOOKUP asks %d keys, token_len=%d, "
-                "fine_grained=%s, first=%s",
+                "[mooncake-keysample] LOOKUP asks %d keys over %d prefixes, "
+                "token_len=%d, fine_grained=%s",
                 len(candidate_keys),
+                len(self._lookup_key_prefixes[0]),
                 token_len,
                 fine_grained,
-                candidate_keys[0],
             )
+            for _p in self._lookup_key_prefixes[0]:
+                logger.info("[mooncake-keysample]   LOOKUP prefix: %s", _p)
 '''
 
 # --- save side: immediately before the put that fills the store -------------
@@ -60,9 +68,9 @@ SAVE_AFTER = '''        batch_bytes = _sum_batch_bytes(sizes)
         if keys and not getattr(self, "_logged_key_sample_save", False):
             self._logged_key_sample_save = True
             logger.info(
-                "[mooncake-keysample] SAVE puts %d keys, first=%s",
+                "[mooncake-keysample] SAVE puts %d keys with prefix: %s",
                 len(keys),
-                keys[0],
+                keys[0].rsplit("@", 1)[0],
             )
         put_start = time.perf_counter()
         try:

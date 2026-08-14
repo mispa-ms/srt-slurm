@@ -206,6 +206,28 @@ python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
 # and Get never fires, so written and queried keys disagree; a key is a string,
 # so print one of each and read the difference instead of deriving it.
 python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
+# vllm#50359, as we carried it on misunp/k3-merged-mooncake-dcp and then left
+# behind when this track moved to the nightly. It revalidates that a reported
+# partial-hash hit names an object the store actually holds, and shortens by
+# one alignment unit until it does -- "a longer stored key proves one object
+# exists at that endpoint; it does not imply independently addressable objects
+# at every shorter hash boundary". That is the shape of our 0.0%: the lookup
+# asks about 240,000 keys per window, reports no error, and never issues a
+# Get. Measured on B300 c8 DCP=8 before: 2,757,664 OBJECT_NOT_FOUND.
+#
+# Cut against the real target tree (nightly 3d204dfda + Hanjie + face29e659 +
+# our alignment work), not against repo/vllm -- applying the branch commit
+# directly lands with fuzz 2 and a 44-line offset.
+REVAL_PATCH=/configs/patches/vllm-mooncake-50359-exact-hit-revalidate.patch
+if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${REVAL_PATCH}" >/dev/null 2>&1; then
+    patch --batch --forward -d "${SITE}" -p1 < "${REVAL_PATCH}"
+    echo "[patch] applied: #50359 exact-hit revalidation"
+elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${REVAL_PATCH}" >/dev/null 2>&1; then
+    echo "[patch] #50359 revalidation already present"
+else
+    echo "[patch] FATAL: the #50359 revalidation patch does not apply" >&2
+    exit 1
+fi
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 
 echo "=== verifying the patched tree ==="
