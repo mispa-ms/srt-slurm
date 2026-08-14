@@ -102,9 +102,8 @@ fi
 # This runs in the same container, on the same node, ~2 minutes in, instead of
 # surfacing as NIXL_ERR_BACKEND at KV-cache init ten minutes later.
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    echo "=== probing UCX for CUDA support (debug log) ==="
-    _ucxlog=$(mktemp)
-    UCX_LOG_LEVEL=debug python3 - >"${_ucxlog}" 2>&1 <<'PROBE'
+    _probe=$(mktemp /tmp/ucxprobe.XXXXXX.py)
+    cat >"${_probe}" <<'PROBE'
 import pathlib
 
 import torch
@@ -169,61 +168,73 @@ except Exception as exc:
 agent.register_memory([buf])
 print("PROBE_OK: UCX registered VRAM")
 PROBE
-    _rc=$?
-    if [ "${_rc}" -ne 0 ] || ! grep -q PROBE_OK "${_ucxlog}"; then
+
+    # Vary the environment inside one job instead of one hypothesis per submit.
+    # The probe is a single process taking about a second, while a submit costs
+    # twelve minutes of queue and setup -- and every UCX theory so far has been
+    # answered by one run and replaced by the next. Ask all the questions at once.
+    #
+    # The arm sets UCX_MEMTYPE_CACHE=n and UCX_MEMTYPE_REG_WHOLE=n, both of which
+    # touch memory-type handling, and the failure is precisely that UCX reports
+    # "VRAM memory is detected as host". That makes them suspects rather than
+    # settings, so run with them and without them, and with no UCX_* at all.
+    _ucxvars=$(env | sed -n 's/^\(UCX_[A-Z0-9_]*\)=.*/\1/p' | tr '\n' ' ')
+    echo "=== probing UCX for CUDA support ==="
+    echo "  arm's UCX vars: ${_ucxvars:-<none>}"
+    _unset_all=""
+    for _v in ${_ucxvars}; do _unset_all="${_unset_all} -u ${_v}"; done
+
+    _winner=""
+    _asislog=""
+    for _variant in asis nomemtype noucx; do
+        _log=$(mktemp)
+        case "${_variant}" in
+            asis)      env UCX_LOG_LEVEL=debug python3 "${_probe}" >"${_log}" 2>&1 ;;
+            nomemtype) env -u UCX_MEMTYPE_CACHE -u UCX_MEMTYPE_REG_WHOLE \
+                           UCX_LOG_LEVEL=debug python3 "${_probe}" >"${_log}" 2>&1 ;;
+            noucx)     env ${_unset_all} UCX_LOG_LEVEL=debug \
+                           python3 "${_probe}" >"${_log}" 2>&1 ;;
+        esac
+        if grep -q PROBE_OK "${_log}"; then
+            echo "  ${_variant}: VRAM registered"
+            [ -z "${_winner}" ] && _winner="${_variant}"
+        else
+            echo "  ${_variant}: FAILED"
+        fi
+        [ "${_variant}" = asis ] && _asislog="${_log}"
+    done
+
+    if [ -n "${_winner}" ] && [ "${_winner}" != asis ]; then
+        echo "[ucx] FATAL: VRAM registration needs the '${_winner}' environment." >&2
+        echo "[ucx]   It works without the arm's UCX settings and fails with them." >&2
+        echo "[ucx]   arm's UCX vars: ${_ucxvars}" >&2
+        echo "[ucx]   Fix the config rather than probing again." >&2
+        exit 1
+    fi
+
+    if [ -z "${_winner}" ]; then
         # Print the decisive lines LAST and nothing after them. srt-slurm quotes
-        # only the "Last 50 lines" of a failed process log, and the first attempt
-        # at this dumped `tail -60` of a debug log whose final lines are agent
-        # teardown -- so the window showed ucp_ep destroy noise and cut off the
-        # module loader entirely. Everything that survives that window has to be
-        # signal.
+        # only the "Last 50 lines" of a failed process log, so anything that has
+        # to survive must come at the end -- and must be matched by name, never
+        # by position: `head`/`tail` on a mixed grep has now silently dropped the
+        # one line that mattered three separate times.
         {
-            echo "[ucx] FATAL: UCX cannot register VRAM in this container."
-            echo "[ucx] --- python ---"
-            grep -vE "UCX +(DEBUG|TRACE|INFO)" "${_ucxlog}" | tail -12
-            echo "[ucx] --- probe verdicts ---"
-            grep -E "PROBE_" "${_ucxlog}" || echo "  (none reached)"
-            # The uct cuda module load happens during MD resource query, hundreds
-            # of lines before the failure, so grep for it by name rather than
-            # taking a tail that will never reach back that far. The GDR lines
-            # repeat once per rail; one is enough.
-            # Filter to the cuda components specifically. Taking the first N
-            # module.c lines fills the budget with uct_ib/mlx5/efa loads, which
-            # are known to work, and never reaches the one that matters. UCX
-            # dlopens libuct_cuda.so for the uct component; ctypes shows that
-            # library loads fine by hand, so whether UCX asks for it at all is
-            # the open half of the question.
-            echo "[ucx] --- uct cuda module ---"
-            grep -E "loading modules for uct$|module '(cuda|cuda_copy|cuda_ipc|gdr_copy)'|libuct_cuda|cuda_ipc|gdr_copy" \
-                "${_ucxlog}" | head -12 || echo "  (uct never asked for a cuda module)"
-            echo "[ucx] --- memory domains ---"
-            grep -E "memory domain|md open|query .* resources" "${_ucxlog}" | head -8
-            # The IB memory domain will register CUDA memory through either
-            # nvidia_peermem or dmabuf -- libuct_ib says so itself: "Couldn't
-            # enable GPUDirect RDMA. Please make sure nv_peer_mem [...] is
-            # installed correctly, or dmabuf is supported." peermem is absent on
-            # oci-aga, so whether dmabuf works is the whole question, and UCX
-            # already probes it and logs the verdict.
-            # What UCX said when the registration itself failed. Every summary so
-            # far has described the container's capabilities and none has quoted
-            # the error, which is why "dmabuf is supported on every rail" and
-            # "registerMem raises NIXL_ERR_BACKEND" can both be true and unmet.
-            echo "[ucx] --- registration ---"
-            grep -iE "ucx_utils|registerMem|failed to register|reg_mem|memory type|not supported" \
-                "${_ucxlog}" | grep -v PROBE_ | tail -12 || echo "  (nothing)"
+            echo "[ucx] FATAL: UCX cannot register VRAM under any tested environment."
             echo "[ucx] --- fabric on this node ---"
-            grep -oE "(rdma_vf_rail[0-9]+|rdma_rail[0-9]+|mlx5_[0-9]+):" "${_ucxlog}" \
+            grep -oE "(rdma_vf_rail[0-9]+|rdma_rail[0-9]+|mlx5_[0-9]+):" "${_asislog}" \
                 | sed 's/:$//' | sort -u | tr '\n' ' '; echo
-            echo "[ucx] --- dmabuf ---"
-            grep -iE "dmabuf" "${_ucxlog}" | head -10 || echo "  (no dmabuf lines)"
-            echo "[ucx] --- GPUDirect (one rail) ---"
-            grep -E "GPUDirect RDMA is not detected|Couldn't enable GPUDirect" "${_ucxlog}" | head -3
+            echo "[ucx] --- probe verdicts ---"
+            grep -E "PROBE_" "${_asislog}" || echo "  (none reached)"
+            echo "[ucx] --- cuda memory domain ---"
+            grep -E "no memory domain|cuda_copy_md|cuda_ipc_md|detect_mem_type" "${_asislog}" \
+                | head -6 || echo "  (none)"
+            echo "[ucx] --- registration ---"
+            grep -iE "ucx_utils|registerMem|detected as host" "${_asislog}" \
+                | grep -v PROBE_ | tail -6 || echo "  (nothing)"
         } >&2
         exit 1
     fi
     echo "  UCX registered VRAM"
-    rm -f "${_ucxlog}"
 else
     echo "=== skipping UCX probe: no GPU visible in the setup context ==="
 fi
-
