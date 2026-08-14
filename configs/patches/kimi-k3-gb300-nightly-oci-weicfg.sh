@@ -212,6 +212,17 @@ if [ -n "${_plugdir}" ]; then
         exit 1
     fi
     echo "  UCX_MODULE_DIR=${UCX_MODULE_DIR} (matches the plugin dir)"
+    # Is there a system UCX in this image at all? The wheel's copy is the only
+    # one vLLM's Dockerfile installs, but a base image or a transitive dep (e.g.
+    # OpenMPI) can drag one in -- and a properly installed UCX has its CUDA
+    # component where its own prefix expects it. If one exists, pointing at it
+    # is a better answer than routing NIXL around UCX, which changes the
+    # transport and therefore the numbers.
+    echo "  system UCX (outside the wheel):"
+    ldconfig -p 2>/dev/null | grep -E "libucp|libuct|libucs" | grep -v "nixl" | sed 's/^/    /' || echo "    none"
+    for _d in /usr/lib64/ucx /usr/lib/aarch64-linux-gnu/ucx /usr/local/ucx/lib/ucx /opt/hpcx/ucx/lib/ucx; do
+        [ -d "${_d}" ] && echo "    module dir exists: ${_d} ($(ls "${_d}" 2>/dev/null | grep -c cuda) cuda modules)"
+    done
 fi
 
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
