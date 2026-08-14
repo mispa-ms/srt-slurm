@@ -210,6 +210,7 @@ PROBE
 
     _winner=""
     _asislog=""
+    _logs=""
     for _variant in asis nomemtype noucx tlsall; do
         _log=$(mktemp)
         case "${_variant}" in
@@ -238,7 +239,10 @@ PROBE
         # messages disappear and the registration still failed, which means the
         # variants fail for different reasons -- so a shared detail section taken
         # from one of them describes the wrong failure for the others.
-        _exc=$(grep -E "^[A-Za-z_.]+(Error|Exception):" "${_log}" | tail -1)
+        # `nixl_cu13._bindings.nixlBackendError` -- the module path carries
+        # digits, which [A-Za-z_.] excluded, so every variant reported
+        # "<no exception>" while raising one.
+        _exc=$(grep -E "^[^ ]+(Error|Exception): " "${_log}" | tail -1)
         if grep -q PROBE_OK "${_log}"; then
             echo "  ${_variant}: VRAM registered (ib mds=${_ibmds})"
             [ -z "${_winner}" ] && _winner="${_variant}"
@@ -246,6 +250,7 @@ PROBE
             echo "  ${_variant}: FAILED (ib mds=${_ibmds}) ${_exc:-<no exception>}"
             echo "      ${_reason:-<no known reason>}"
         fi
+        _logs="${_logs} ${_variant}:${_log}"
         [ "${_variant}" = asis ] && _asislog="${_log}"
     done
 
@@ -270,12 +275,18 @@ PROBE
                 | sed 's/:$//' | sort -u | tr '\n' ' '; echo
             echo "[ucx] --- probe verdicts ---"
             grep -E "PROBE_" "${_asislog}" || echo "  (none reached)"
-            echo "[ucx] --- cuda memory domain ---"
-            grep -E "no memory domain|cuda_copy_md|cuda_ipc_md|detect_mem_type" "${_asislog}" \
-                | head -6 || echo "  (none)"
-            echo "[ucx] --- registration ---"
-            grep -iE "ucx_utils|registerMem|detected as host" "${_asislog}" \
-                | grep -v PROBE_ | tail -6 || echo "  (nothing)"
+            for _entry in ${_logs}; do
+                _vname=${_entry%%:*}
+                _vlog=${_entry#*:}
+                echo "[ucx] --- ${_vname} ---"
+                _detail=$(grep -hE "no memory domain|detected as host|ucx_utils|^[^ ]+(Error|Exception): |no selected transport" "${_vlog}" \
+                          | sed 's/^/      /' | sort -u | head -5)
+                if [ -n "${_detail}" ]; then
+                    echo "${_detail}"
+                else
+                    echo "      (no matching line -- the variant failed silently)"
+                fi
+            done
         } >&2
         exit 1
     fi
