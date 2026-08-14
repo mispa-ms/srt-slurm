@@ -135,6 +135,16 @@ bash /configs/patches/ucx-cuda-check.sh
 SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
 echo "site-packages: $SITE"
 
+# Print the root cause LAST. srt-slurm quotes only the final 50 lines of a
+# failed process log, and a vLLM engine failure ends with forty lines of
+# asyncio/uvloop frames under "Engine core initialization failed. See root
+# cause above" -- so the exception that explains it is pushed out of view
+# every time. sitecustomize is imported automatically by CPython, so this
+# covers every worker without touching a launch command.
+cp /configs/patches/k3-roothook.py "${SITE}/sitecustomize.py"
+python3 -c "import sitecustomize, sys; assert sys.excepthook.__name__ == 'hook'" \
+    && echo "[roothook] installed" || { echo "[roothook] FATAL: not active" >&2; exit 1; }
+
 # --- Hanjie's applier, unmodified -----------------------------------------
 # It gates on _version.py containing g3d204dfda and refuses to touch any other
 # image, which is a stronger identity check than we had: our own source-built
