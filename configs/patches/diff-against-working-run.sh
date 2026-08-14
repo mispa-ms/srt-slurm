@@ -23,42 +23,56 @@ set -uo pipefail
 
 exec >"${UCX_DIFF_OUT:-/dev/stdout}" 2>&1
 
-HANJIE_ROOTS="
-/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/srt-slurm/outputs
-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/srt-slurm/outputs
+# Every user, not one. Betting on a name is how this started: the first version
+# looked only at hanjieq, and AIB shows no successful oci-aga run by anyone --
+# 30 sweep jobs on this cluster, all ours, all failed or cancelled. But
+# srt-slurm is also driven by hand here (Zachary Patel: "I sent a test job in
+# with srt slurm for Minimax on oci-aga and it worked"), and those runs land in
+# the same place under a different user. Glob the users directory instead of
+# guessing usernames.
+USER_GLOBS="
+/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/*/srt-slurm/outputs
+/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/*/srt-slurm/outputs
 "
 
 echo "=== the run that works ==="
-_root=""
-for _r in ${HANJIE_ROOTS}; do
-    if [ -d "${_r}" ]; then _root="${_r}"; break; fi
+_roots=""
+for _g in ${USER_GLOBS}; do
+    for _r in ${_g}; do
+        [ -d "${_r}" ] && _roots="${_roots} ${_r}"
+    done
 done
-if [ -z "${_root}" ]; then
-    echo "  none of the candidate output roots exist on this cluster:"
-    for _r in ${HANJIE_ROOTS}; do echo "    ${_r}"; done
+if [ -z "${_roots}" ]; then
+    echo "  no srt-slurm outputs under any user on this cluster"
     exit 0
 fi
-echo "  outputs: ${_root}"
+echo "  searching $(echo ${_roots} | wc -w) user output trees"
 
 # A run that worked is one whose workers instantiated the UCX backend. The
 # failure we are chasing prints "UCX CUDA support was not found" instead, so
 # that string is the discriminator, not the job's exit status -- a run can fail
 # for unrelated reasons with a perfectly good UCX.
 _good=""
-for _job in $(ls -1t "${_root}" 2>/dev/null | head -40); do
-    _logs="${_root}/${_job}/logs"
-    [ -d "${_logs}" ] || continue
-    if grep -rlq "Backend UCX was instantiated" "${_logs}" 2>/dev/null &&
-       ! grep -rq "UCX CUDA support was not found" "${_logs}" 2>/dev/null; then
-        _good="${_job}"
-        break
-    fi
+_root=""
+for _r in ${_roots}; do
+    for _job in $(ls -1t "${_r}" 2>/dev/null | head -15); do
+        _logs="${_r}/${_job}/logs"
+        [ -d "${_logs}" ] || continue
+        if grep -rlq "Backend UCX was instantiated" "${_logs}" 2>/dev/null &&
+           ! grep -rq "UCX CUDA support was not found" "${_logs}" 2>/dev/null; then
+            _good="${_job}"; _root="${_r}"
+            break 2
+        fi
+    done
 done
 if [ -z "${_good}" ]; then
-    echo "  no run in the last 40 shows a working UCX backend"
-    echo "  (newest: $(ls -1t "${_root}" 2>/dev/null | head -3 | tr '\n' ' '))"
+    echo "  no run under any user shows a working UCX backend"
+    for _r in ${_roots}; do
+        echo "    $(echo "${_r}" | sed 's|.*/users/||; s|/srt-slurm.*||'): $(ls -1 "${_r}" 2>/dev/null | wc -l) jobs"
+    done
     exit 0
 fi
+echo "  ${_root}"
 echo "  job ${_good}"
 
 _theirs=$(mktemp)
