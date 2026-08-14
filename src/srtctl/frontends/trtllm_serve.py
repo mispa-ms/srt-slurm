@@ -186,6 +186,7 @@ class TRTLLMServeFrontend:
             container_image=str(runtime.container_image),
             container_mounts=runtime.container_mounts,
             env_to_set=env_to_set if env_to_set else None,
+            env_to_unset=list(runtime.environment_unset) or None,
             # trtllm-serve imports tensorrt_llm, which requires an MPI launcher even
             # for the single-rank orchestrator (same reason the dynamo frontend uses it).
             mpi="pmix",

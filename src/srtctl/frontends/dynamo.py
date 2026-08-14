@@ -112,6 +112,7 @@ class DynamoFrontend:
                 container_image=str(runtime.container_image),
                 container_mounts=runtime.container_mounts,
                 env_to_set=env_to_set,
+                env_to_unset=list(runtime.environment_unset) or None,
                 bash_preamble=bash_preamble,
                 # Frontend container runs the dynamo install (see _build_preamble), whose
                 # cold build needs root inside the container. Remap via enroot env var.
