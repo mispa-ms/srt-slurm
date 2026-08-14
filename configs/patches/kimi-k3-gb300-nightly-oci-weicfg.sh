@@ -161,16 +161,25 @@ fi
 #
 # Reverting this restores the sub-block tail from vllm#49502; measure before
 # keeping either way.
-ALIGN_PATCH=/configs/patches/vllm-mooncake-external-hit-block-aligned.patch
-if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
-    patch --batch --forward -d "${SITE}" -p1 < "${ALIGN_PATCH}"
-    echo "[patch] applied: external hit is block-aligned"
-elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
-    echo "[patch] external-hit alignment already present"
-else
-    echo "[patch] FATAL: the external-hit alignment patch does not apply" >&2
-    exit 1
-fi
+# Two alignment sites, not one. find_longest_cache_hit decides how much of a hit
+# is reported; align_lookup_length decides which keys are asked for -- worker.py
+# fixes token_len from it and builds the candidate key list. Patching only the
+# first leaves the lookup still asking for sub-block keys, which is the bug both
+# are here to remove.
+for ALIGN_PATCH in \
+    /configs/patches/vllm-mooncake-external-hit-block-aligned.patch \
+    /configs/patches/vllm-mooncake-lookup-align.patch
+do
+    if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+        patch --batch --forward -d "${SITE}" -p1 < "${ALIGN_PATCH}"
+        echo "[patch] applied: $(basename "${ALIGN_PATCH}")"
+    elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${ALIGN_PATCH}" >/dev/null 2>&1; then
+        echo "[patch] already present: $(basename "${ALIGN_PATCH}")"
+    else
+        echo "[patch] FATAL: $(basename "${ALIGN_PATCH}") does not apply" >&2
+        exit 1
+    fi
+done
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 
 echo "=== verifying the patched tree ==="
