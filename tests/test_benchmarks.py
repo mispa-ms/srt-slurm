@@ -227,6 +227,44 @@ class TestSABenchRunner:
 class TestCustomBenchmarkRunner:
     """Test custom benchmark runner."""
 
+    @staticmethod
+    def _benchmark_stage(
+        frontend_type,
+        processes,
+        *,
+        benchmark_type="custom",
+        prefill_environment=None,
+        aggregated_environment=None,
+    ):
+        from types import SimpleNamespace
+
+        from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
+
+        class Stage(BenchmarkStageMixin):
+            @property
+            def backend_processes(self):
+                return processes
+
+        stage = Stage()
+        stage.config = SimpleNamespace(
+            benchmark=SimpleNamespace(type=benchmark_type, aiperf_package=None),
+            backend=SimpleNamespace(
+                prefill_environment=prefill_environment or {},
+                aggregated_environment=aggregated_environment or {},
+            ),
+            frontend=SimpleNamespace(type=frontend_type),
+            profiling=SimpleNamespace(enabled=False),
+        )
+        stage.runtime = SimpleNamespace(
+            environment={},
+            environment_unset=(),
+        environment_unset=(),
+            frontend_port=8000,
+            network_interface="ibp1s0",
+            nodes=SimpleNamespace(head="head-node"),
+        )
+        return stage
+
     def test_validate_config_requires_command(self):
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
@@ -1064,6 +1102,8 @@ class TestRunPostEval:
             network_interface=None,
             container_mounts={},
             environment={},
+            environment_unset=(),
+        environment_unset=(),
         )
         return SweepOrchestrator(config=config, runtime=runtime)
 

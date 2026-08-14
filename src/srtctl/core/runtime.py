@@ -194,6 +194,9 @@ class RuntimeContext:
     # Environment variables
     environment: dict[str, str] = field(default_factory=dict)
 
+    # Environment variable names to unset before the worker command
+    environment_unset: tuple[str, ...] = ()
+
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
 
@@ -363,6 +366,7 @@ class RuntimeContext:
             container_mounts={},
             srun_options=dict(config.srun_options),
             environment=environment,
+            environment_unset=tuple(config.environment_unset),
             is_hf_model=is_hf_model,
             request_plane=config.dynamo.request_plane,
         )
@@ -388,6 +392,7 @@ class RuntimeContext:
             container_mounts=container_mounts,
             srun_options=dict(config.srun_options),
             environment=environment,
+            environment_unset=tuple(config.environment_unset),
             is_hf_model=is_hf_model,
             stage_dir=stage_dir,
             staged_model_path=staged_model_path,
