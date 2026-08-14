@@ -176,6 +176,10 @@ fi
 # two hand-made patches for this one hunk failed for reasons unrelated to the
 # change (wrong base tree, then a malformed @@ header), each costing a submit.
 python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
+# And one sample key from each side. The master says 19,224 keys are resident
+# and Get never fires, so written and queried keys disagree; a key is a string,
+# so print one of each and read the difference instead of deriving it.
+python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 
 echo "=== verifying the patched tree ==="

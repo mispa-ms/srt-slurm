@@ -36,7 +36,21 @@ export FI_VER=${FI_VER:-0.6.16.post3}
 #
 # Forced, not defaulted. The arms still carry the B300 value in their
 # prefill/decode_environment, and a ':-' fallback would silently restore it.
-export TOTAL_CPU_DRAM_GB=480
+#
+# The ceiling is per cluster. Wei, 2026-08-13: "150gb global segment size for MC
+# works on OCI-aga, on lyris I can only do 120GB" -- and the trays are the same
+# size (950 GB on oci-aga, 955 on lyris), so the difference is not memory and
+# cannot be derived here. The arm names it: K3_MOONCAKE_TOTAL_GB.
+#
+# It matters. At 4 x 120 on oci-aga the master evicted 95,736 keys and 1.85 TB
+# while sitting at 79.2% of 480 GB, just under the 0.8 eviction watermark --
+# keys pushed out about as fast as they were written. (That is a contributing
+# factor, not the reason reads are zero: eviction lowers a hit rate, it does not
+# hold Get at exactly 0.00 for a whole run.)
+#
+# A new name rather than TOTAL_CPU_DRAM_GB, because the arms still carry the
+# B300 value under that one and reading it here would silently restore it.
+export TOTAL_CPU_DRAM_GB=${K3_MOONCAKE_TOTAL_GB:-480}
 export MOONCAKE_TP=4
 
 # Check it against the tray before the run rather than 40 minutes into it. The
@@ -44,7 +58,13 @@ export MOONCAKE_TP=4
 # 600 OOM-kills (62448615), 748 OOM-killed before that (SLURM 2673272).
 MEM_TOTAL_GB=$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
 if [ -n "${MEM_TOTAL_GB}" ] && [ "${MEM_TOTAL_GB}" -gt 0 ]; then
-    MC_CEILING_GB=$(( MEM_TOTAL_GB * ${MOONCAKE_NODE_FRACTION_PCT:-55} / 100 ))
+    # 55% is the default headroom; an explicit K3_MOONCAKE_TOTAL_GB is trusted
+    # up to 70%. The guard exists to catch absurd values -- 748 GB of a 955 GB
+    # tray (78%) was OOM-killed -- not to veto a considered one: 600 of 950 is
+    # 63%, which is what Wei runs on this cluster.
+    _frac=${MOONCAKE_NODE_FRACTION_PCT:-55}
+    [ -n "${K3_MOONCAKE_TOTAL_GB:-}" ] && _frac=${MOONCAKE_NODE_FRACTION_PCT:-70}
+    MC_CEILING_GB=$(( MEM_TOTAL_GB * _frac / 100 ))
     echo "[mooncake] node MemTotal ${MEM_TOTAL_GB} GB, reserving ${TOTAL_CPU_DRAM_GB} GB" \
          "across ${MOONCAKE_TP} ranks ($(( TOTAL_CPU_DRAM_GB / MOONCAKE_TP )) GB each)," \
          "ceiling ${MC_CEILING_GB} GB"
@@ -182,6 +202,10 @@ fi
 # two hand-made patches for this one hunk failed for reasons unrelated to the
 # change (wrong base tree, then a malformed @@ header), each costing a submit.
 python3 /configs/patches/apply-lookup-align.py "${SITE}" || exit 1
+# And one sample key from each side. The master says 19,224 keys are resident
+# and Get never fires, so written and queried keys disagree; a key is a string,
+# so print one of each and read the difference instead of deriving it.
+python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 
 echo "=== verifying the patched tree ==="
