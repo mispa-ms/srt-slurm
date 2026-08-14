@@ -1,0 +1,94 @@
+diff -ruN a/vllm/v1/core/single_type_kv_cache_manager.py fix/vllm/v1/core/single_type_kv_cache_manager.py
+--- a/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-13 17:25:11.284069948 -0700
++++ fix/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-13 17:25:27.223627911 -0700
+@@ -6,6 +6,7 @@
+ from collections.abc import Sequence
+ from typing import ClassVar
+ 
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -34,6 +35,9 @@
+ from vllm.v1.request import Request
+ 
+ 
++logger = init_logger(__name__)
++
++
+ class SingleTypeKVCacheManager(ABC):
+     """
+     An abstract base class for a manager that handle the kv cache management
+@@ -1249,6 +1253,22 @@
+ 
+ 
+ class MambaManager(SingleTypeKVCacheManager):
++    # Round 2 of the vllm#51766 cost hunt. Round 1 counted the same-step CoW
++    # deferral and found it fires 9 times in 40,000 scheduler steps, which cannot
++    # be worth 8.9%. These count what else the fix changes: it flips
++    # blocks_allocated to True, which routes partial-tail CoW down the
++    # running-request branch, and that branch moves cache entries, takes an extra
++    # ref, and hands blocks to the connector for offload. Counting first, before
++    # writing another patch.
++    cow_stats = {
++        "steps": 0,
++        "early_return": 0,        # the path vllm#51766 marks
++        "cow_running": 0,         # partial-tail CoW, running-request branch
++        "cow_firstprefill": 0,    # partial-tail CoW, first-prefill branch
++        "cow_copies": 0,          # queued block copies, either branch
++        "tail_offloads": 0,       # blocks handed to the connector by that branch
++    }
++
+     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+ 
+     def __init__(
+@@ -1557,6 +1577,7 @@
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
++                MambaManager.cow_stats["early_return"] += 1
+                 self._allocated_block_reqs.add(request_id)
+                 return []
+             else:
+@@ -1618,6 +1639,8 @@
+                         # instead; the queued copy fills it before forward
+                         # overwrites source_block.
+                         assert req_blocks[block_idx] is source_block
++                        MambaManager.cow_stats["cow_running"] += 1
++                        MambaManager.cow_stats["cow_copies"] += 1
+                         self.block_pool.move_block_hashes(source_block, cow_block)
+                         self._pending_cow_copies.append((source_block, cow_block))
+                         source_block.ref_cnt += 1
+@@ -1628,6 +1651,7 @@
+                             # This CoW preserved a producer's own boundary
+                             # state in cow_block; hand it to the connector for
+                             # partial-tail offload once the copy has run.
++                            MambaManager.cow_stats["tail_offloads"] += 1
+                             self._pending_partial_tail_offloads.append(
+                                 (
+                                     request_id,
+@@ -1641,6 +1665,8 @@
+                             # copy, so defer same-step hits on it.
+                             self.cached_blocks_this_step.add(cow_block.block_hash)
+                     else:
++                        MambaManager.cow_stats["cow_firstprefill"] += 1
++                        MambaManager.cow_stats["cow_copies"] += 1
+                         self._apply_cow(request_id, block_idx, source_block, cow_block)
+                         returned_blocks = [cow_block] + returned_blocks
+                 req_blocks.extend(new_blocks)
+@@ -1698,6 +1724,15 @@
+ 
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
++        s = MambaManager.cow_stats
++        s["steps"] += 1
++        if s["steps"] % 500 == 0:
++            logger.info(
++                "cow-stats: steps=%d early_return=%d cow_running=%d "
++                "cow_firstprefill=%d cow_copies=%d tail_offloads=%d",
++                s["steps"], s["early_return"], s["cow_running"],
++                s["cow_firstprefill"], s["cow_copies"], s["tail_offloads"],
++            )
+ 
+     def _cache_partial_tail_block(
+         self,
