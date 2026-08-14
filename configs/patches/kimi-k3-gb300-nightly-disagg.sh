@@ -288,6 +288,20 @@ else
     exit 1
 fi
 python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
+# compileall proves the syntax, not that the module runs. Today a patched
+# coordinator.py compiled fine and raised NameError on `logger` at the
+# first lookup -- inside a worker thread, so nothing crashed and the
+# client hung at "0 returned, 0 errors" until the reaper killed the job.
+# Import the modules we patched and touch the names we added.
+python3 - <<'IMPORTCHECK' || { echo "[patch] FATAL: a patched module does not import cleanly" >&2; exit 1; }
+import importlib
+for m in ("vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator",
+          "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker"):
+    mod = importlib.import_module(m)
+    if "coordinator" in m and not hasattr(mod, "logger"):
+        raise SystemExit(f"{m} has no logger, but a patch logs from it")
+print("[patch] patched modules import and expose what they use")
+IMPORTCHECK
 
 echo "=== verifying the patched tree ==="
 # Read the tree rather than trust the applier's exit code: `patch --forward`

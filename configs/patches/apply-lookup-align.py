@@ -27,6 +27,14 @@ import sys
 
 TARGET = "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py"
 
+# coordinator.py has no logger. worker.py defines one; this module never needed
+# it until the line below was added, and `logger.info` there raises NameError --
+# inside the connector's process_request thread, so the thread dies, the lookup
+# never returns, and the client sits at "51 in flight, 0 returned, 0 errors"
+# until the idle-GPU reaper claims the job. Four ladders were lost to that and
+# read as a reaper problem. Import it explicitly rather than assume.
+LOGGER_IMPORT = "from vllm.logger import init_logger\n\nlogger = init_logger(__name__)\n"
+
 BEFORE = """    def align_lookup_length(self, length: int) -> int:
         alignment = (
             self.hash_block_size
@@ -76,6 +84,16 @@ def main() -> int:
     if "_logged_keyset_alignment" in src:
         print("[lookup-align] already present")
         return 0
+
+    # The logger first, and verified: without it the added log line raises
+    # NameError in a worker thread and the stall is silent.
+    if "init_logger" not in src:
+        marker = "\n\nclass MooncakeStoreCoordinator"
+        if marker not in src:
+            print("[lookup-align] FATAL: cannot place the logger import",
+                  file=sys.stderr)
+            return 1
+        src = src.replace(marker, "\n\n" + LOGGER_IMPORT + marker, 1)
     if src.count(BEFORE) != 1:
         print(
             f"[lookup-align] FATAL: align_lookup_length does not match the "
