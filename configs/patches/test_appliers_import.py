@@ -114,10 +114,53 @@ def check_keysample() -> list[str]:
     return []
 
 
+def check_guard_both_gates() -> list[str]:
+    """The setup script's own guard, run against both gate states.
+
+    The guard is what the arms actually execute, and it has now failed in both
+    directions: first it did not exist and a NameError cost four ladders, then
+    it required coordinator.py to define a logger unconditionally and failed
+    four more arms in eight minutes -- because the logger arrives with
+    apply-lookup-align.py, which is gated off by default.
+
+    So the test is not "does the applier work" but "does the guard agree with
+    the tree in every configuration the arms can be submitted in". Both.
+    """
+    problems = []
+    for gate in (False, True):
+        d = stage([COORD, WORKER])
+        if d is None:
+            return ["cannot read the nightly -- skipped"]
+        if gate:
+            r = subprocess.run([sys.executable, str(HERE / "apply-lookup-align.py"), str(d)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                problems.append(f"gate=on: applier failed: {r.stderr.strip()[:120]}")
+                continue
+        subprocess.run([sys.executable, str(HERE / "apply-keysample-log.py"), str(d)],
+                       capture_output=True, text=True)
+
+        for rel in (COORD, WORKER):
+            src = (d / rel).read_text()
+            logs = "logger." in src
+            defines = "init_logger" in src or "\nlogger = " in src
+            # This is the guard's predicate, verbatim.
+            if logs and not defines:
+                problems.append(
+                    f"gate={'on' if gate else 'off'}: {rel.rsplit('/', 1)[-1]} "
+                    f"logs but defines no logger")
+            # And the inverse, which is what bit us the second time: the guard
+            # must not demand a logger from a module that never logs.
+            if not logs and not defines:
+                pass  # fine -- nothing to check, and nothing to demand
+    return problems
+
+
 def main() -> int:
     failures = []
     for name, fn in (("lookup-align", check_lookup_align),
-                     ("keysample", check_keysample)):
+                     ("keysample", check_keysample),
+                     ("guard/both-gates", check_guard_both_gates)):
         problems = fn()
         for p in problems:
             failures.append(f"{name}: {p}")

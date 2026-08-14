@@ -293,13 +293,23 @@ python3 -m compileall -q "${SITE}/vllm/distributed/kv_transfer"
 # first lookup -- inside a worker thread, so nothing crashed and the
 # client hung at "0 returned, 0 errors" until the reaper killed the job.
 # Import the modules we patched and touch the names we added.
+# Ask the module what it uses, do not assume. The first version of this check
+# required coordinator.py to define a logger unconditionally -- but the logger
+# arrives with apply-lookup-align.py, which is gated off by default, so the
+# guard failed every arm that ran the default configuration and passed only the
+# ones testing the patch. Four arms died at eight minutes to a check written to
+# prevent a different bug. A guard that fires when nothing is wrong is worse
+# than no guard: it teaches you to route around it.
 python3 - <<'IMPORTCHECK' || { echo "[patch] FATAL: a patched module does not import cleanly" >&2; exit 1; }
 import importlib
+import pathlib
+
 for m in ("vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator",
           "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker"):
     mod = importlib.import_module(m)
-    if "coordinator" in m and not hasattr(mod, "logger"):
-        raise SystemExit(f"{m} has no logger, but a patch logs from it")
+    src = pathlib.Path(mod.__file__).read_text()
+    if "logger." in src and not hasattr(mod, "logger"):
+        raise SystemExit(f"{m} logs but defines no logger")
 print("[patch] patched modules import and expose what they use")
 IMPORTCHECK
 
