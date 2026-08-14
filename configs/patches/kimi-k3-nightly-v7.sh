@@ -48,10 +48,19 @@ assert sha.startswith("${PINNED_SHA}") or "${PINNED_SHA}".startswith(sha), (
 print(f"=== base nightly verified: {v} ===")
 PY
 
-echo "=== applying k3-ours8-v6-nightly ==="
+echo "=== applying $(basename "$PATCH") ==="
 if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$PATCH" >/dev/null 2>&1; then
     echo "already applied"
 else
+    # The patch must contain only vllm/ paths. site-packages has no tests/ tree,
+    # so a tests/ hunk makes patch exit non-zero, and with set -e that kills the
+    # setup after the deps have already been installed -- which reads as "server
+    # never became healthy" two log screens later. v7 shipped that way once.
+    if grep -qE '^diff --git a/(?!vllm/)' "$PATCH" 2>/dev/null || \
+       grep -E '^diff --git a/' "$PATCH" | grep -qv 'a/vllm/'; then
+        echo "ERROR: $PATCH touches paths outside vllm/; regenerate it with -- vllm/" >&2
+        exit 1
+    fi
     patch -p1 --forward -d "$SITE" < "$PATCH"
 fi
 
