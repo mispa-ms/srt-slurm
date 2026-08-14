@@ -180,7 +180,13 @@ PROBE
     # settings, so run with them and without them, and with no UCX_* at all.
     _ucxvars=$(env | sed -n 's/^\(UCX_[A-Z0-9_]*\)=.*/\1/p' | tr '\n' ' ')
     echo "=== probing UCX for CUDA support ==="
-    echo "  arm's UCX vars: ${_ucxvars:-<none>}"
+    # Values, not just names. UCX_TLS and UCX_NET_DEVICES turned up in this
+    # environment even though the arm sets neither and its comment says both are
+    # deliberately unset, and neither repo assigns them -- so they arrive from the
+    # image or the cluster. A restrictive UCX_TLS is exactly what would leave UCP
+    # with no registration-capable memory domain, which is what it reports: not
+    # only for cuda, but for host memory too.
+    env | grep "^UCX_" | sort | sed 's/^/  env: /' || echo "  env: <no UCX_ vars>"
     _unset_all=""
     for _v in ${_ucxvars}; do _unset_all="${_unset_all} -u ${_v}"; done
 
