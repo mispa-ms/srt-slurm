@@ -104,7 +104,30 @@ fi
 # and refuses to continue when it is absent, so this has to be set here. Note
 # the path sits under /lustre/share and only carries inferencex in its name --
 # it does not follow SLURM_PPP, so it resolves for either account.
-export K3_STAGED_DIR=${K3_STAGED_DIR:-/lustre/share/coreai_comparch_inferencex/models/kimi-k3}
+# The staged K3 checkpoint sits at a different path on every cluster, and this
+# script now runs on more than one of them, so probe rather than hardcode. An
+# explicit K3_STAGED_DIR still wins; otherwise take the first candidate that
+# exists and say which. Guessing a path costs a whole run to find out, and the
+# team sheet has no OCI-aga entry yet.
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    for _cand in \
+        /lustre/share/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3 \
+        /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/hanjieq/models/kimi-k3 \
+        /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3
+    do
+        if [ -d "${_cand}" ]; then
+            export K3_STAGED_DIR="${_cand}"
+            echo "[k3] staged checkpoint: ${K3_STAGED_DIR}"
+            break
+        fi
+    done
+fi
+if [ -z "${K3_STAGED_DIR:-}" ]; then
+    echo "[k3] WARN: no staged checkpoint found on this cluster; the HF shim will" \
+         "fall back to downloading 1.45 TB. Set K3_STAGED_DIR to the local copy." >&2
+fi
+
 
 # hfshim first -- the model has to resolve before anything else matters -- then
 # the Mooncake wheel, config and master. Both scripts source
