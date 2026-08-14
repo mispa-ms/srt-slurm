@@ -472,6 +472,31 @@ def _single_node_process() -> SimpleNamespace:
     )
 
 
+def test_every_job_container_srun_gets_the_unset() -> None:
+    """The unset must reach the frontend too, not only the workers.
+
+    The setup script runs in all three roles, so a cluster variable removed from
+    the workers and left on the frontend produces two different environments in
+    one job -- which is exactly how this was found: the same config reported
+    UCX_TLS absent when a prefill log was quoted and present when the frontend's
+    was.
+    """
+    import re
+
+    launchers = {
+        "src/srtctl/cli/mixins/worker_stage.py": 2,
+        "src/srtctl/frontends/dynamo.py": 1,
+        "src/srtctl/frontends/sglang.py": 1,
+        "src/srtctl/frontends/trtllm_serve.py": 1,
+    }
+    for path, expected in launchers.items():
+        src = Path(path).read_text()
+        calls = len(re.findall(r"start_srun_process\(", src))
+        unsets = src.count("env_to_unset=")
+        assert calls == expected, f"{path}: {calls} srun calls, expected {expected}"
+        assert unsets == expected, f"{path}: {unsets} of {calls} srun calls pass env_to_unset"
+
+
 def test_worker_stage_unsets_configured_environment(tmp_path: Path) -> None:
     """config.environment_unset reaches the worker srun.
 
