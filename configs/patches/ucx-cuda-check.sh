@@ -105,13 +105,36 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     echo "=== probing UCX for CUDA support (debug log) ==="
     _ucxlog=$(mktemp)
     UCX_LOG_LEVEL=debug python3 - >"${_ucxlog}" 2>&1 <<'PROBE'
-import torch
-from nixl._api import nixl_agent, nixl_agent_config
+import pathlib
 
-# Register DRAM first. It separates "UCX is broken here" from "UCX works and has
-# no CUDA memory type", which are different bugs with different fixes, and one
-# run should answer both.
+import torch
+
+# Create the CUDA context BEFORE the agent. UCX scans devices when the context
+# is built and skips the cuda memory domains if it finds none active -- the
+# first version of this probe made the agent first and produced exactly that:
+#
+#   cuda_ctx.c:30 cuda primary context is inactive on device 0..3
+#   ucp_context.c:2073 no memory domain supports registering cuda memory
+#
+# which says more about the probe's ordering than about the container. vLLM has
+# a live context long before NixlConnector builds its agent, so the faithful
+# order is this one.
+buf = torch.zeros(1024, dtype=torch.uint8, device="cuda:0")
+torch.cuda.synchronize()
+print(f"PROBE_CTX: cuda context active, {torch.cuda.device_count()} devices")
+
+# What UCX checks for GPUDirect RDMA, reported whichever way the probe goes.
+for p in ("/sys/kernel/mm/memory_peers/nv_mem/version",
+          "/sys/module/nvidia_peermem/version",
+          "/sys/module/nv_peer_mem/version"):
+    print(f"PROBE_GDR: {p}: {'present' if pathlib.Path(p).exists() else 'absent'}")
+
+from nixl._api import nixl_agent, nixl_agent_config  # noqa: E402
+
 agent = nixl_agent("ucx-probe", nixl_agent_config(backends=["UCX"]))
+
+# DRAM first: it separates "UCX is broken here" from "UCX works and has no CUDA
+# memory type", which are different bugs with different fixes.
 host = torch.zeros(1024, dtype=torch.uint8)
 try:
     agent.register_memory([host])
@@ -119,7 +142,6 @@ try:
 except Exception as exc:
     print(f"PROBE_DRAM_FAIL: {type(exc).__name__}: {exc}")
 
-buf = torch.zeros(1024, dtype=torch.uint8, device="cuda:0")
 agent.register_memory([buf])
 print("PROBE_OK: UCX registered VRAM")
 PROBE
@@ -136,7 +158,7 @@ PROBE
             echo "[ucx] --- python ---"
             grep -vE "UCX +(DEBUG|TRACE|INFO)" "${_ucxlog}" | tail -12
             echo "[ucx] --- probe verdicts ---"
-            grep -E "PROBE_(OK|DRAM_OK|DRAM_FAIL)" "${_ucxlog}" || echo "  (none reached)"
+            grep -E "PROBE_" "${_ucxlog}" || echo "  (none reached)"
             echo "[ucx] --- module loader / cuda ---"
             grep -iE "dlopen|module|cuda|not found|failed" "${_ucxlog}" \
                 | grep -viE "ucp_ep|mpool|async\.c|topo\.c|tcp_ep|tcp_cm|tcp_iface" \
