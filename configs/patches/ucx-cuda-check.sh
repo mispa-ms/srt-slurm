@@ -190,15 +190,39 @@ PROBE
     _unset_all=""
     for _v in ${_ucxvars}; do _unset_all="${_unset_all} -u ${_v}"; done
 
+    # Two things that would explain the failure without any environment variable
+    # being involved, which is what the 'noucx' variant failing implies.
+    #
+    # A ucx.conf overrides nothing we can unset -- libucs reads /etc/ucx/ucx.conf
+    # and one relative to its own install prefix -- so a TLS restriction there
+    # survives `env -u`.
+    echo "  ucx.conf:"
+    for _c in /etc/ucx/ucx.conf "${HOME}/.ucx/ucx.conf" \
+              /usr/local/lib/python3.12/dist-packages/nixl_cu13.libs/etc/ucx/ucx.conf; do
+        [ -f "${_c}" ] && { echo "    ${_c}:"; sed 's/^/      /' "${_c}"; }
+    done
+    [ -f /etc/ucx/ucx.conf ] || echo "    (none found)"
+    # And without the IB device nodes there is no IB memory domain to have, only
+    # tcp -- which registers nothing. That would produce exactly what UCP reports
+    # here: no memory domain for host memory either, not just for cuda. The nodes
+    # these probes landed on did not all show the same fabric.
+    echo "  /dev/infiniband: $(ls /dev/infiniband 2>/dev/null | tr '\n' ' ' || echo '<absent>')"
+
     _winner=""
     _asislog=""
-    for _variant in asis nomemtype noucx; do
+    for _variant in asis nomemtype noucx tlsall; do
         _log=$(mktemp)
         case "${_variant}" in
             asis)      env UCX_LOG_LEVEL=debug python3 "${_probe}" >"${_log}" 2>&1 ;;
             nomemtype) env -u UCX_MEMTYPE_CACHE -u UCX_MEMTYPE_REG_WHOLE \
                            UCX_LOG_LEVEL=debug python3 "${_probe}" >"${_log}" 2>&1 ;;
             noucx)     env ${_unset_all} UCX_LOG_LEVEL=debug \
+                           python3 "${_probe}" >"${_log}" 2>&1 ;;
+            # Override rather than unset. We inherit UCX_TLS=tcp and
+            # UCX_NET_DEVICES=eth0 from outside both repos, and tcp registers no
+            # memory at all -- but unsetting them did not help, so if a ucx.conf
+            # carries the same restriction only an explicit value beats it.
+            tlsall)    env UCX_TLS=all UCX_NET_DEVICES=all UCX_LOG_LEVEL=debug \
                            python3 "${_probe}" >"${_log}" 2>&1 ;;
         esac
         if grep -q PROBE_OK "${_log}"; then
