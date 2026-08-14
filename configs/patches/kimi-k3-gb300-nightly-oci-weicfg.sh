@@ -115,9 +115,22 @@ echo "site-packages: $SITE"
 # cause above" -- so the exception that explains it is pushed out of view
 # every time. sitecustomize is imported automatically by CPython, so this
 # covers every worker without touching a launch command.
-cp /configs/patches/k3-roothook.py "${SITE}/sitecustomize.py"
-python3 -c "import sitecustomize, sys; assert sys.excepthook.__name__ == 'hook'" \
-    && echo "[roothook] installed" || { echo "[roothook] FATAL: not active" >&2; exit 1; }
+cp /configs/patches/k3_roothook.py "${SITE}/k3_roothook.py"
+# A .pth, not sitecustomize.py: site.py imports only the first
+# sitecustomize on sys.path and the image already ships one at
+# /usr/lib/python3.12/sitecustomize.py, which would have shadowed ours
+# without a word. A .pth import line runs for every path entry.
+echo "import k3_roothook" > "${SITE}/zz-k3-roothook.pth"
+# A WARNING, never fatal. The first version of this check ran `import
+# sitecustomize` and asserted, which failed on a healthy install and took
+# four weiport arms down with it -- the same shape as the UCX guard that
+# killed eight arms this morning. A diagnostic that cannot confirm itself
+# must not end the run.
+if python3 -c "import sys; raise SystemExit(0 if sys.excepthook.__name__ == 'hook' else 1)" 2>/dev/null; then
+    echo "[roothook] installed"
+else
+    echo "[roothook] WARNING: not confirmed active; tracebacks may stay truncated" >&2
+fi
 
 # --- Hanjie's applier, unmodified -----------------------------------------
 # It gates on _version.py containing g3d204dfda and refuses to touch any other

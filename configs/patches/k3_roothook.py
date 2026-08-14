@@ -10,8 +10,11 @@ This installs an excepthook that walks the __cause__/__context__ chain to the
 innermost exception and prints it as the last thing the process writes. Nothing
 else changes: the original traceback is printed first, exactly as before.
 
-Installed as sitecustomize.py, which CPython imports automatically at startup, so
-it covers every worker without touching a launch command.
+Installed as a .pth file rather than sitecustomize.py. site.py imports only the
+FIRST sitecustomize it finds on sys.path, and the image already ships
+/usr/lib/python3.12/sitecustomize.py -- ours would have been shadowed and done
+nothing, silently. A .pth's import line is executed for every path entry, so it
+cannot be shadowed by name.
 """
 
 import sys
