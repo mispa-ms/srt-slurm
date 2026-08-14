@@ -158,8 +158,17 @@ if cuda is None:
 print(cuda.split('.', 1)[0], md.version('nixl'))
 ")
 read -r CU_MAJOR NIXL_VERSION <<<"${KV_META}"
-python3 -m pip uninstall -y nixl-cu12 nixl-cu13 >/dev/null 2>&1 || true
-python3 -m pip install --no-cache-dir --no-deps "nixl-cu${CU_MAJOR}==${NIXL_VERSION}"
+# Do NOT uninstall the other variant first. install-kv-connectors.sh does
+# ("Keep only the variant matching this CI image"), and following it is what
+# broke us: Hanjie's working container has BOTH nixl_cu12.libs and
+# nixl_cu13.libs present, which is what vLLM's Dockerfile actually produces --
+# `nixl` pulls cu12, then cu13 is force-reinstalled over it, and nothing is
+# removed. His runs show 40 "Backend UCX was instantiated" and zero "UCX CUDA
+# support was not found"; ours, with the same nixl 1.3.2 and cu12 removed,
+# report the warning on every rank.
+#
+# So the variant that must be present is not only the matching one. Leave both.
+python3 -m pip install --no-cache-dir --force-reinstall --no-deps "nixl-cu${CU_MAJOR}==${NIXL_VERSION}"
 python3 -c "
 import importlib.metadata as md
 import pathlib
@@ -170,7 +179,8 @@ present = sorted('%s==%s' % (d.metadata['Name'], d.version)
 print('  nixl distributions:', present)
 print('  imported from:', pathlib.Path(nixl.__file__).parent)
 cu = [p for p in present if p.startswith('nixl-cu')]
-assert len(cu) == 1, 'expected exactly one nixl-cuXX variant, found %s' % cu
+assert any(p.startswith('nixl-cu13') for p in cu), (
+    'nixl-cu13 is missing; UCX will have no CUDA-13 component: %s' % present)
 "
 
 
