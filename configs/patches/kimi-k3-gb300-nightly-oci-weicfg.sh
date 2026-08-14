@@ -121,7 +121,27 @@ python3 -m pip install --no-deps --force-reinstall \
 #      libcudart." That is the same shape as the mooncake cu12/cu13 shadowing
 #      that cost us a day: two distributions, one import, undefined winner.
 echo "=== installing KV connectors the way the working image does ==="
-python3 -m pip install --no-cache-dir "nixl==${NIXL_VER:-1.3.1}"
+# 1.3.2, not the 1.3.1 that requirements/kv_connectors.txt pins.
+#
+# The cu13 wheel's bundled UCX is version-dependent, and 1.3.1's is byte
+# identical to nixl-cu12's -- a CUDA 12 UCX inside the CUDA 13 wheel. auditwheel
+# names the libraries by content hash, so this is checkable:
+#
+#   nixl-cu13==1.3.0  libucp-fb7bfdea.so.0.0.0
+#   nixl-cu13==1.3.1  libucp-fb7bfdea.so.0.0.0   <- same as cu12
+#   nixl-cu13==1.3.2  libucp-e76cb9e6.so.0.0.0
+#   nixl-cu12==1.3.1  libucp-fb7bfdea.so.0.0.0
+#
+# That is why UCX loads no CUDA component here while every library resolves and
+# UCX_MODULE_DIR points at the right place: the component is not built for this
+# CUDA. Hanjie's container carries 1.3.2, which is the difference between his
+# oci-aga runs working and ours not -- his squashfs has
+# nixl_cu13.libs/libucp-e76cb9e6 while ours has fb7bfdea.
+#
+# Following .buildkite/scripts/install-kv-connectors.sh to the letter is what
+# pinned us to the broken pair, since it takes the version from the generic
+# `nixl` requirement.
+python3 -m pip install --no-cache-dir "nixl==${NIXL_VER:-1.3.2}"
 KV_META=$(python3 -c "
 import importlib.metadata as md
 import torch
@@ -212,6 +232,20 @@ if [ -n "${_plugdir}" ]; then
         exit 1
     fi
     echo "  UCX_MODULE_DIR=${UCX_MODULE_DIR} (matches the plugin dir)"
+    # The cu13 wheel has shipped a cu12 UCX before (1.3.0 and 1.3.1 both bundle
+    # nixl-cu12's libucp). Catch that here rather than 40 minutes later as
+    # "UCX CUDA support was not found" with every library resolving.
+    _ucp=$(ls "${_plugdir}"/../libucp-*.so.* 2>/dev/null | head -1)
+    if [ -n "${_ucp}" ]; then
+        echo "    bundled UCX: $(basename "${_ucp}")"
+        case "$(basename "${_ucp}")" in
+            libucp-fb7bfdea.*)
+                echo "[ucx] FATAL: this is nixl-cu12's UCX inside the cu13 wheel" \
+                     "(nixl-cu13 1.3.0/1.3.1). Its CUDA component will not load on a" \
+                     "CUDA 13 image. Pin NIXL_VER=1.3.2 or later." >&2
+                exit 1 ;;
+        esac
+    fi
     # Is there a system UCX in this image at all? The wheel's copy is the only
     # one vLLM's Dockerfile installs, but a base image or a transitive dep (e.g.
     # OpenMPI) can drag one in -- and a properly installed UCX has its CUDA
