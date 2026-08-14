@@ -225,11 +225,20 @@ PROBE
             tlsall)    env UCX_TLS=all UCX_NET_DEVICES=all UCX_LOG_LEVEL=debug \
                            python3 "${_probe}" >"${_log}" 2>&1 ;;
         esac
+        # Report every variant's evidence, not just its verdict. The previous
+        # round ran four environments and quoted only the first one's log, so
+        # 'tlsall: FAILED' carried no information about what changed -- the same
+        # mistake as running one hypothesis per submit, just compressed into a
+        # single job. Two numbers separate "the override did nothing" from "it
+        # opened the fabric and something else stopped it".
+        _ibmds=$(grep -c "md open by .* is successful" "${_log}" || true)
+        _reason=$(grep -oE "no memory domain supports registering (host|cuda) memory|VRAM memory is detected as host|no selected transport resources" \
+                  "${_log}" | sort -u | tr '\n' ';')
         if grep -q PROBE_OK "${_log}"; then
-            echo "  ${_variant}: VRAM registered"
+            echo "  ${_variant}: VRAM registered (ib mds=${_ibmds})"
             [ -z "${_winner}" ] && _winner="${_variant}"
         else
-            echo "  ${_variant}: FAILED"
+            echo "  ${_variant}: FAILED (ib mds=${_ibmds}) ${_reason:-<no known reason>}"
         fi
         [ "${_variant}" = asis ] && _asislog="${_log}"
     done
