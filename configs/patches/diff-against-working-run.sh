@@ -121,6 +121,38 @@ echo "=== their container ==="
 grep -rhom1 "container_image[^ ]*[:=] *[^ ]*" "${_root}/${_good}"/*.log "${_root}/${_good}"/logs/*.log 2>/dev/null | sort -u | head -3
 grep -rhoE "\-\-container-image[= ][^ ]+" "${_root}/${_good}/logs" 2>/dev/null | sort -u | head -3
 
+# The question their run answers that ours cannot: is their offload tier
+# actually serving? "dram-mooncake" in a series name says the store is
+# configured, not that anything is read back from it. Our prefill external hit
+# is 0.0% and their curve is good; if theirs is 0.0% too, the offload tier is
+# not what separates us and the whole hunt is aimed wrong.
+#
+# Per role and mean, not pooled max: on decode this counter is the disagg KV
+# pull from prefill and reads ~100% by construction, which drowns the prefill
+# number that matters.
+echo "=== their prefix cache hit rates (prefill = the offload tier) ==="
+python3 - "${_root}/${_good}/logs" <<'PYEOF'
+import pathlib, re, sys
+agg = {}
+for f in pathlib.Path(sys.argv[1]).glob("*.out*"):
+    role = "prefill" if "prefill" in f.name else "decode" if "decode" in f.name else None
+    if role is None:
+        continue
+    for g, e in re.findall(
+        r"Prefix cache hit rate: ([\d.]+)%, External prefix cache hit rate: ([\d.]+)%",
+        f.read_text(errors="ignore"),
+    ):
+        agg.setdefault(role, []).append((float(g), float(e)))
+for role in ("prefill", "decode"):
+    v = agg.get(role, [])
+    if v:
+        print(f"  {role}: gpu={sum(x[0] for x in v)/len(v):.1f}% "
+              f"external={sum(x[1] for x in v)/len(v):.1f}%  ({len(v)} samples)")
+    else:
+        print(f"  {role}: no samples")
+PYEOF
+grep -rhoE "Get=[0-9.]+/[0-9.]+|Keys: [0-9]+" "${_root}/${_good}"/logs/mooncake_master.log 2>/dev/null | sort -u | tail -3
+
 echo "=== what UCX chose in their run ==="
 grep -rhoE "(Backend UCX was instantiated|selected transport[s]?[^,]*|using dmabuf[^,]*)" \
     "${_root}/${_good}/logs" 2>/dev/null | sort -u | head -5
