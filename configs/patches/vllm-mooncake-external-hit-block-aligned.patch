@@ -1,34 +1,70 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
-index 7ab7b79945..bc1e66c036 100644
+index 2fc71ee488..d6775d2982 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
-@@ -316,11 +316,24 @@ class MooncakeStoreCoordinator:
-         used by ``load_mask`` to avoid popping a second block on top of the
+@@ -98,12 +98,34 @@ class MooncakeStoreCoordinator:
+         self._verify_and_split_kv_cache_groups()
+ 
+     def align_lookup_length(self, length: int) -> int:
+-        alignment = (
+-            self.hash_block_size
+-            if self.enable_partial_hash_hits
+-            else self.lcm_block_size
+-        )
+-        return length // alignment * alignment
++        # This is the alignment that decides which keys are asked for: worker.py
++        # fixes token_len from it and then builds the candidate key list. The
++        # other alignment, in find_longest_cache_hit below, only decides how much
++        # of a hit is reported. Changing that one alone leaves the lookup still
++        # asking for sub-block keys, so both are changed here.
++        alignment = self.lcm_block_size
++        aligned = length // alignment * alignment
++        # One line, once per process, that settles why the offload tier writes
++        # gigabytes and reads back 0.0%. Under DCP the two alignments are far
++        # apart -- block_size is scaled by dcp_world_size, so at DCP8 a block is
++        # 12288 tokens (96 hashes) while a hash_block_size-aligned hit lands on
++        # any multiple of 128, between two written keys.
++        if not getattr(self, "_logged_keyset_alignment", False):
++            self._logged_keyset_alignment = True
++            logger.info(
++                "[mooncake-keyset] lookup aligns to %d; hash_block_size=%d, "
++                "lcm_block_size=%d, partial_hash_hits=%s; upstream would use "
++                "%d, and the store answers only multiples of %d",
++                alignment,
++                self.hash_block_size,
++                self.lcm_block_size,
++                self.enable_partial_hash_hits,
++                self.hash_block_size
++                if self.enable_partial_hash_hits
++                else self.lcm_block_size,
++                self.lcm_block_size,
++            )
++        return aligned
+ 
+     def _verify_and_split_kv_cache_groups(self) -> None:
+         """Mirrors KVCacheCoordinator.verify_and_split_kv_cache_groups but
+@@ -292,11 +314,19 @@ class MooncakeStoreCoordinator:
          one already removed by the lookup.
          """
+         eagle_indices = self.eagle_attn_group_indices if apply_eagle else set()
 -        alignment_tokens = (
 -            self.hash_block_size
 -            if self.enable_partial_hash_hits
 -            else self.lcm_block_size
 -        )
 +        # The store keys one object per block_size chunk, by that chunk's last
-+        # hash_block_size sub-hash (see chunk_hashes_for_block_size in data.py),
-+        # so the only lengths it can serve are multiples of the block size.
-+        # Aligning the lookup to hash_block_size lets it report a hit at a
-+        # sub-block boundary, and loading that asks for a key nobody wrote: the
-+        # request succeeds, finds nothing, and reports no error. That is why
-+        # every K3 DCP run offloads gigabytes and reads back 0.0%.
-+        #
-+        # Under DCP the gap is unmissable -- block_size is scaled by
-+        # dcp_world_size, so at DCP8 a block is 12288 tokens (96 hashes) while
-+        # the reported hit lands on any multiple of 128. configs/patches/
-+        # test_mooncake_dcp_keyset.py fails at dcp=2, 4 and 8 and passes at
-+        # dcp=1 for exactly this reason.
++        # hash_block_size sub-hash (chunk_hashes_for_block_size in data.py), so
++        # the only lengths it can serve are multiples of the block size.
++        # Reporting a hit at a sub-block boundary makes the load ask for a key
++        # nobody wrote: the request succeeds, finds nothing, reports no error.
++        # That is why every K3 DCP run offloads gigabytes and reads back 0.0%,
++        # and why test_mooncake_dcp_keyset.py fails at dcp=2, 4 and 8 while
++        # passing at dcp=1.
 +        #
 +        # Round to what the store can answer. This gives up the sub-block tail
-+        # that vllm#49502 added, which costs at most one block of prefix per
-+        # request and cannot be worse than the 0% we measure today.
++        # vllm#49502 added, which costs at most one block of prefix per request
++        # and cannot be worse than the 0% measured today.
 +        alignment_tokens = self.lcm_block_size
          if len(self.attention_groups) == 1:
-             spec, group_ids, manager_cls, group_eagle = self.attention_groups[0]
+             spec, group_ids, manager_cls = self.attention_groups[0]
              hit_blocks, hit_length = manager_cls.find_longest_cache_hit(
