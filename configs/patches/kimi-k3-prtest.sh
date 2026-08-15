@@ -37,15 +37,20 @@ patch -p1 --forward < "$TEST"
 # `ModuleNotFoundError: vllm._C_stable_libtorch` before collecting anything.
 mkdir -p /tmp/vt && cp -r /tmp/vsrc/tests /tmp/vt/tests
 cd /tmp/vt
-python3 - <<'PYEOF'
+# Compare against $SITE rather than looking for "site-packages" in the path:
+# this image is Debian-based and installs to dist-packages, so the literal
+# string check rejected a perfectly good interpreter.
+python3 - "$SITE" <<'PYEOF'
 import pathlib
+import sys
 
 import vllm
 
+site = pathlib.Path(sys.argv[1]).resolve()
 where = pathlib.Path(vllm.__file__).resolve()
-assert "site-packages" in str(where), (
-    f"vllm resolves to {where}, not the installed package; the tests would run "
-    "against an unbuilt source tree"
+assert site in where.parents, (
+    f"vllm resolves to {where}, which is not under the installed tree {site}; "
+    "the tests would run against an unbuilt source tree"
 )
 print(f"vllm resolves to {where}")
 PYEOF
