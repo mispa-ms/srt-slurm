@@ -79,9 +79,18 @@ LOOKUP_AFTER = '''            res = self.store.batch_is_exist(candidate_keys)
                     sum(1 for r in res if r == 1),
                     _ever,
                     len(_pool),
-                    candidate_keys[0].rsplit("@", 1)[-1] if candidate_keys else "-",
-                    next(iter(_pool)).rsplit("@", 1)[-1] if _pool else "-",
+                    candidate_keys[0] if candidate_keys else "-",
+                    next(iter(_pool)) if _pool else "-",
                 )
+                # Whole keys, both sides, once. The prefix has been compared
+                # already and matches; what has never been put side by side is
+                # the string the store is actually given against the string it
+                # is actually asked for.
+                if _n == 0:
+                    for _k in list(candidate_keys)[:3]:
+                        logger.info("[mooncake-keyset]   ASKED %s", _k)
+                    for _k in list(_pool)[:3]:
+                        logger.info("[mooncake-keyset]   SAVED %s", _k)
 '''
 
 
@@ -97,14 +106,41 @@ def main() -> int:
         print("[keyset-intersect] already present")
         return 0
 
-    for what, before, after in (("save", SAVE_BEFORE, SAVE_AFTER),
-                                ("lookup", LOOKUP_BEFORE, LOOKUP_AFTER)):
+    # BOTH put sites. The first version of this hooked only the deep one and
+    # reported saved_pool=0 on every sample, which was read as "the lookup runs
+    # in a process that never saves" -- a structural claim built on a missing
+    # anchor. The shallow site wraps its arguments on one line and sits a level
+    # out; it cannot match the deep anchor however many replacements are
+    # allowed. keysample learned this an hour earlier and this file did not.
+    SHALLOW_BEFORE = """            res = self.store.batch_put_from_multi_buffers(
+                keys, addrs, sizes, self.replicate_config
+            )
+"""
+    SHALLOW_AFTER = '''            res = self.store.batch_put_from_multi_buffers(
+                keys, addrs, sizes, self.replicate_config
+            )
+            _pool = getattr(self, "_ks_saved", None)
+            if _pool is None:
+                _pool = self._ks_saved = set()
+            if len(_pool) < 400000:
+                _pool.update(keys)
+'''
+
+    for what, before, after, required in (
+        ("save-deep", SAVE_BEFORE, SAVE_AFTER, True),
+        ("save-shallow", SHALLOW_BEFORE, SHALLOW_AFTER, True),
+        ("lookup", LOOKUP_BEFORE, LOOKUP_AFTER, True),
+    ):
         n = src.count(before)
         if n != 1:
+            if not required:
+                print(f"[keyset-intersect]   {what}: {n} anchors, skipped")
+                continue
             print(f"[keyset-intersect] FATAL: {n} {what} anchors, expected 1. "
                   f"The upstream body changed; re-read it.", file=sys.stderr)
             return 1
         src = src.replace(before, after, 1)
+        print(f"[keyset-intersect]   {what}: instrumented")
 
     path.write_text(src)
     print("[keyset-intersect] applied: written keys are intersected with asked keys")
