@@ -26,10 +26,29 @@ SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).paren
 python3 -c "import vllm; print('image vllm:', vllm.__version__)"
 
 command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
-rm -rf /tmp/vsrc && mkdir -p /tmp/vsrc && cd /tmp/vsrc
+rm -rf /tmp/vsrc /tmp/vt && mkdir -p /tmp/vsrc && cd /tmp/vsrc
 git init -q && git remote add origin https://github.com/vllm-project/vllm.git
 git fetch -q --depth 1 origin "$SHA" && git checkout -q FETCH_HEAD
 patch -p1 --forward < "$TEST"
+
+# Run from a directory that holds tests/ and nothing else. Inside the clone,
+# `import vllm` resolves to the source tree ahead of site-packages, and the
+# source tree has no compiled extension -- the first attempt died on
+# `ModuleNotFoundError: vllm._C_stable_libtorch` before collecting anything.
+mkdir -p /tmp/vt && cp -r /tmp/vsrc/tests /tmp/vt/tests
+cd /tmp/vt
+python3 - <<'PYEOF'
+import pathlib
+
+import vllm
+
+where = pathlib.Path(vllm.__file__).resolve()
+assert "site-packages" in str(where), (
+    f"vllm resolves to {where}, not the installed package; the tests would run "
+    "against an unbuilt source tree"
+)
+print(f"vllm resolves to {where}")
+PYEOF
 
 # tests/conftest.py imports tblib at module scope, so without it pytest exits 4
 # (collection error) and never runs anything. The first attempt read that 4 as
