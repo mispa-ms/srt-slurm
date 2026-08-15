@@ -201,6 +201,26 @@ MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-/tmp/mooncake_config.json}"
 # block: one master on the infra node, MOONCAKE_MASTER injected everywhere, and
 # store_config rendered for it. Its docs say that value must never be set by
 # hand. This flag steps aside for that.
+# Default to standing aside whenever srtctl has already provided a master.
+#
+# This used to be opt-in behind K3_MOONCAKE_SKIP_LOCAL_MASTER, which left 103 of
+# the 107 GB300 disagg configs still starting one master per node. Starting a
+# second master when MOONCAKE_MASTER is already in the environment is not a
+# tuning choice -- it is never right. srtctl sets that variable only when it has
+# launched a master on the infra node and pointed every worker at it.
+#
+# What it cost while it was the default: 1P1D at two nodes per role gave four
+# independent stores, so a lookup asking for a hash under all eight rank
+# namespaces could never see more than four. External hit was 0.0% on every arm
+# for weeks. With one shared master the same workload reads 4.2%.
+#
+# K3_MOONCAKE_FORCE_LOCAL_MASTER=1 restores the old behaviour for anyone who
+# needs a node-local store on purpose (single-node AGG, which is what this
+# script was written for).
+if [ -n "${MOONCAKE_MASTER:-}" ] && [ "${K3_MOONCAKE_FORCE_LOCAL_MASTER:-0}" != "1" ]; then
+    K3_MOONCAKE_SKIP_LOCAL_MASTER=1
+    echo "[mooncake] MOONCAKE_MASTER is set by srtctl -- not starting a second master"
+fi
 if [ "${K3_MOONCAKE_SKIP_LOCAL_MASTER:-0}" = "1" ]; then
     echo "[mooncake] K3_MOONCAKE_SKIP_LOCAL_MASTER=1 -- srtctl owns the master"
     echo "[mooncake]   MOONCAKE_MASTER=${MOONCAKE_MASTER:-<unset by srtctl!>}"
