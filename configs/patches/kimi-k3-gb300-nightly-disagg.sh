@@ -376,6 +376,11 @@ if [ "${K3_MOONCAKE_DIAG:-0}" = "1" ]; then
     # prefixes matching on both sides. Only the hash suffix is left, and the
     # prefix-only sample drops exactly that.
     python3 /configs/patches/apply-keyset-intersect-log.py "${SITE}" || exit 1
+    # The sharpest test available: the save path and the lookup path call the
+    # same primitive, so put a batch and immediately ask for exactly those
+    # keys, in one process on one handle. If the store denies a write it just
+    # accepted, then which keys are asked for never mattered.
+    python3 /configs/patches/apply-put-readback-log.py "${SITE}" || exit 1
 else
     echo "[patch] mooncake diagnostics skipped (K3_MOONCAKE_DIAG != 1)"
 fi
