@@ -220,6 +220,57 @@ else
     exit 1
 fi
 
+# --- wzhao18/vllm kimi-k3-agentx-v3, the part we do not already have -------
+# Every +dspark arm reached healthy, served traffic, and died in
+# cache_full_blocks on `block_hash_num_tokens` -- c8 at 61/87 requests, c32 at
+# 82/354, c48 at 123/531. The nospec arms on the identical stack kept running,
+# which is the clue: the assertion guards partial->full block promotion, and
+# only draft tokens open that window.
+#
+# 07839fb50f "fix(kv-transfer): privatize partial attention pages" names it:
+#
+#   A fine-grained local hit can end inside a larger attention page. The page
+#   is shared through the prefix cache, so an external suffix must use a newly
+#   allocated private page instead of overwriting it in place.
+#
+# The fine-grained hit is what prefix-match-unit=128 creates, and every arm
+# here sets it.
+#
+# Only four files. His branch is eighteen commits over upstream 925ea7e60f and
+# the aug13 snapshot already carries fourteen of them; the delta is this. Cut
+# as merge-base..tip -- NOT as our-tree..his-tree, which mixes his changes with
+# upstream drift and reads like a dependency on upstream we do not have. That
+# misreading cost an hour and two wrong conclusions ("v3 needs #50062", "the
+# image must move"). See tools/wei_branch_port.py.
+V3_PATCH=/configs/patches/vllm-wzhao-k3-agentx-v3-delta-on-aug13.patch
+if [ ! -r "${V3_PATCH}" ]; then
+    echo "[patch] FATAL: ${V3_PATCH} missing" >&2
+    exit 1
+fi
+if patch --batch --forward --dry-run -d "${SITE}" -p1 < "${V3_PATCH}" >/dev/null 2>&1; then
+    patch --batch --forward -d "${SITE}" -p1 < "${V3_PATCH}"
+    echo "[patch] applied v3 delta (privatize partial attention pages, DSpark+DCP)"
+elif patch --batch --reverse --dry-run -d "${SITE}" -p1 < "${V3_PATCH}" >/dev/null 2>&1; then
+    echo "[patch] v3 delta already present"
+else
+    echo "[patch] FATAL: the v3 delta neither applies nor is already applied" >&2
+    exit 1
+fi
+# The name the fix hangs on, asserted rather than assumed: without it a +dspark
+# arm does not fail here, it fails an hour later under load.
+python3 - <<'V3CHECK' || { echo "[patch] FATAL: the v3 delta did not take" >&2; exit 1; }
+import os
+import pathlib
+site = pathlib.Path(os.environ["VLLM_SITE_PACKAGES"])
+src = (site / "vllm/v1/core/kv_cache_manager.py").read_text()
+if "truncate_attention_blocks_for_external_load" not in src:
+    raise SystemExit("kv_cache_manager has no truncate_attention_blocks_for_external_load")
+back = (site / "vllm/v1/attention/backend.py").read_text()
+if "supports_non_causal_multi_token_dcp" not in back:
+    raise SystemExit("backend.py does not declare supports_non_causal_multi_token_dcp")
+print("[patch] v3 delta verified")
+V3CHECK
+
 # --- ours: block-align the external hit ------------------------------------
 # Not from Wei or Hanjie. The mooncake store keys one object per block_size
 # chunk, so the only lengths it can serve are multiples of the block size, but
