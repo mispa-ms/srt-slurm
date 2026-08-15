@@ -258,6 +258,14 @@ else
 fi
 # The name the fix hangs on, asserted rather than assumed: without it a +dspark
 # arm does not fail here, it fails an hour later under load.
+# 07839fb50f is in two halves -- the method, and the nine lines in
+# Scheduler.schedule that call it. The port took the first half only: the delta
+# was cut per file, sched/scheduler.py came back "previously applied" because
+# the v2 snapshot already had most of it, and the one new hunk went with the
+# skipped file. Everything compiled, every assertion here passed, and the arm
+# died at 122/531 on the assertion the commit exists to prevent -- one request
+# off what the unpatched stack managed.
+python3 /configs/patches/apply-privatize-external-pages-callsite.py "${SITE}" || exit 1
 python3 - <<'V3CHECK' || { echo "[patch] FATAL: the v3 delta did not take" >&2; exit 1; }
 import os
 import pathlib
@@ -265,6 +273,11 @@ site = pathlib.Path(os.environ["VLLM_SITE_PACKAGES"])
 src = (site / "vllm/v1/core/kv_cache_manager.py").read_text()
 if "truncate_attention_blocks_for_external_load" not in src:
     raise SystemExit("kv_cache_manager has no truncate_attention_blocks_for_external_load")
+# A method in the tree is not a method that runs. Assert the caller too.
+sched = (site / "vllm/v1/core/sched/scheduler.py").read_text()
+if "truncate_attention_blocks_for_external_load" not in sched:
+    raise SystemExit("nothing calls truncate_attention_blocks_for_external_load; "
+                     "the scheduler half of 07839fb50f is missing")
 back = (site / "vllm/v1/attention/backend.py").read_text()
 if "supports_non_causal_multi_token_dcp" not in back:
     raise SystemExit("backend.py does not declare supports_non_causal_multi_token_dcp")
