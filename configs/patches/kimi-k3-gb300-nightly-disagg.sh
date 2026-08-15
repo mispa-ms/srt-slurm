@@ -381,6 +381,12 @@ if [ "${K3_MOONCAKE_DIAG:-0}" = "1" ]; then
     # keys, in one process on one handle. If the store denies a write it just
     # accepted, then which keys are asked for never mattered.
     python3 /configs/patches/apply-put-readback-log.py "${SITE}" || exit 1
+    # Two numbers, once at init: the per-group replication factor (which is
+    # also the save-side put stride) and the number of rank prefixes the
+    # lookup requires. put_step > 1 with lookup_prefixes > 1 means one rank
+    # in N writes each chunk while the lookup waits for all N -- which is
+    # exactly the shape of 19,615 keys found and none surviving the quorum.
+    python3 /configs/patches/apply-group-topology-log.py "${SITE}" || exit 1
 else
     echo "[patch] mooncake diagnostics skipped (K3_MOONCAKE_DIAG != 1)"
 fi
