@@ -354,6 +354,26 @@ fi
 # and Get never fires, so written and queried keys disagree; a key is a string,
 # so print one of each and read the difference instead of deriving it.
 python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
+
+# --- diagnostics, off by default -------------------------------------------
+# Two questions the counters cannot answer. The connector reports
+# lookup_exists_count 8 against ~3,000 requests in the same window, with
+# save_put writing 22 GB and lookup_exists_error_count at 0 -- and that last
+# zero proves nothing, because an exception raised before the counter
+# increments is invisible to it. That is how a NameError in this same connector
+# hid for a day behind "0 returned, 0 errors".
+#
+#   apply-lookup-exit-log.py    where lookup() leaves, as a distribution
+#   apply-external-hit-decision-log.py   external vs local, when it does return
+#
+# Both add log lines on a per-request path, so they stay behind their own flag:
+# an arm carrying them is a diagnostic, not a datapoint.
+if [ "${K3_MOONCAKE_DIAG:-0}" = "1" ]; then
+    python3 /configs/patches/apply-lookup-exit-log.py "${SITE}" || exit 1
+    python3 /configs/patches/apply-external-hit-decision-log.py "${SITE}" || exit 1
+else
+    echo "[patch] mooncake diagnostics skipped (K3_MOONCAKE_DIAG != 1)"
+fi
 # vllm#50359, as we carried it on misunp/k3-merged-mooncake-dcp and then left
 # behind when this track moved to the nightly. It revalidates that a reported
 # partial-hash hit names an object the store actually holds, and shortens by
