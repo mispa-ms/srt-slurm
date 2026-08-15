@@ -188,6 +188,31 @@ TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-1500}"
 TP="${MOONCAKE_TP:-8}"
 PER_RANK_GB=$(( TOTAL_CPU_DRAM_GB / TP ))
 MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-/tmp/mooncake_config.json}"
+
+# One master for the job, or one per node.
+#
+# Everything below this point writes a config naming 127.0.0.1 and starts a
+# local mooncake_master. With 1P1D at two nodes per role that is four masters
+# and four stores that do not know about each other -- the master log says
+# "Clients: 4", one node's four ranks -- while the lookup asks for a hash under
+# all eight rank namespaces and can only ever find four.
+#
+# srt-slurm does it the other way when the arm carries a mooncake_kv_store
+# block: one master on the infra node, MOONCAKE_MASTER injected everywhere, and
+# store_config rendered for it. Its docs say that value must never be set by
+# hand. This flag steps aside for that.
+if [ "${K3_MOONCAKE_SKIP_LOCAL_MASTER:-0}" = "1" ]; then
+    echo "[mooncake] K3_MOONCAKE_SKIP_LOCAL_MASTER=1 -- srtctl owns the master"
+    echo "[mooncake]   MOONCAKE_MASTER=${MOONCAKE_MASTER:-<unset by srtctl!>}"
+    echo "[mooncake]   MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH}"
+    if [ -z "${MOONCAKE_MASTER:-}" ]; then
+        echo "[mooncake] FATAL: no MOONCAKE_MASTER. The arm has no" >&2
+        echo "[mooncake]   backend.mooncake_kv_store block, so nothing started a" >&2
+        echo "[mooncake]   shared master and skipping the local one leaves none." >&2
+        exit 1
+    fi
+    exit 0
+fi
 # Into /logs when the run has one: only that directory is harvested with the job, and
 # the master's periodic store stats (fill/keys/evictions) are the only record of what
 # the host-DRAM pool actually did. Earlier runs wrote to /tmp and lost them.
