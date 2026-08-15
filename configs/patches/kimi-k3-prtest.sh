@@ -31,7 +31,12 @@ git init -q && git remote add origin https://github.com/vllm-project/vllm.git
 git fetch -q --depth 1 origin "$SHA" && git checkout -q FETCH_HEAD
 patch -p1 --forward < "$TEST"
 
-python3 -m pip install -q pytest 2>/dev/null || true
+# tests/conftest.py imports tblib at module scope, so without it pytest exits 4
+# (collection error) and never runs anything. The first attempt read that 4 as
+# "the test failed without the fix" -- which is why the gate below now demands
+# exactly 1, pytest's code for "tests ran and failed".
+python3 -m pip install -q pytest tblib pytest-asyncio 2>&1 | tail -2 || true
+python3 -c "import tblib, pytest; print('pytest', pytest.__version__, '/ tblib ok')"
 
 echo "=============== 1. WITHOUT the fix: the new test must FAIL ==============="
 set +e
@@ -40,8 +45,12 @@ python3 -m pytest -q \
     -k eagle_group_registers_unaligned_tail
 before=$?
 set -e
-echo "exit before fix = $before"
-[ "$before" -eq 0 ] && { echo "FATAL - the regression test passes without the fix, so it tests nothing" >&2; exit 1; }
+echo "exit before fix = $before  (pytest: 0=passed 1=failed 2=interrupted 4=usage 5=no tests)"
+if [ "$before" -ne 1 ]; then
+    echo "FATAL - expected exit 1 (test ran and failed). Got $before, which means" >&2
+    echo "        the suite did not run, not that the fix is unnecessary." >&2
+    exit 1
+fi
 
 echo "=============== 2. applying the fix to installed vllm ==============="
 patch -p1 --forward -d "$SITE" < "$FIX"
