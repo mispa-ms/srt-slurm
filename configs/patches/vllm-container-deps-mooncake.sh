@@ -74,11 +74,42 @@ CU_MAJOR=$(ldconfig -p 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | grep -oE
 GLIBC_MINOR=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+$')
 echo "[mooncake] arch=$(uname -m) cuda_major=${CU_MAJOR:-unknown} glibc=2.${GLIBC_MINOR:-?}"
 
+# Optionally keep what the image already ships.
+#
+# Hanjie's InferenceMAX submission (NVIDIA/InferenceMAX#213) runs the same
+# nightly image and does NOT reinstall mooncake -- "0.3.12.post1 (CUDA13,
+# image-resident, no reinstall)" -- and his offload reads: 73.9% external hit at
+# disagg c48, 2,565 GB put against 491 GB get. Ours reads 0.0% on the same image
+# and the same patch set, having replaced the resident wheel with the PyPI one
+# of the same version. Same version is not the same build, and RDMA memory
+# registration is exactly the kind of thing that differs between them.
+#
+# Off by default: the reinstall is what fixed the silent 0.3.9 downgrade, and
+# every number we have was measured with it.
+if [ "${K3_MOONCAKE_USE_IMAGE:-0}" = "1" ]; then
+    if python3 -c "import mooncake" >/dev/null 2>&1; then
+        _IMGV=$(pip show mooncake-transfer-engine-cuda13 2>/dev/null | awk '/^Version:/{print $2}')
+        [ -z "${_IMGV}" ] && _IMGV=$(pip show mooncake-transfer-engine 2>/dev/null | awk '/^Version:/{print $2}')
+        echo "[mooncake] K3_MOONCAKE_USE_IMAGE=1 -- keeping the image's mooncake ${_IMGV:-<unknown>}"
+        MOONCAKE_INSTALLED=1
+        SKIP_MOONCAKE_INSTALL=1
+        # Everything the skipped block would have defined. `set -u` is on, and
+        # the shim branch below reads these unconditionally.
+        NEED_CUDART12_SHIM=0
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${_IMGV:-image}"
+        MOONCAKE_FALLBACK_PKG="${MOONCAKE_PKG}"
+    else
+        echo "[mooncake] FATAL: K3_MOONCAKE_USE_IMAGE=1 but the image has no mooncake" >&2
+        exit 1
+    fi
+fi
+
 # Clear BOTH distributions first. They provide the same `mooncake` package, so
 # with both installed --force-reinstall only overwrites files and leaves the
 # loser's metadata behind: `pip show <name>` then answers for a version that is
 # not the one importing. Uninstalling afterwards is worse -- it deletes the files
 # the winner just wrote. Start from zero and there is one answer.
+if [ "${SKIP_MOONCAKE_INSTALL:-0}" != "1" ]; then
 for _mc in mooncake-transfer-engine-cuda13 mooncake-transfer-engine; do
     if pip show "${_mc}" >/dev/null 2>&1; then
         echo "[mooncake] removing pre-existing ${_mc}"
@@ -105,6 +136,7 @@ else
         [ "${CU_MAJOR}" = "13" ] && NEED_CUDART12_SHIM=1
     fi
 fi
+fi   # SKIP_MOONCAKE_INSTALL
 if [ "${NEED_CUDART12_SHIM}" = "1" ]; then
     echo "[mooncake] cu13 image + non-cu13 wheel -> installing cu12 runtime shim (libcudart.so.12)"
     pip install --quiet --no-cache-dir "nvidia-cuda-runtime-cu12"
