@@ -1,0 +1,56 @@
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index f5cd79b285..141c7612cf 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -704,20 +704,26 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 for gid in group.group_ids:
+                     self.single_type_managers[gid].use_eagle = True
+ 
+-    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
++    def _align_cacheable(self, num_tokens: int) -> int:
++        """Round ``num_tokens`` down to what may enter the prefix-cache hash map.
++
++        Cache hits in this coordinator are always a multiple of
++        ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``). Within
++        an aligned region, SWA groups may only consult a subset of blocks per
++        ``scheduler_block_size``-segment, so the unused blocks also stay out of
++        the hash map.
++
++        With fine-grained partial hash hits a hit does not have to land on a
++        ``scheduler_block_size`` boundary, so no rounding applies. Every caller
++        must go through here: computing the bound in one place and re-deriving it
++        in another is how the EAGLE branch below silently lost this exemption.
++        """
+         if self.enable_partial_hash_hits:
+-            aligned_num_computed_tokens = num_computed_tokens
+-        else:
+-            # Cache hits in this coordinator are always a multiple of
+-            # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
+-            # Within an aligned region, SWA groups may only consult a subset of
+-            # blocks per ``scheduler_block_size``-segment so the unused blocks
+-            # also stay out of the prefix-cache hash map.
+-            aligned_num_computed_tokens = (
+-                num_computed_tokens
+-                // self.scheduler_block_size
+-                * self.scheduler_block_size
+-            )
++            return num_tokens
++        return num_tokens // self.scheduler_block_size * self.scheduler_block_size
++
++    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
++        aligned_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+         for manager in self.single_type_managers:
+             num_tokens_to_cache = aligned_num_computed_tokens
+             # EAGLE groups match one block past each aligned boundary and drop
+@@ -729,10 +735,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 num_finalized_computed_tokens = max(
+                     0, num_computed_tokens - self.num_reprefillable_tokens
+                 )
+-                aligned_num_finalized_computed_tokens = (
++                aligned_num_finalized_computed_tokens = self._align_cacheable(
+                     num_finalized_computed_tokens
+-                    // self.scheduler_block_size
+-                    * self.scheduler_block_size
+                 )
+                 num_tokens_to_cache = min(
+                     num_finalized_computed_tokens,
