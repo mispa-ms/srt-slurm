@@ -371,6 +371,11 @@ python3 /configs/patches/apply-keysample-log.py "${SITE}" || exit 1
 if [ "${K3_MOONCAKE_DIAG:-0}" = "1" ]; then
     python3 /configs/patches/apply-lookup-exit-log.py "${SITE}" || exit 1
     python3 /configs/patches/apply-external-hit-decision-log.py "${SITE}" || exit 1
+    # The last unknown. Everything else is ruled out: the lookup runs, reaches
+    # the store, raises nothing, and comes back empty 128 of 128, with the key
+    # prefixes matching on both sides. Only the hash suffix is left, and the
+    # prefix-only sample drops exactly that.
+    python3 /configs/patches/apply-keyset-intersect-log.py "${SITE}" || exit 1
 else
     echo "[patch] mooncake diagnostics skipped (K3_MOONCAKE_DIAG != 1)"
 fi
