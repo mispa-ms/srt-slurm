@@ -271,6 +271,33 @@ if "supports_non_causal_multi_token_dcp" not in back:
 print("[patch] v3 delta verified")
 V3CHECK
 
+# The one hunk of the v3 port that does not apply: our de19be2460 moved the
+# TokenspeedMLA class body, so Wei's context no longer matches. Carried as an
+# applier instead of a hunk, because what it sets is read through
+# `getattr(builder_cls, "supports_non_causal_multi_token_dcp", False)` -- a
+# missing attribute is silently a "no", the selector then refuses
+# TOKENSPEED_MLA with "non-causal MLA attention with DCP not supported", every
+# worker fails to start, and the job surfaces it as an EOFError twenty minutes
+# in. It was first waved through because a neighbouring flag,
+# supports_mtp_with_cp_non_trivial_interleave_size, sits a few lines away and
+# reads almost the same.
+python3 /configs/patches/apply-tokenspeed-noncausal-dcp.py "${SITE}" || exit 1
+python3 - <<'DCPCHECK' || { echo "[patch] FATAL: TOKENSPEED_MLA would be refused under DCP" >&2; exit 1; }
+import os
+import pathlib
+site = pathlib.Path(os.environ["VLLM_SITE_PACKAGES"])
+ts = (site / "vllm/v1/attention/backends/mla/tokenspeed_mla.py").read_text()
+# It has to be on the builder class -- the impl class carries similarly named
+# flags and the selector does not read those.
+builder = ts.split("class TokenspeedMLAMetadataBuilder")[1].split("\nclass ")[0]
+if "supports_non_causal_multi_token_dcp" not in builder:
+    raise SystemExit(
+        "supports_non_causal_multi_token_dcp is not on TokenspeedMLAMetadataBuilder; "
+        "the backend selector will refuse TOKENSPEED_MLA under DCP"
+    )
+print("[patch] TOKENSPEED_MLA declares non-causal DCP support")
+DCPCHECK
+
 # --- ours: block-align the external hit ------------------------------------
 # Not from Wei or Hanjie. The mooncake store keys one object per block_size
 # chunk, so the only lengths it can serve are multiples of the block size, but
