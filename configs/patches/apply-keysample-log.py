@@ -92,12 +92,41 @@ def main() -> int:
         print("[keysample] already present")
         return 0
 
-    for what, before, after, expected in (
-        ("lookup", LOOKUP_BEFORE, LOOKUP_AFTER, 1),
-        # The put appears on more than one path (partial-tail and full-block);
-        # instrument the first, which is enough for one sample and keeps the
-        # replacement unambiguous.
-        ("save", SAVE_BEFORE, SAVE_AFTER, None),
+    # The second put site is indented one level deeper and wraps its arguments
+    # one per line, so the first anchor cannot match it however many
+    # replacements are allowed. It is the site the arms actually take.
+    SAVE2_BEFORE = """            batch_bytes = _sum_batch_bytes(sizes)
+            put_start = time.perf_counter()
+"""
+    SAVE2_AFTER = '''            batch_bytes = _sum_batch_bytes(sizes)
+            if keys and not getattr(self, "_logged_key_sample_save", False):
+                self._logged_key_sample_save = True
+                logger.info(
+                    "[mooncake-keysample] SAVE puts %d keys with prefix: %s",
+                    len(keys),
+                    keys[0].rsplit("@", 1)[0],
+                )
+            put_start = time.perf_counter()
+'''
+
+    for what, before, after, only_first in (
+        ("lookup", LOOKUP_BEFORE, LOOKUP_AFTER, True),
+        ("save-deep", SAVE2_BEFORE, SAVE2_AFTER, False),
+        # EVERY put site, not the first.
+        #
+        # This used to instrument only the first, with a comment saying one
+        # sample was enough. The put appears on two paths -- the partial-tail
+        # one at the top of the file and the full-block one further down -- and
+        # the arms take the second. So `save_put_count` climbed to 176 and
+        # 22 GB landed in the store while the SAVE sample line never once
+        # printed, and every log read that day showed a LOOKUP prefix with
+        # nothing to compare it against.
+        #
+        # The whole point of this patch is to put the written key next to the
+        # queried key. Instrumenting one arbitrary path of two defeats it
+        # silently, which is worse than not having it: the missing line reads
+        # like "no saves happened".
+        ("save", SAVE_BEFORE, SAVE_AFTER, False),
     ):
         n = src.count(before)
         if n == 0:
@@ -107,13 +136,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if expected is not None and n != expected:
-            print(
-                f"[keysample] FATAL: {n} {what} anchors, expected {expected}",
-                file=sys.stderr,
-            )
-            return 1
-        src = src.replace(before, after, 1)
+        src = src.replace(before, after, 1 if only_first else -1)
+        print(f"[keysample]   {what}: instrumented {1 if only_first else n} site(s)")
 
     path.write_text(src)
     print("[keysample] applied: one sample key logged from each side")
