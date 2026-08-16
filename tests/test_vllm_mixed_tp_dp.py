@@ -106,3 +106,23 @@ class TestValidation:
             assert "does not match" in str(exc)
         else:
             raise AssertionError("expected a ValueError for dp4 on 8 GPUs")
+
+    def test_rejects_a_rank_that_would_span_nodes(self):
+        """tp8 x dp2 on 4-GPU nodes: a rank straddles two nodes.
+
+        per_node launching gives each node one process owning its resident
+        ranks, so a rank has to fit inside a node. This shape used to floor
+        local_dp_size to 0 and surface as "KV-event port block size must be at
+        least 1" from the port allocator -- eight GB300 arms died on that
+        before the shape itself was named.
+        """
+        backend = _backend(**{"data-parallel-size": 2, "tensor-parallel-size": 8})
+        endpoint = _endpoint("decode", ("node0", "node1", "node2", "node3"), gpus_per_node=4)
+
+        try:
+            backend.endpoints_to_processes([endpoint])
+        except ValueError as exc:
+            assert "would span" in str(exc), exc
+            assert "tensor-parallel-size=8" in str(exc), exc
+        else:
+            raise AssertionError("expected a ValueError for a node-spanning DP rank")
