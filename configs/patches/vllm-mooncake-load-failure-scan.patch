@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index 762e5eba92..7933632cec 100644
+index 762e5eba92..3c04bd2133 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 @@ -232,6 +233,14 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
@@ -17,7 +17,22 @@ index 762e5eba92..7933632cec 100644
  def _sum_batch_bytes(sizes: list[list[int]]) -> int:
      return sum(sum(size) for size in sizes)
  
-@@ -1127,6 +1136,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -931,6 +940,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     self.replicate_config,
+                 )
+                 failed = [i for i, v in enumerate(res) if v < 0]
++                if envs.VLLM_MOONCAKE_STORE_KEY_LOG:
++                    for key, value in zip(keys, res, strict=True):
++                        logger.info(
++                            "Mooncake store key: req_id=%s key=%s put=%d",
++                            req_id,
++                            key,
++                            value,
++                        )
+                 self._record_operation(
+                     "save_put",
+                     put_start,
+@@ -1127,6 +1144,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          current_batch_keys: list[str] = key_list_c
          current_batch_block_ids: list[int] = block_id_list_c
          batch_bytes = 0
@@ -26,7 +41,7 @@ index 762e5eba92..7933632cec 100644
          try:
              for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
                  current_batch_keys = batch_keys
-@@ -1170,7 +1181,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1170,7 +1189,28 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                          len(batch_keys),
                          [(key, value) for key, value, _ in failed[:3]],
                      )
@@ -36,10 +51,27 @@ index 762e5eba92..7933632cec 100644
 +                    for key, _value, _block_id in failed:
 +                        g_idx = _group_index_from_key(key)
 +                        scanned_failures[g_idx] = scanned_failures.get(g_idx, 0) + 1
++                    # -704 is OBJECT_NOT_FOUND. Asking the store about the same
++                    # keys now separates "exists but the GET disagrees" from
++                    # "the object is simply not there". Never let a diagnostic
++                    # change the outcome of the load it is observing.
++                    try:
++                        failed_keys = [key for key, _v, _b in failed]
++                        present = self.store.batch_is_exist(failed_keys)
++                        for key, exists in zip(failed_keys, present, strict=True):
++                            logger.warning(
++                                "Mooncake load failure recheck: req_id=%s key=%s "
++                                "exists=%s",
++                                req_id,
++                                key,
++                                exists,
++                            )
++                    except Exception as e:
++                        logger.warning("Mooncake failure recheck errored: %s", e)
          except Exception as e:
              self._add_load_error_block_ids(current_batch_block_ids)
              self._record_operation(
-@@ -1187,6 +1202,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1187,6 +1227,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                  e,
              )
  
@@ -57,18 +89,19 @@ index 762e5eba92..7933632cec 100644
          self.request_queue.task_done()
  
 diff --git a/vllm/envs.py b/vllm/envs.py
-index c2314891cb..e5132c4c55 100755
+index c2314891cb..9383ee37b5 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -219,6 +219,7 @@ if TYPE_CHECKING:
+@@ -219,6 +219,8 @@ if TYPE_CHECKING:
      VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
      VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
      VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
 +    VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN: bool = False
++    VLLM_MOONCAKE_STORE_KEY_LOG: bool = False
      VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
      VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
      MOONCAKE_PREFERRED_SEGMENT: str | None = None
-@@ -1634,6 +1635,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1634,6 +1636,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
          os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
      ),
@@ -79,6 +112,13 @@ index c2314891cb..e5132c4c55 100755
 +    "VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN": lambda: (
 +        os.getenv("VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN", "False").lower()
 +        in ("true", "1")
++    ),
++    # Diagnostic: log every stored key with its put return code. One line per
++    # key, so this is c1-scale only. Its purpose is to let a failed GET key be
++    # joined against what was actually written -- the full string, because a
++    # prefix or hash-unit mismatch must read as a near-miss and not as absence.
++    "VLLM_MOONCAKE_STORE_KEY_LOG": lambda: (
++        os.getenv("VLLM_MOONCAKE_STORE_KEY_LOG", "False").lower() in ("true", "1")
 +    ),
      # Number of parallel KV-load receive threads per worker rank. Lets the
      # per-request control overhead (Python prep + master key lookup) of one

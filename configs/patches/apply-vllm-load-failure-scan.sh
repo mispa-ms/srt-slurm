@@ -24,9 +24,21 @@
 # scheduler truncates there -- so scanning trades wasted transfers for a
 # complete picture and belongs only in a diagnostic arm.
 #
-# Pair it with VLLM_MOONCAKE_STORE_TIER_LOG, which already prints
-# memory/disk/unknown per sub-batch. Together they answer whether the failures
-# really are confined to one group, and which tier the missing keys were on.
+# The same flag also re-issues batch_is_exist on the failed keys the moment the
+# GET fails. -704 is OBJECT_NOT_FOUND (mooncake types.h; REPLICA_NOT_FOUND is
+# -710, REPLICA_IS_GONE -712, LEASE_EXPIRED -707 -- none of which we receive),
+# so asking the store about the same key now separates "it exists and the GET
+# disagrees" from "the object is simply not there". The recheck is wrapped so a
+# diagnostic can never change the outcome of the load it is observing.
+#
+# VLLM_MOONCAKE_STORE_KEY_LOG is separate because it is unbounded: one line per
+# stored key, with the full key string and its put return code. The full string
+# is what makes a prefix or hash-unit mismatch read as a near-miss rather than
+# as absence, and the return code is what separates "never written" from
+# "written and gone". c1 emits ~540 store events; do not set it above that.
+#
+# Pair all of it with VLLM_MOONCAKE_STORE_TIER_LOG, which prints
+# memory/disk/unknown per sub-batch.
 #
 # Verified: the six hunks apply onto nightly 3d204dfda with Hanjie's patch
 # already on top (dry-run, offsets 1/36/5/32). Unit coverage lives in
@@ -81,9 +93,10 @@ import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker
 
 ok = True
-if not hasattr(envs, "VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN"):
-    print("[loadscan] VERIFY FAILED: env var not declared")
-    ok = False
+for var in ("VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN", "VLLM_MOONCAKE_STORE_KEY_LOG"):
+    if not hasattr(envs, var):
+        print(f"[loadscan] VERIFY FAILED: {var} not declared")
+        ok = False
 if not hasattr(worker, "_group_index_from_key"):
     print("[loadscan] VERIFY FAILED: _group_index_from_key missing")
     ok = False
@@ -94,9 +107,10 @@ else:
         ok = False
 if not ok:
     sys.exit(1)
-print("[loadscan] applied; scan=%s tier_log=%s" % (
+print("[loadscan] applied; scan=%s tier_log=%s key_log=%s" % (
     os.environ.get("VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN", "<unset>"),
     os.environ.get("VLLM_MOONCAKE_STORE_TIER_LOG", "<unset>"),
+    os.environ.get("VLLM_MOONCAKE_STORE_KEY_LOG", "<unset>"),
 ))
 PY
 
