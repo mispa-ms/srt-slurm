@@ -86,7 +86,10 @@ class SABenchRunner(BenchmarkRunner):
             decode_gpus = r.decode_gpus
             total_gpus = prefill_gpus + decode_gpus
         else:
-            total_gpus = (r.agg_nodes or 1) * r.gpus_per_node
+            # Count the GPUs the agg workers actually occupy, not every GPU on
+            # the node. A TP=4 worker on an 8-GPU node used to be recorded as 8,
+            # which halves every per-GPU number derived from the result file.
+            total_gpus = r.agg_gpus or (r.agg_nodes or 1) * r.gpus_per_node
             prefill_gpus = 0
             decode_gpus = 0
 

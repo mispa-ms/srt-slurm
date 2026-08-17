@@ -608,6 +608,11 @@ class ResourceConfig:
         """Total GPUs used by all decode workers."""
         return self.num_decode * self.gpus_per_decode
 
+    @property
+    def agg_gpus(self) -> int:
+        """Total GPUs used by all aggregated workers."""
+        return self.num_agg * self.gpus_per_agg
+
     def het_components(
         self,
         *,
