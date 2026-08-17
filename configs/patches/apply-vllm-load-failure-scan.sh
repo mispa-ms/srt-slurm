@@ -45,11 +45,14 @@
 # Pair all of it with VLLM_MOONCAKE_STORE_TIER_LOG, which prints
 # memory/disk/unknown per sub-batch.
 #
-# Verified: the six hunks apply onto nightly 3d204dfda with Hanjie's patch
-# already on top (dry-run, offsets 1/36/5/32). Unit coverage lives in
+# Verified: all seven hunks apply onto nightly 3d204dfda with Hanjie's patch
+# already on top (dry-run). Unit coverage lives in
 # tests/v1/kv_connector/unit/test_mooncake_store_worker.py:
 #   test_recv_thread_scans_every_sub_batch_when_failure_scan_enabled
 #   test_recv_thread_failure_scan_logs_untruncated_per_group_summary
+#   test_store_sending_thread_logs_each_key_with_its_put_result
+#   test_recv_thread_rechecks_existence_of_failed_keys
+#   test_recv_thread_logs_group_histogram_of_every_requested_key
 # =============================================================================
 set -euo pipefail
 
