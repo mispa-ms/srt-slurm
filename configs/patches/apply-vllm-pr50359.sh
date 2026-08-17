@@ -77,20 +77,31 @@ fi
 python3 -m compileall -q \
   "${VLLM_ROOT}/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py"
 
+# tracks_existence is set in __init__, so it is an INSTANCE attribute -- an
+# earlier version of this check asked hasattr() of the class, which is always
+# False and failed three arms at startup. Probe an instance, and assert the
+# value too: the recv-side pool must report False or the retry would shorten a
+# hit the lookup already validated.
 python3 - <<'PY'
 import sys
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import coordinator as c
 
-missing = [
-    n for n, o in (
-        ("tracks_existence", c.ExternalCachedBlockPool),
-        ("cache_hit_alignment_tokens", c.MooncakeStoreCoordinator),
-        ("_exact_partial_hit_key_exists", c.MooncakeStoreCoordinator),
-    ) if not hasattr(o, n)
-]
-if missing:
-    print("[pr50359] VERIFY FAILED, absent:", ", ".join(missing))
+failures = []
+try:
+    recv_pool = c.ExternalCachedBlockPool(16)
+    lookup_pool = c.ExternalCachedBlockPool(16, set())
+    if recv_pool.tracks_existence is not False:
+        failures.append("tracks_existence is not False on the recv-side pool")
+    if lookup_pool.tracks_existence is not True:
+        failures.append("tracks_existence is not True when an exists set is given")
+except AttributeError as e:
+    failures.append(f"tracks_existence absent ({e})")
+for name in ("cache_hit_alignment_tokens", "_exact_partial_hit_key_exists"):
+    if not hasattr(c.MooncakeStoreCoordinator, name):
+        failures.append(f"{name} absent")
+if failures:
+    print("[pr50359] VERIFY FAILED: " + "; ".join(failures))
     sys.exit(1)
 print("[pr50359] applied; exact-boundary revalidation active")
 PY
