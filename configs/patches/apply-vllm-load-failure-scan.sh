@@ -37,6 +37,11 @@
 # as absence, and the return code is what separates "never written" from
 # "written and gone". c1 emits ~540 store events; do not set it above that.
 #
+# The scan flag also logs the group histogram of every requested key, on every
+# load including successful ones. That is the denominator: without it,
+# "every failure is group:3" cannot be told apart from "group:3 is most of
+# what a load asks for", and the second would make the first vacuous.
+#
 # Pair all of it with VLLM_MOONCAKE_STORE_TIER_LOG, which prints
 # memory/disk/unknown per sub-batch.
 #

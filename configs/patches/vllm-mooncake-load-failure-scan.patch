@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index 762e5eba92..3c04bd2133 100644
+index 762e5eba92..0e1d79f0cc 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 @@ -232,6 +233,14 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
@@ -32,16 +32,29 @@ index 762e5eba92..3c04bd2133 100644
                  self._record_operation(
                      "save_put",
                      put_start,
-@@ -1127,6 +1144,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1127,6 +1144,21 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          current_batch_keys: list[str] = key_list_c
          current_batch_block_ids: list[int] = block_id_list_c
          batch_bytes = 0
 +        failure_scan = envs.VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN
 +        scanned_failures: dict[int, int] = {}
++        if failure_scan:
++            # The denominator. Failures alone cannot distinguish "this group is
++            # broken" from "this group is most of what a load asks for".
++            requested: dict[int, int] = {}
++            for key in key_list_c:
++                g_idx = _group_index_from_key(key)
++                requested[g_idx] = requested.get(g_idx, 0) + 1
++            logger.info(
++                "Mooncake load requested: req_id=%s keys=%d by_group=%s",
++                req_id,
++                len(key_list_c),
++                dict(sorted(requested.items())),
++            )
          try:
              for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
                  current_batch_keys = batch_keys
-@@ -1170,7 +1189,28 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1170,7 +1202,28 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                          len(batch_keys),
                          [(key, value) for key, value, _ in failed[:3]],
                      )
@@ -71,7 +84,7 @@ index 762e5eba92..3c04bd2133 100644
          except Exception as e:
              self._add_load_error_block_ids(current_batch_block_ids)
              self._record_operation(
-@@ -1187,6 +1227,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1187,6 +1240,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                  e,
              )
  
