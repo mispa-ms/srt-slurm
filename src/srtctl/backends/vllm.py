@@ -507,12 +507,21 @@ class VLLMProtocol:
 
         if frontend_type == "vllm":
             # Direct `vllm serve` spans nodes with --nnodes/--node-rank, so the TP
-            # one-process-per-node layout is what we want. Data-parallel layouts need
-            # a router in front and are not supported here.
-            if any(self._is_dp_mode(ep.mode) for ep in endpoints):
-                raise ValueError(
-                    "frontend.type: vllm does not support data-parallel layouts; use tensor/expert parallel"
-                )
+            # one-process-per-node layout is what we want. A data-parallel layout is
+            # expressible on that same topology exactly when the DP ranks map one to
+            # one onto nodes: then node_rank already is the data-parallel rank, which
+            # is what build_serve_command emits. Upstream dropped this guard outright
+            # (NVIDIA/srt-slurm 217f9438) and SemiAnalysis' two-node Kimi-K3 B200 runs
+            # go through that path; keep a narrowed form so a layout this topology
+            # cannot express still fails here rather than at engine init.
+            for ep in endpoints:
+                dp_size = self._get_dp_size(ep.mode)
+                if dp_size is not None and dp_size != len(ep.nodes):
+                    raise ValueError(
+                        f"frontend.type: vllm needs one data-parallel rank per node, but "
+                        f"{ep.mode} has data-parallel-size={dp_size} across {len(ep.nodes)} "
+                        "node(s); use frontend.type: dynamo for any other DP layout"
+                    )
             processes = endpoints_to_processes(
                 endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator
             )

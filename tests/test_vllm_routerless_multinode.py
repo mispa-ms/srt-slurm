@@ -54,11 +54,27 @@ class TestRouterlessMultiNodeTopology:
         assert processes[0].http_port == FRONTEND_PUBLIC_PORT
         assert processes[0].is_leader
 
-    def test_data_parallel_layout_is_rejected(self):
-        """DP needs a router in front, so it must not silently fall through."""
+    def test_data_parallel_one_rank_per_node_is_allowed(self):
+        """DP2 over two nodes is the one-process-per-node topology already.
+
+        node_rank doubles as the data-parallel rank, which is what
+        build_serve_command emits, so this needs no router. SemiAnalysis' two-node
+        Kimi-K3 B200 recipe is exactly this shape.
+        """
         backend = VLLMProtocol(vllm_config=VLLMServerConfig(aggregated={"data-parallel-size": 2}))
 
-        with pytest.raises(ValueError, match="does not support data-parallel"):
+        processes = backend.endpoints_to_processes([_agg_endpoint(("node0", "node1"))], frontend_type="vllm")
+
+        assert [p.node for p in processes] == ["node0", "node1"]
+        assert [p.node_rank for p in processes] == [0, 1]
+        assert processes[0].http_port == FRONTEND_PUBLIC_PORT
+        assert processes[1].http_port == 0
+
+    def test_data_parallel_not_matching_node_count_is_rejected(self):
+        """Any other DP layout needs more processes than this topology has."""
+        backend = VLLMProtocol(vllm_config=VLLMServerConfig(aggregated={"data-parallel-size": 4}))
+
+        with pytest.raises(ValueError, match="one data-parallel rank per node"):
             backend.endpoints_to_processes([_agg_endpoint(("node0", "node1"))], frontend_type="vllm")
 
 
