@@ -35,6 +35,9 @@ from srtctl.cli.mixins import (
 )
 from srtctl.core.config import load_config
 from srtctl.core.health import wait_for_port
+
+# Cold pyxis image imports dominate this wait; see start_mooncake_master.
+MOONCAKE_MASTER_START_TIMEOUT_S = int(os.environ.get("SRTCTL_MOONCAKE_MASTER_TIMEOUT_S", "1800"))
 from srtctl.core.lockfile import write_lockfile
 from srtctl.core.processes import (
     ManagedProcess,
@@ -276,9 +279,21 @@ class SweepOrchestrator(
             critical=True,
         )
 
+        # The first of these ports to open is gated on pyxis importing the
+        # container image, not on mooncake starting. On a cluster that has never
+        # pulled the image -- a fresh vLLM nightly on prenyx, tens of GB -- the
+        # import alone runs well past two minutes, and the old 120 s budget
+        # failed the sweep with an empty mooncake_master.out whose only line was
+        # "pyxis: importing docker image". Give the first wait the image-pull
+        # budget; once it opens the image is cached and the two that follow are
+        # the process itself, which is fast.
         logger.info("Waiting for mooncake_master RPC (port %d) on %s...", MOONCAKE_MASTER_PORT, infra_node)
-        if not wait_for_port(infra_node, MOONCAKE_MASTER_PORT, timeout=120):
-            raise RuntimeError("mooncake_master RPC failed to start")
+        if not wait_for_port(infra_node, MOONCAKE_MASTER_PORT, timeout=MOONCAKE_MASTER_START_TIMEOUT_S):
+            raise RuntimeError(
+                "mooncake_master RPC failed to start within "
+                f"{MOONCAKE_MASTER_START_TIMEOUT_S}s -- check {mooncake_log}; if its last "
+                "line is a pyxis image import, the image was still being pulled"
+            )
         logger.info(
             "Waiting for mooncake_master HTTP metadata (port %d) on %s...",
             MOONCAKE_HTTP_METADATA_PORT,
