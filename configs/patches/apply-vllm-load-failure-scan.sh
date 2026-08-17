@@ -42,6 +42,12 @@
 # "every failure is group:3" cannot be told apart from "group:3 is most of
 # what a load asks for", and the second would make the first vacuous.
 #
+# The failure line also carries the failed chunk's index and token span next to
+# token_len. The key string is a hash and says nothing about position, and
+# position is the open question: end == token_len means the tail of the
+# verified range, end > token_len means the load overran it, end < token_len
+# means neither story holds.
+#
 # Pair all of it with VLLM_MOONCAKE_STORE_TIER_LOG, which prints
 # memory/disk/unknown per sub-batch.
 #

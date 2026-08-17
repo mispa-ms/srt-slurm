@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index 762e5eba92..0e1d79f0cc 100644
+index 762e5eba92..dc3e0d01bd 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 @@ -232,6 +233,14 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
@@ -32,7 +32,28 @@ index 762e5eba92..0e1d79f0cc 100644
                  self._record_operation(
                      "save_put",
                      put_start,
-@@ -1127,6 +1144,21 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1053,6 +1070,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         size_list: list[list[int]] = []
+         key_list: list[str] = []
+         block_id_list: list[int] = []
++        # Where each requested key sits, so a failure can be placed against
++        # token_len instead of being reported as a bare hash.
++        key_span: dict[str, tuple[int, int, int]] = {}
+         for g_idx, db in enumerate(self.token_databases):
+             mask = load_mask_per_group[g_idx]
+             chunks: list[tuple[int, int]] = []
+@@ -1062,7 +1082,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 chunk_idx = start // db.block_size
+                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                     continue
+-                key_list.append(db.key_for(block_hash))
++                key = db.key_for(block_hash)
++                key_list.append(key)
++                key_span[key] = (chunk_idx, start, end)
+                 chunks.append((start, end))
+             g_addrs, g_sizes, g_block_ids = db.prepare_values(
+                 chunks, req_meta.block_ids[g_idx]
+@@ -1127,6 +1149,24 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          current_batch_keys: list[str] = key_list_c
          current_batch_block_ids: list[int] = block_id_list_c
          batch_bytes = 0
@@ -46,15 +67,18 @@ index 762e5eba92..0e1d79f0cc 100644
 +                g_idx = _group_index_from_key(key)
 +                requested[g_idx] = requested.get(g_idx, 0) + 1
 +            logger.info(
-+                "Mooncake load requested: req_id=%s keys=%d by_group=%s",
++                "Mooncake load requested: req_id=%s keys=%d by_group=%s "
++                "token_len=%d mask_num=%d",
 +                req_id,
 +                len(key_list_c),
 +                dict(sorted(requested.items())),
++                token_len,
++                mask_num,
 +            )
          try:
              for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
                  current_batch_keys = batch_keys
-@@ -1170,7 +1202,28 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1170,7 +1210,33 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                          len(batch_keys),
                          [(key, value) for key, value, _ in failed[:3]],
                      )
@@ -72,19 +96,24 @@ index 762e5eba92..0e1d79f0cc 100644
 +                        failed_keys = [key for key, _v, _b in failed]
 +                        present = self.store.batch_is_exist(failed_keys)
 +                        for key, exists in zip(failed_keys, present, strict=True):
++                            idx, s, e = key_span.get(key, (-1, -1, -1))
 +                            logger.warning(
 +                                "Mooncake load failure recheck: req_id=%s key=%s "
-+                                "exists=%s",
++                                "exists=%s chunk=%d span=%d-%d token_len=%d",
 +                                req_id,
 +                                key,
 +                                exists,
++                                idx,
++                                s,
++                                e,
++                                token_len,
 +                            )
 +                    except Exception as e:
 +                        logger.warning("Mooncake failure recheck errored: %s", e)
          except Exception as e:
              self._add_load_error_block_ids(current_batch_block_ids)
              self._record_operation(
-@@ -1187,6 +1240,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1187,6 +1253,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                  e,
              )
  
