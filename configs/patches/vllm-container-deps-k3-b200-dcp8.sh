@@ -26,6 +26,17 @@ if [[ -f /configs/patches/vllm-container-deps-k3-hfshim.sh ]]; then
     bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 fi
 
+# Dump what the container can actually see of the fabric and the host. Mooncake
+# names its RDMA devices by hand (device_name in the recipe) and reports a wrong
+# name only as "Found 0 HCAs" / "No available RNIC", which does not say what the
+# right name would have been. prenyx cost a run to that. Cheap, once per node.
+echo "=== k3-b200-dcp8: fabric and host inventory ==="
+echo "--- ibv_devices"; ibv_devices 2>&1 | head -20 || echo "(ibv_devices unavailable)"
+echo "--- ibstat -l"; ibstat -l 2>&1 | head -20 || echo "(ibstat unavailable)"
+echo "--- /sys/class/infiniband"; ls -1 /sys/class/infiniband 2>&1 | head -20 || echo "(none)"
+echo "--- MemTotal"; grep -E "MemTotal|MemAvailable" /proc/meminfo || true
+echo "=== k3-b200-dcp8: inventory done ==="
+
 echo "=== k3-b200-dcp8: applying the DCP dummy-batch fix ==="
 
 python3 - <<'PY'
