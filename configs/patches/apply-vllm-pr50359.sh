@@ -59,11 +59,27 @@ if [[ ! -r "${PATCH_FILE}" ]]; then
   exit 1
 fi
 
-if [[ ! -r "${VERSION_FILE}" ]] || ! grep -q "g3d204dfda" "${VERSION_FILE}"; then
-  echo "[pr50359] FATAL: expected nightly g3d204dfda, got:" >&2
+# Accept either nightly. The patch touches only mooncake/store/coordinator.py,
+# and that file is byte-identical between the two (17,102 bytes in both trees) --
+# the 132 commits between them changed connector.py, data.py, scheduler.py and
+# worker.py, and left coordinator.py alone. Pinning to aug13 alone stopped being
+# tenable when Docker Hub deleted the aug13 tag: `nightly-3d204dfda...` now 404s
+# and every arm on it fails at "NATS failed to start", before any of our code.
+readonly ACCEPTED_NIGHTLIES="g3d204dfda g311b3513a"
+if [[ ! -r "${VERSION_FILE}" ]]; then
+  echo "[pr50359] FATAL: no ${VERSION_FILE}" >&2
+  exit 1
+fi
+_matched=""
+for _v in ${ACCEPTED_NIGHTLIES}; do
+  if grep -q "${_v}" "${VERSION_FILE}"; then _matched="${_v}"; break; fi
+done
+if [[ -z "${_matched}" ]]; then
+  echo "[pr50359] FATAL: expected one of [${ACCEPTED_NIGHTLIES}], got:" >&2
   cat "${VERSION_FILE}" >&2 || true
   exit 1
 fi
+echo "[pr50359] nightly ${_matched}"
 
 if patch --batch --forward --dry-run -d "${SITE_PACKAGES}" -p1 < "${PATCH_FILE}" >/dev/null; then
   patch --batch --forward -d "${SITE_PACKAGES}" -p1 < "${PATCH_FILE}"
