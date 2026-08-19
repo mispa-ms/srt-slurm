@@ -9,6 +9,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 import huggingface_hub.constants
@@ -16,6 +17,32 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+_active_profile_decode_streams = 0
+
+
+def _profile_decode_stream_started() -> bool:
+    marker = os.environ.get("SRT_BENCH_DECODE_ACTIVE_MARKER")
+    target_text = os.environ.get("SRT_BENCH_DECODE_ACTIVE_TARGET")
+    if not marker or not target_text:
+        return False
+
+    target = int(target_text)
+    if target <= 0:
+        raise ValueError("SRT_BENCH_DECODE_ACTIVE_TARGET must be positive")
+
+    global _active_profile_decode_streams
+    _active_profile_decode_streams += 1
+    if _active_profile_decode_streams == target:
+        Path(marker).touch()
+    return True
+
+
+def _profile_decode_stream_finished(tracked: bool) -> None:
+    if not tracked:
+        return
+
+    global _active_profile_decode_streams
+    _active_profile_decode_streams -= 1
 
 
 def create_dynamo_session() -> aiohttp.ClientSession:
@@ -376,6 +403,7 @@ async def async_request_dynamo_completions(
         output.prompt_len = request_func_input.prompt_len
 
         generated_text = ""
+        profile_decode_stream_active = False
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -409,6 +437,9 @@ async def async_request_dynamo_completions(
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
+                                    profile_decode_stream_active = (
+                                        _profile_decode_stream_started()
+                                    )
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
 
@@ -437,6 +468,8 @@ async def async_request_dynamo_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _profile_decode_stream_finished(profile_decode_stream_active)
 
     if pbar:
         pbar.update(1)
