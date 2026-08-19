@@ -11,6 +11,7 @@ This module provides lifecycle management for srun processes, including:
 """
 
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -183,12 +184,21 @@ class ProcessRegistry:
                     except Exception as e:  # noqa: BLE001
                         logger.warning("Failed to terminate %s: %s", name, e)
 
-    def print_failure_details(self, tail_lines: int = 50) -> None:
+    def print_failure_details(self, tail_lines: int | None = None) -> None:
         """Print detailed failure information including log tails.
 
+        A vLLM engine-core startup failure re-raises through ~40 stack frames, so
+        50 lines is entirely traceback and the line naming the actual cause --
+        which precedes the traceback -- never reaches the CI log. Override with
+        ``SRTCTL_FAILURE_TAIL_LINES`` when a failure is opaque.
+
         Args:
-            tail_lines: Number of lines to show from each failed process log
+            tail_lines: Lines to show from each failed process log. Defaults to
+                ``SRTCTL_FAILURE_TAIL_LINES`` if set, otherwise 50.
         """
+        if tail_lines is None:
+            raw = os.environ.get("SRTCTL_FAILURE_TAIL_LINES", "")
+            tail_lines = int(raw) if raw.strip().isdigit() else 50
         if not self._failed_processes:
             return
 
