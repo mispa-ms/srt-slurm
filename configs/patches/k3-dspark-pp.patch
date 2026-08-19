@@ -271,25 +271,6 @@ index cea735c0e8..12629a317b 100644
  
          # Post-step KV connector related operations.
          kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-index d7487afaaa..5d6b42aef9 100644
---- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-+++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-@@ -303,9 +303,12 @@ class MambaHybridModelState(DefaultModelState):
-                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
-                 )
-         else:
--            # Fill with single value.
-+            # Fill with single value. index_fill_ only accepts int64 indices,
-+            # while idx_mapping is int32. This branch is reached only from the
-+            # non-last PP rank, which passes a dense mapping with no -1
-+            # sentinels, so the cast is safe.
-             self.num_accepted_tokens_gpu.index_fill_(
--                0, idx_mapping, max(num_sampled, 1)
-+                0, idx_mapping.long(), max(num_sampled, 1)
-             )
- 
-         # Align: save the running state to the block-aligned position when
 diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
 index 9b1786cbe4..2bd52f838f 100644
 --- a/vllm/v1/worker/gpu/pp_utils.py
