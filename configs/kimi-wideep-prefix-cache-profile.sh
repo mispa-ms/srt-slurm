@@ -124,6 +124,35 @@ wait_for_full_decode_concurrency() {
 
 mkdir -p /logs/profile-benchmark
 
+# --- Does the prefix cache even fit the working set? -------------------------
+# A two-wave replay is only a decode measurement if wave 2 hits. Wave 1 seeds
+# NUM_PROMPTS x ISL tokens; if the prefill pool is smaller than that they are
+# evicted before the replay and wave 2 silently re-prefills. That is not
+# hypothetical: a prefill TP8/DCP2 arm ran with a 5,982,708-token pool against
+# an 8,388,608-token working set, replayed at a ~22% hit, and its TTFT p90 went
+# 10.2 s -> 46.2 s. Nothing failed; the numbers were just measuring the wrong
+# thing. Cost of finding out the slow way: one four-hour job.
+#
+# The worker prints the pool at startup, so this is answerable before the first
+# request. Advisory unless PROFILE_REQUIRE_KV_FIT=1, because the pool line is a
+# log format we do not own.
+WORKING_SET=$(( NUM_PROMPTS * ISL ))
+KV_POOL=$(grep -ohE "GPU KV cache size: [0-9,]+ tokens" /logs/*prefill*.out /logs/*prefill*.out.log /logs/*agg*.out /logs/*agg*.out.log 2>/dev/null \
+    | head -1 | grep -oE "[0-9,]+" | tr -d ,)
+if [[ -z "${KV_POOL}" ]]; then
+    echo "KV-fit check: could not read 'GPU KV cache size' from /logs; skipping."
+else
+    echo "KV-fit check: pool ${KV_POOL} tokens vs working set ${WORKING_SET} (${NUM_PROMPTS} x ${ISL})"
+    if (( KV_POOL < WORKING_SET )); then
+        echo "KV-fit check: POOL IS SMALLER THAN THE WORKING SET -- wave 2 will miss and this run will measure re-prefill, not decode." >&2
+        if [[ "${PROFILE_REQUIRE_KV_FIT:-0}" == "1" ]]; then
+            echo "KV-fit check: PROFILE_REQUIRE_KV_FIT=1, refusing to run." >&2
+            exit 1
+        fi
+        echo "KV-fit check: continuing anyway (set PROFILE_REQUIRE_KV_FIT=1 to make this fatal)." >&2
+    fi
+fi
+
 echo "Cache fill: ${NUM_PROMPTS} prompts, ISL=${ISL}, OSL=${CACHE_FILL_OSL}, concurrency=${CONCURRENCY}"
 run_phase "${CACHE_FILL_OSL}"
 
