@@ -12,17 +12,41 @@ MODEL_NAME="${PROFILE_MODEL_NAME:-moonshotai/Kimi-K3}"
 TOKENIZER_PATH="${PROFILE_TOKENIZER_PATH:-/model}"
 ENDPOINT="http://${SRT_FRONTEND_HOST}:${SRT_FRONTEND_PORT}"
 BENCHMARK_SCRIPT="/configs/kimi-wideep-benchmark-serving.py"
-REPO_VENV="${PROFILE_REPO_VENV:-/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/weizha/vllm/.venv}"
-PYTHON_BIN="${REPO_VENV}/bin/python"
 
-if [[ ! -x "${PYTHON_BIN}" ]]; then
-    echo "Repository virtualenv is unavailable at ${REPO_VENV}" >&2
-    exit 1
+# Upstream resolved the client interpreter to a personal virtualenv on Lustre.
+# That venv is a live source checkout on another cluster: it changes underneath
+# a run, and it does not exist on ours. Take the container's python and let
+# PROFILE_REPO_VENV opt back in, rather than requiring a path nobody else has.
+REPO_VENV="${PROFILE_REPO_VENV:-}"
+if [[ -n "${REPO_VENV}" ]]; then
+    PYTHON_BIN="${REPO_VENV}/bin/python"
+    if [[ ! -x "${PYTHON_BIN}" ]]; then
+        echo "PROFILE_REPO_VENV set but ${PYTHON_BIN} is not executable" >&2
+        exit 1
+    fi
+    unset VIRTUAL_ENV
+else
+    PYTHON_BIN="${PYTHON_BIN:-python3}"
+    if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+        echo "Error: ${PYTHON_BIN} not found; set PROFILE_REPO_VENV or PYTHON_BIN" >&2
+        exit 127
+    fi
 fi
-unset VIRTUAL_ENV
-if ! "${PYTHON_BIN}" -c 'import transformers'; then
-    echo "Benchmark dependencies are unavailable to ${PYTHON_BIN}" >&2
-    exit 1
+
+# benchmark_serving.py's full dependency set, imported before the run spends
+# minutes building 128K-token prompts. `datasets` is deliberately absent: the
+# wrapper stubs it so a non-random dataset fails loudly instead of importing.
+# Falling back to a venv rather than failing follows sa-bench's own contract for
+# containers that ship only a subset.
+SA_BENCH_VENV="${SA_BENCH_VENV:-/tmp/sa-bench-venv}"
+SA_BENCH_DEPS=(aiohttp numpy pandas Pillow tqdm transformers huggingface_hub)
+if ! "${PYTHON_BIN}" -c "import aiohttp, numpy, pandas, PIL, tqdm, transformers, huggingface_hub" 2>/dev/null; then
+    echo "Missing benchmark dependencies; installing into ${SA_BENCH_VENV} ..."
+    if [[ ! -d "${SA_BENCH_VENV}" ]]; then
+        "${PYTHON_BIN}" -m venv --system-site-packages "${SA_BENCH_VENV}"
+    fi
+    PYTHON_BIN="${SA_BENCH_VENV}/bin/python3"
+    "${PYTHON_BIN}" -m pip install "${SA_BENCH_DEPS[@]}"
 fi
 if [[ "${PROFILE_VALIDATE_CLIENT_ONLY:-0}" == "1" ]]; then
     "${PYTHON_BIN}" "${BENCHMARK_SCRIPT}" --help >/dev/null
