@@ -30,6 +30,8 @@ from srtctl.ports import (
     DYN_SYSTEM_PORT_BASE,
     MOONCAKE_HTTP_METADATA_PORT,
     MOONCAKE_MASTER_PORT,
+    VLLM_MASTER_PORT_BASE,
+    VLLM_MASTER_PORT_SLOTS,
     VLLM_DATA_PARALLEL_RPC_PORT,
     VLLM_PORT_BASE,
     VLLM_PORT_STRIDE,
@@ -582,6 +584,18 @@ class VLLMProtocol:
         config = self.get_config_for_mode(mode)
         return int(config.get("tensor-parallel-size") or config.get("tensor_parallel_size") or 1)
 
+    @staticmethod
+    def _master_port(job_id: str) -> int:
+        """vLLM multi-node rendezvous port, unique per SLURM job.
+
+        vLLM's default is 29500(+1). A stale bind there -- from an earlier job
+        on the same node, ours or anyone's -- fails the run at
+        ``init_process_group`` with EADDRINUSE, which is what took a GB300 arm
+        down. Deriving from the job id means a leftover cannot be inherited.
+        """
+        digits = "".join(c for c in str(job_id) if c.isdigit())
+        return VLLM_MASTER_PORT_BASE + (int(digits or 0) % VLLM_MASTER_PORT_SLOTS)
+
     def _get_pp_size(self, mode: WorkerMode) -> int:
         """Pipeline-parallel degree for a mode, defaulting to 1.
 
@@ -877,10 +891,13 @@ class VLLMProtocol:
             if is_multi_node:
                 # vLLM-native multi-node serve (torchrun-style): the leader owns
                 # the OpenAI server; other node ranks run headless engine workers.
+                master_port = self._master_port(runtime.job_id)
                 cmd.extend(
                     [
                         "--master-addr",
                         leader_ip,
+                        "--master-port",
+                        str(master_port),
                         "--nnodes",
                         str(len(endpoint_nodes)),
                         "--node-rank",
@@ -888,6 +905,7 @@ class VLLMProtocol:
                     ]
                 )
                 srtslurm_owned["master-addr"] = leader_ip
+                srtslurm_owned["master-port"] = str(master_port)
                 srtslurm_owned["nnodes"] = str(len(endpoint_nodes))
                 srtslurm_owned["node-rank"] = str(node_rank)
                 if node_rank > 0:
@@ -1012,6 +1030,8 @@ class VLLMProtocol:
                 [
                     "--master-addr",
                     leader_ip,
+                    "--master-port",
+                    str(self._master_port(runtime.job_id)),
                     "--nnodes",
                     str(len(endpoint_nodes)),
                     "--node-rank",
