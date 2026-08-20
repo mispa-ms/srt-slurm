@@ -1327,10 +1327,10 @@ index d2c073676d..4f551fcccc 100644
  
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
 new file mode 100644
-index 0000000000..1e2f5d4365
+index 0000000000..7e0dd8541c
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,145 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Pure layout planning for member-ordered NIXL transfers."""
@@ -1343,6 +1343,15 @@ index 0000000000..1e2f5d4365
 +)
 +
 +MemberLayout = tuple[int, int]
++
++
++class KVLayoutMismatchError(RuntimeError):
++    """The two engines hold different sets of KV layers.
++
++    Static: the layer sets are fixed at startup, so every subsequent request
++    fails identically. Callers should say so once and stop, rather than
++    retrying per request -- which turns a config error into an hour of silence.
++    """
 +
 +
 +@dataclass(frozen=True)
@@ -1416,9 +1425,12 @@ index 0000000000..1e2f5d4365
 +        for layer_name in local_members:
 +            remote_region = remote_region_of.get(layer_name)
 +            if remote_region is None:
-+                raise RuntimeError(
++                raise KVLayoutMismatchError(
 +                    "Remote NIXL metadata is missing locally owned KV cache "
-+                    f"layer {layer_name!r}; the transfer would leave it stale"
++                    f"layer {layer_name!r}; the transfer would leave it stale. "
++                    "The two engines were built with different KV layer sets -- "
++                    "most often a speculative-config set on one side only, whose "
++                    "draft model registers KV this peer never advertises."
 +                )
 +            group_id = layer_to_group.get(layer_name)
 +            if group_id is None:
@@ -1547,10 +1559,20 @@ index 6efe491be8..ad9f80ca1c 100644
              "remote_engine_id": params["remote_engine_id"],
              "remote_host": params["remote_host"],
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
-index 0721bf9d1d..3c252eaa2c 100644
+index 0721bf9d1d..ac7c4e1913 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
-@@ -79,6 +79,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -44,6 +44,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+     NixlBaseConnectorWorker,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
++    KVLayoutMismatchError,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+     PUSH_REG_NOTIF_PREFIX,
+     NixlConnectorMetadata,
+@@ -79,6 +82,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
  
      # Distinguishes push from pull in the NIXL compatibility hash.
      _TRANSFER_MODE: str = "push"
@@ -1558,7 +1580,15 @@ index 0721bf9d1d..3c252eaa2c 100644
  
      def __init__(
          self,
-@@ -433,6 +434,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -91,6 +95,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+         # Heartbeat handshakes to a PP-sharded producer must be notif-only,
+         # like the PUSH_REG path.
+         self._hb_handshake_notif_only = True
++        self._layout_mismatch_reported = False
+ 
+         # Push-specific state.
+         # P-side: outgoing WRITE handles awaiting completion, keyed by
+@@ -433,6 +438,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              registration_data["decode_host"],
              registration_data["decode_port"],
              registration_data["decode_tp_size"],
@@ -1566,7 +1596,15 @@ index 0721bf9d1d..3c252eaa2c 100644
          )
          if fut is not None:
  
-@@ -467,6 +469,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -447,6 +453,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+                     self._log_failure(
+                         failure_type="push_handshake_failed", req_id=rid, error=e
+                     )
++                    self._report_layout_mismatch(e)
+                     return
+                 self._deferred_push_inbox.put((rid, blocks, rd))
+                 self._push_writer_wake.set()
+@@ -467,6 +474,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              local_block_ids=logical_local,
              local_physical_block_ids=physical_local,
              tp_size=self.world_size,
@@ -1574,7 +1612,36 @@ index 0721bf9d1d..3c252eaa2c 100644
              remote=RemoteMeta(
                  block_ids=logical_remote,
                  host="",
-@@ -505,6 +508,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -498,6 +506,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             return (list(block_ids),)
+         return block_ids
+ 
++    def _report_layout_mismatch(self, error: BaseException) -> None:
++        """Say once, loudly, that the peers' KV layer sets do not match.
++
++        A layout mismatch is fixed at startup, so the per-request warning the
++        generic failure path emits repeats for every request while the run
++        makes no progress -- 512 times, in the arm that prompted this, before an
++        idle reaper killed the job an hour later with nothing in the CI log to
++        say why. This does not abort the engine; it makes the cause findable in
++        the first screen of the worker log.
++        """
++        cause: BaseException | None = error
++        while cause is not None and not isinstance(cause, KVLayoutMismatchError):
++            cause = cause.__cause__ or cause.__context__
++        if cause is None or self._layout_mismatch_reported:
++            return
++        self._layout_mismatch_reported = True
++        logger.error(
++            "NIXL KV layout mismatch with the peer; every transfer will fail "
++            "the same way and the engine will not recover: %s",
++            cause,
++        )
++
+     def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
+         """Issue WRITE transfers to one or more remote TP ranks."""
+         assert meta.remote is not None and self.transfer_topo is not None
+@@ -505,6 +535,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
          plan = self.tp_mappings[engine_id]
          remote_info = self.transfer_topo.get_engine_info(engine_id)
          tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
@@ -1588,7 +1655,7 @@ index 0721bf9d1d..3c252eaa2c 100644
  
          # Expand D's logical IDs using the ratio learned during the
          # NIXL handshake. ``meta`` is freshly built by
-@@ -526,9 +536,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -526,9 +563,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
          replicate_attn = self.use_mla and tp_ratio < 0
          if replicate_attn and not self._has_mamba:
              assert len(plan.all_source_ranks) == 1
@@ -1610,7 +1677,7 @@ index 0721bf9d1d..3c252eaa2c 100644
  
          def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
              return [
-@@ -541,15 +561,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -541,15 +588,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
  
          read_specs = [
              ReadSpec(
@@ -1635,7 +1702,7 @@ index 0721bf9d1d..3c252eaa2c 100644
              remote_block_size = remote_info.remote_block_size
              logger.debug(
                  "Remote agent %s available, calling _xfer_blocks"
-@@ -559,19 +583,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -559,19 +610,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                  remote_block_size,
                  req_id,
              )
@@ -1662,7 +1729,7 @@ index 0721bf9d1d..3c252eaa2c 100644
              ]
  
              handle = self._xfer_blocks(
-@@ -581,6 +609,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -581,6 +636,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                  remote_request_id=meta.remote.request_id,
                  local_xfer_side_handle=local_xfer_side_handle,
                  remote_xfer_side_handle=remote_xfer_side_handle,
@@ -1670,7 +1737,7 @@ index 0721bf9d1d..3c252eaa2c 100644
              )
              if handle is not None:
                  handles.append(handle)
-@@ -600,6 +629,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -600,6 +656,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
          remote_request_id: str,
          local_xfer_side_handle: int,
          remote_xfer_side_handle: int,
@@ -1678,7 +1745,7 @@ index 0721bf9d1d..3c252eaa2c 100644
      ) -> int | None:
          """Post a WRITE point-to-point xfer request.
  
-@@ -657,12 +687,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -657,12 +714,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              dst_num_blocks=self.dst_num_blocks[dst_engine_id],
              block_size_ratio=None,
              physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
@@ -1693,7 +1760,7 @@ index 0721bf9d1d..3c252eaa2c 100644
          )
  
          assert len(local_block_descs_ids) == len(remote_block_descs_ids)
-@@ -726,11 +758,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -726,11 +785,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              # Not tracked as a P-side send/process for this notif.
              if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
                  if (meta := self._recving_metadata.get(req_id)) is not None:
