@@ -24,12 +24,26 @@ for f in sorted(cfgdir.glob("*.yml")):
     r, b = d["resources"], d["backend"]
     agg = b["vllm_config"]["aggregated"]
     nodes = tuple(f"n{i}" for i in range(r["agg_nodes"]))
-    ep = Endpoint(mode="aggregated", index=0, nodes=nodes,
+    ep = Endpoint(mode="agg", index=0, nodes=nodes,
                   gpu_indices=frozenset(range(r["gpus_per_node"])),
                   gpus_per_node=r["gpus_per_node"])
     backend = VLLMProtocol(dp_launch_mode=b.get("dp_launch_mode", "per_gpu"),
                            vllm_config=VLLMServerConfig(aggregated=dict(agg)))
-    tp, dp = agg["tensor-parallel-size"], agg["data-parallel-size"]
+    # The mode key is "agg"; with "aggregated" get_config_for_mode returns {} and
+    # every topology passes vacuously -- which is how a TP8xPP2 arm that srtctl
+    # cannot lay out was cleared before submit. Fail loudly rather than silently.
+    if not backend.get_config_for_mode("agg"):
+        ok = False
+        print(f"FAIL {f.stem}\n      backend config did not load for mode 'agg'")
+        continue
+    tp = agg["tensor-parallel-size"]
+    pp = agg.get("pipeline-parallel-size", 1)
+    dp = agg.get("data-parallel-size", 1)
+    world = tp * pp * dp
+    if world != r["gpus_per_agg"]:
+        ok = False
+        print(f"FAIL {f.stem}\n      TP{tp} x PP{pp} x DP{dp} = {world} != gpus_per_agg {r['gpus_per_agg']}")
+        continue
     try:
         procs = backend.endpoints_to_processes([ep])
     except Exception as exc:
@@ -38,7 +52,7 @@ for f in sorted(cfgdir.glob("*.yml")):
         continue
     gpus_each = sorted(len(p.gpu_indices) for p in procs)
     print(f"PASS {f.stem}")
-    print(f"      TP{tp} x DP{dp} = EP{tp*dp} over {r['agg_nodes']} nodes / {r['gpus_per_agg']} GPUs"
+    print(f"      TP{tp} x PP{pp} x DP{dp} = {world} over {r['agg_nodes']} nodes / {r['gpus_per_agg']} GPUs"
           f" -> {len(procs)} process(es), GPUs each {gpus_each}, node_ranks {[p.node_rank for p in procs]}")
     if len(procs) != r["agg_nodes"]:
         ok = False
