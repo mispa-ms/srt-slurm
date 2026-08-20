@@ -169,20 +169,20 @@ async def _run_wave(
         tasks = []
         start = time.perf_counter()
         for index, (prompt, prompt_len, _, _) in enumerate(prompts):
-            # Two independent ways to land wave 2 on the rank wave 1 warmed, because
-            # the whole measurement is worthless if it misses. X-data-parallel-rank
-            # is what this client already sent; it is not enough on its own -- an
-            # EP16 arm replayed at a 7.3% prefix hit with 6.5x the pool it needed,
-            # which is a placement miss, not an eviction. X-Session-ID is stable per
-            # prompt index across both waves, so a session-affinity router sends the
-            # replay back where the seed went. This is the same thing AIPerf does
-            # for the agentic runs via
-            # AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID; there is no AIPerf
-            # here, so set it directly. Pair with a router that honours one of them
-            # (router-mode: kv, or router-session-affinity-ttl-secs).
-            headers = {"X-Session-ID": f"prefix-replay-{index}"}
-            if dp_size > 1:
-                headers["X-data-parallel-rank"] = str(index % dp_size)
+            # Placement is the whole measurement: wave 2 has to land on the rank
+            # wave 1 warmed or the replay re-prefills. X-data-parallel-rank alone
+            # does not achieve it -- an EP16 arm replayed at a 7.3% prefix hit with
+            # 6.5x the pool it needed, so a placement miss, not an eviction. The
+            # router has to do it: router-mode: kv with router-kv-events, which is
+            # what the reference K3 DEP16 recipe uses.
+            #
+            # NOT X-Session-ID. It looks like the obvious session-affinity header
+            # and it is not ours: dynamo binds it to the opencode agent harness
+            # (lib/llm/src/protocols/agents.rs, HEADER_OPENCODE_SESSION_ID =
+            # "x-session-id"; dynamo's own is "x-dynamo-session-id"). Sending it
+            # made the frontend parse plain /v1/completions calls as agent requests
+            # and answer 400 to all of them -- three arms, every seed request.
+            headers = {"X-data-parallel-rank": str(index % dp_size)} if dp_size > 1 else None
             request = RequestFuncInput(
                 prompt=prompt,
                 api_url=api_url,
