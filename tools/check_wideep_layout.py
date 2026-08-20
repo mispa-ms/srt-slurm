@@ -11,6 +11,7 @@ import sys, yaml, pathlib
 sys.path.insert(0, "src")
 from srtctl.backends import VLLMProtocol
 from srtctl.backends.vllm import VLLMServerConfig
+from srtctl.core.schema import SrtConfig
 from srtctl.core.topology import Endpoint
 
 cfgdir = pathlib.Path(
@@ -21,7 +22,28 @@ cfgdir = pathlib.Path(
 ok = True
 for f in sorted(cfgdir.glob("*.yml")):
     d = yaml.safe_load(f.read_text())
+
+    # srtctl's own validation, run here rather than discovered at submit time.
+    # It rejects real mistakes the schema alone does not -- a mooncake_kv_store
+    # block with no Mooncake connector left in kv-transfer-config, for one,
+    # which cost a disagg PP arm before this was added.
+    try:
+        SrtConfig.Schema().load({k: v for k, v in d.items() if k != "aib_metadata"})
+    except Exception as exc:
+        ok = False
+        print(f"FAIL {f.stem}\n      srtctl rejected the config: "
+              f"{type(exc).__name__}: {str(exc)[:200]}")
+        continue
+
     r, b = d["resources"], d["backend"]
+    # The layout simulation below is aggregated-only: it builds one endpoint.
+    # Disaggregated configs still get srtctl's validation above, which is what
+    # catches the config-level mistakes, so report and move on rather than
+    # crashing on the first one and checking nothing after it.
+    if "aggregated" not in b.get("vllm_config", {}):
+        print(f"PASS {f.stem}\n      srtctl validation only (disaggregated; "
+              f"layout simulation is aggregated-only)")
+        continue
     agg = b["vllm_config"]["aggregated"]
     nodes = tuple(f"n{i}" for i in range(r["agg_nodes"]))
     ep = Endpoint(mode="agg", index=0, nodes=nodes,
