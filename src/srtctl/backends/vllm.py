@@ -962,7 +962,14 @@ class VLLMProtocol:
             cmd.extend(
                 [
                     "--data-parallel-size-local",
-                    str(len(process.gpu_indices) // self._get_tp_size(mode)),
+                    # A rank owns tp_size * pp_size GPUs. Dividing by tp_size
+                    # alone tells vLLM a local DP size pp_size times larger than
+                    # the one the process layout built, and larger than the
+                    # kv_events port block reserved for it.
+                    str(
+                        len(process.gpu_indices)
+                        // (self._get_tp_size(mode) * self._get_pp_size(mode))
+                    ),
                     "--data-parallel-start-rank",
                     str(process.node_rank),
                     "--data-parallel-address",

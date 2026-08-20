@@ -11,7 +11,7 @@ This module provides lifecycle management for srun processes, including:
 """
 
 import logging
-import os
+import re
 import signal
 import subprocess
 import sys
@@ -184,21 +184,51 @@ class ProcessRegistry:
                     except Exception as e:  # noqa: BLE001
                         logger.warning("Failed to terminate %s: %s", name, e)
 
+    #: Lines of a dead worker's log to quote. A vLLM engine-core startup failure
+    #: re-raises through ~40 stack frames, so the old default of 50 was entirely
+    #: traceback and the line naming the cause -- which *precedes* the traceback --
+    #: never reached the CI log. It hid four separate failures on the GB300
+    #: wide-EP arms before anyone read the number.
+    #:
+    #: This is a constant rather than an env var on purpose: the reader is the
+    #: orchestrator process, and neither `environment:` nor `*_environment:` in a
+    #: recipe reaches it -- both are rendered into the workers' srun. There was no
+    #: way to raise it from a config, which is how the first fix silently did
+    #: nothing.
+    DEFAULT_FAILURE_TAIL_LINES = 200
+
+    #: Lines matching this, and not looking like a traceback frame, are the
+    #: candidates for "See root cause above".
+    _CAUSE_RE = re.compile(
+        r"(Error|Exception|Traceback|Assertion|assert |FATAL|CRITICAL|"
+        r"NotImplemented|Unsupported|not supported|refus|Killed|out of memory|OOM)",
+        re.IGNORECASE,
+    )
+    _FRAME_RE = re.compile(r'^\s*(File "|\^+\s*$|\w+\(.*\)\s*$)')
+
+    @classmethod
+    def _likely_causes(cls, lines: list[str], limit: int = 12) -> list[str]:
+        """Lines that look like a stated cause rather than a stack frame."""
+        out = [
+            ln
+            for ln in lines
+            if cls._CAUSE_RE.search(ln) and not cls._FRAME_RE.match(ln)
+        ]
+        return out[-limit:]
+
     def print_failure_details(self, tail_lines: int | None = None) -> None:
         """Print detailed failure information including log tails.
 
-        A vLLM engine-core startup failure re-raises through ~40 stack frames, so
-        50 lines is entirely traceback and the line naming the actual cause --
-        which precedes the traceback -- never reaches the CI log. Override with
-        ``SRTCTL_FAILURE_TAIL_LINES`` when a failure is opaque.
+        Prints two things per dead process: the lines that look like a stated
+        cause, and then the tail. The cause extract exists because vLLM's own
+        message says "See root cause above" and the tail alone routinely does not
+        reach far enough above.
 
         Args:
-            tail_lines: Lines to show from each failed process log. Defaults to
-                ``SRTCTL_FAILURE_TAIL_LINES`` if set, otherwise 50.
+            tail_lines: Lines to show from each failed process log.
         """
         if tail_lines is None:
-            raw = os.environ.get("SRTCTL_FAILURE_TAIL_LINES", "")
-            tail_lines = int(raw) if raw.strip().isdigit() else 50
+            tail_lines = self.DEFAULT_FAILURE_TAIL_LINES
         if not self._failed_processes:
             return
 
@@ -222,6 +252,11 @@ class ProcessRegistry:
                     try:
                         lines = proc.log_file.read_text().splitlines()
                         if lines:
+                            causes = self._likely_causes(lines)
+                            if causes:
+                                logger.error("\nLikely cause(s), newest last:")
+                                for line in causes:
+                                    logger.error("  %s", line)
                             logger.error("\nLast %d lines of log:", tail_lines)
                             for line in lines[-tail_lines:]:
                                 logger.error("  %s", line)

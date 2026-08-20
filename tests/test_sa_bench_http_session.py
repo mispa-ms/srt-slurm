@@ -138,6 +138,27 @@ def test_dynamo_requests_reuse_injected_session_without_closing_it():
     assert [output.output_tokens for output in outputs] == [2, 2]
 
 
+def test_decode_active_marker_requires_simultaneous_target_streams(
+    monkeypatch, tmp_path
+):
+    module = _import_sa_bench_module("backend_request_func")
+    marker = tmp_path / "all-active"
+    monkeypatch.setenv("SRT_BENCH_DECODE_ACTIVE_MARKER", str(marker))
+    monkeypatch.setenv("SRT_BENCH_DECODE_ACTIVE_TARGET", "2")
+
+    first = module._profile_decode_stream_started()
+    assert not marker.exists()
+    module._profile_decode_stream_finished(first)
+
+    first = module._profile_decode_stream_started()
+    second = module._profile_decode_stream_started()
+    assert marker.exists()
+
+    module._profile_decode_stream_finished(first)
+    module._profile_decode_stream_finished(second)
+    assert module._active_profile_decode_streams == 0
+
+
 def test_dynamo_requests_use_owned_per_request_sessions_by_default(monkeypatch):
     module = _import_sa_bench_module("backend_request_func")
     sessions: list[FakeSession] = []
@@ -495,6 +516,7 @@ def test_result_json_records_effective_http_connection_mode(monkeypatch, tmp_pat
         request_rate=float("inf"),
         burstiness=1.0,
         disable_tqdm=True,
+        skip_initial_test=False,
         profile=False,
         percentile_metrics="ttft,tpot,itl,e2el",
         metric_percentiles="50,90,99",

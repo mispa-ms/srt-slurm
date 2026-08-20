@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# vllm#50359 -- revalidate exact partial-hash hit boundaries. The fix, not a
+# diagnostic.
+# =============================================================================
+# WHAT IT IS. Upstream's answer to our -704, stated in its own words:
+#
+#   "A longer stored key proves that one object exists at that endpoint; it
+#    does not imply that Mooncake also contains independently addressable
+#    objects at every shorter hash boundary."
+#
+# Core's fine-grained lookup deliberately extends a hit into the first non-full
+# block -- locally a block is usable as a prefix, remotely an object is not --
+# and the EAGLE path then subtracts exactly one hash unit, landing mid-block by
+# construction. Off DCP the gap is empty because the attention block equals
+# hash_block_size. Scaling it by dcp opens a 1536/128 x 8 = 96-unit interior,
+# and every hit landing there names a key nobody wrote.
+#
+# WHY IT IS NOT IN THE IMAGE. nightly 3d204dfda is 2026-08-13; the carry
+# (665b7129ab) and its two guards (090492be16) are 08-10 but on a lineage the
+# image never took. Six related commits are missing; these two are the ones
+# that address this defect, and they touch coordinator.py only.
+#
+# SCOPE. Deliberately minimal. 29961d6bca (DCP + hybrid) is excluded because
+# the wzhao patch already provides its effect and it touches different files;
+# 0d93dac100 and dc9ae4b8ac reach into the scheduler and managers and would
+# blur the A/B; 017e9f4448 is unnecessary -- the promoted argument still reads
+# VLLM_PREFIX_CACHE_RETENTION_INTERVAL through get_from_deprecated_env_if_set
+# and defaults to 0, which is what we set.
+#
+# VERIFIED, and not only textually. The patch applies onto 3d204dfda with the
+# wzhao patch on top (3 hunks, one at offset 25 -- expected, since the image
+# carries wzhao rather than 29961d6bca). Applying it to a tree and running the
+# commits' own tests gives 41 passed, including
+# test_reported_hit_is_an_object_boundary_for_every_group_under_dcp over
+# dcp in {1,2,4,8} -- our case is DCP8 with multiple groups, so that test is
+# the one that matters. An offset hunk that compiles is not the same as one
+# that means the same thing; the tests are what close that gap.
+#
+# READING THE RESULT. load_get_failed_keys at c64 is 38,102 on the baseline.
+# Zero means #50359 completes it. A few hundred residual means boundaries with
+# nothing to step back to, and 0d93dac100 (Mamba/Eagle alignment) is next.
+# Thousands means a second mechanism. Do not read "not zero" as "failed".
+# =============================================================================
+set -euo pipefail
+
+readonly SITE_PACKAGES="${VLLM_SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
+readonly VLLM_ROOT="${SITE_PACKAGES}/vllm"
+readonly VERSION_FILE="${VLLM_ROOT}/_version.py"
+readonly PATCH_FILE="${VLLM_PR50359_PATCH_FILE:-/configs/patches/vllm-mooncake-pr50359.patch}"
+readonly MARKER_FILE="${VLLM_ROOT}/.mooncake_pr50359"
+
+if [[ -f "${MARKER_FILE}" ]]; then
+  echo "[pr50359] already applied."
+  exit 0
+fi
+
+if [[ ! -r "${PATCH_FILE}" ]]; then
+  echo "[pr50359] FATAL: missing patch ${PATCH_FILE}" >&2
+  exit 1
+fi
+
+# Accept either nightly. The patch touches only mooncake/store/coordinator.py,
+# and that file is byte-identical between the two (17,102 bytes in both trees) --
+# the 132 commits between them changed connector.py, data.py, scheduler.py and
+# worker.py, and left coordinator.py alone. Pinning to aug13 alone stopped being
+# tenable when Docker Hub deleted the aug13 tag: `nightly-3d204dfda...` now 404s
+# and every arm on it fails at "NATS failed to start", before any of our code.
+readonly ACCEPTED_NIGHTLIES="g3d204dfda g311b3513a"
+if [[ ! -r "${VERSION_FILE}" ]]; then
+  echo "[pr50359] FATAL: no ${VERSION_FILE}" >&2
+  exit 1
+fi
+_matched=""
+for _v in ${ACCEPTED_NIGHTLIES}; do
+  if grep -q "${_v}" "${VERSION_FILE}"; then _matched="${_v}"; break; fi
+done
+if [[ -z "${_matched}" ]]; then
+  echo "[pr50359] FATAL: expected one of [${ACCEPTED_NIGHTLIES}], got:" >&2
+  cat "${VERSION_FILE}" >&2 || true
+  exit 1
+fi
+echo "[pr50359] nightly ${_matched}"
+
+if patch --batch --forward --dry-run -d "${SITE_PACKAGES}" -p1 < "${PATCH_FILE}" >/dev/null; then
+  patch --batch --forward -d "${SITE_PACKAGES}" -p1 < "${PATCH_FILE}"
+elif patch --batch --reverse --dry-run -d "${SITE_PACKAGES}" -p1 < "${PATCH_FILE}" >/dev/null; then
+  echo "[pr50359] content already present."
+else
+  echo "[pr50359] FATAL: patch neither applies nor is already applied." >&2
+  exit 1
+fi
+
+python3 -m compileall -q \
+  "${VLLM_ROOT}/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py"
+
+# tracks_existence is set in __init__, so it is an INSTANCE attribute -- an
+# earlier version of this check asked hasattr() of the class, which is always
+# False and failed three arms at startup. Probe an instance, and assert the
+# value too: the recv-side pool must report False or the retry would shorten a
+# hit the lookup already validated.
+python3 - <<'PY'
+import sys
+
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import coordinator as c
+
+failures = []
+try:
+    recv_pool = c.ExternalCachedBlockPool(16)
+    lookup_pool = c.ExternalCachedBlockPool(16, set())
+    if recv_pool.tracks_existence is not False:
+        failures.append("tracks_existence is not False on the recv-side pool")
+    if lookup_pool.tracks_existence is not True:
+        failures.append("tracks_existence is not True when an exists set is given")
+except AttributeError as e:
+    failures.append(f"tracks_existence absent ({e})")
+for name in ("cache_hit_alignment_tokens", "_exact_partial_hit_key_exists"):
+    if not hasattr(c.MooncakeStoreCoordinator, name):
+        failures.append(f"{name} absent")
+if failures:
+    print("[pr50359] VERIFY FAILED: " + "; ".join(failures))
+    sys.exit(1)
+print("[pr50359] applied; exact-boundary revalidation active")
+PY
+
+touch "${MARKER_FILE}"

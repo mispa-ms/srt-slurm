@@ -70,26 +70,47 @@ profiling__start_profile_on_worker() {
 
     echo "Starting profiling on http://${hostport} (steps ${start_step}-${stop_step})"
     if [[ -z "${SRTCTL_FRONTEND_TYPE}" ]]; then
-        echo "Error: SRTCTL_FRONTEND_TYPE is not set (expected 'dynamo', 'vllm', or 'sglang')" >&2
+        echo "Error: SRTCTL_FRONTEND_TYPE is not set (expected 'dynamo', 'sglang', or 'vllm')" >&2
         return 1
     fi
 
-    local start_path=""
+    local -a start_paths=()
     case "${SRTCTL_FRONTEND_TYPE}" in
-        dynamo) start_path="/engine/control/start_profile" ;;
-        vllm) start_path="/start_profile" ;;
-        sglang) start_path="/start_profile" ;;
+        # The worker's system status server routes "/engine/{*path}" and looks
+        # the captured path up verbatim in the engine-route registry
+        # (system_status_server.rs). Dynamo now registers the profiling control
+        # under "control/start_profile", so the URL is the concatenation of the
+        # two -- "/engine/" plus "control/start_profile". Older builds
+        # registered a bare "start_profile"; try the current name first and fall
+        # back so this works on either.
+        #
+        # Both halves are easy to get wrong on their own: /engine/start_profile
+        # misses the control/ segment, /control/start_profile misses the mount
+        # point and hits the axum fallback. Either way the worker logs
+        # "[fallback handler] called" and returns 404.
+        dynamo) start_paths=("/engine/control/start_profile" "/engine/start_profile") ;;
+        sglang|vllm) start_paths=("/start_profile") ;;
         *)
-            echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'vllm', or 'sglang')" >&2
+            echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'sglang', or 'vllm')" >&2
             return 1
             ;;
     esac
 
-    if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
-        return 0
-    fi
-    echo "Warning: failed to start profiling on ${hostport}"
-    return 0
+    local start_path
+    for start_path in "${start_paths[@]}"; do
+        if curl -sS -f -X POST "http://${hostport}${start_path}" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
+            echo "Armed profiling on ${hostport}${start_path}"
+            return 0
+        fi
+        echo "Note: POST ${start_path} to ${hostport} did not succeed, trying next route"
+    done
+
+    # Do not swallow this. Returning 0 here means the sweep runs to completion,
+    # reports success, and writes no trace at all: nsys is launched with
+    # -c cudaProfilerApi and waits for a cudaProfilerStart() that only fires
+    # once vLLM's CudaProfilerWrapper has been armed by this POST.
+    echo "Error: failed to start profiling on ${hostport} (tried: ${start_paths[*]})" >&2
+    return 1
 }
 
 profiling__stop_profile_on_worker() {
@@ -104,22 +125,31 @@ profiling__stop_profile_on_worker() {
 
     echo "Stopping profiling on http://${hostport}"
     if [[ -z "${SRTCTL_FRONTEND_TYPE}" ]]; then
-        echo "Error: SRTCTL_FRONTEND_TYPE is not set (expected 'dynamo', 'vllm', or 'sglang')" >&2
+        echo "Error: SRTCTL_FRONTEND_TYPE is not set (expected 'dynamo', 'sglang', or 'vllm')" >&2
         return 1
     fi
 
-    local stop_path=""
+    local -a stop_paths=()
     case "${SRTCTL_FRONTEND_TYPE}" in
-        dynamo) stop_path="/engine/control/stop_profile" ;;
-        vllm) stop_path="/stop_profile" ;;
-        sglang) stop_path="/stop_profile" ;;
+        # Same mount-point-plus-route-name split as the start side above.
+        dynamo) stop_paths=("/engine/control/stop_profile" "/engine/stop_profile") ;;
+        sglang|vllm) stop_paths=("/stop_profile") ;;
         *)
-            echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'vllm', or 'sglang')" >&2
+            echo "Error: unsupported SRTCTL_FRONTEND_TYPE='${SRTCTL_FRONTEND_TYPE}' (expected 'dynamo', 'sglang', or 'vllm')" >&2
             return 1
             ;;
     esac
 
-    curl -sS -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null || true
+    # Best-effort by design: nsys is launched with --capture-range-end stop, so
+    # a missed stop costs a truncated trace, not a lost run. Still say so --
+    # a silent miss here looks exactly like a clean shutdown.
+    local stop_path
+    for stop_path in "${stop_paths[@]}"; do
+        if curl -sS -f -X POST "http://${hostport}${stop_path}" -H "Content-Type: application/json" -d '{}' >/dev/null; then
+            return 0
+        fi
+    done
+    echo "Warning: failed to stop profiling on ${hostport} (tried: ${stop_paths[*]})" >&2
     return 0
 }
 
@@ -207,15 +237,26 @@ start_all_profiling() {
     IFS=',' read -r -a agg_endpoints <<< "${PROFILE_AGG_ENDPOINTS}"
 
     local ep
+    local failed=0
     for ep in "${prefill_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_PREFILL_START_STEP}" "${PROFILE_PREFILL_STOP_STEP}" "${prefill_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_PREFILL_START_STEP}" "${PROFILE_PREFILL_STOP_STEP}" "${prefill_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
     for ep in "${decode_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_DECODE_START_STEP}" "${PROFILE_DECODE_STOP_STEP}" "${decode_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_DECODE_START_STEP}" "${PROFILE_DECODE_STOP_STEP}" "${decode_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
     for ep in "${agg_endpoints[@]}"; do
-        profiling__start_profile_on_worker "${ep}" "${PROFILE_AGG_START_STEP}" "${PROFILE_AGG_STOP_STEP}" "${agg_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}"
+        profiling__start_profile_on_worker "${ep}" "${PROFILE_AGG_START_STEP}" "${PROFILE_AGG_STOP_STEP}" "${agg_output_dir}" "${PROFILE_TYPE}" "${WORKER_PORT}" || failed=$((failed + 1))
     done
+
+    # Propagate. Without this the per-worker return value is discarded and the
+    # caller cannot tell an armed run from an unarmed one, which is the whole
+    # failure mode: the benchmark runs to completion and writes no trace. A
+    # partial arm is a failure too -- in disaggregated mode a capture that is
+    # missing one phase is not worth the GPU hours to collect it.
+    if [[ "${failed}" -gt 0 ]]; then
+        echo "Error: failed to start profiling on ${failed} worker(s)" >&2
+        return 1
+    fi
 
     profiling__started=1
     echo ""
@@ -256,3 +297,4 @@ stop_all_profiling() {
     echo ""
     return 0
 }
+
