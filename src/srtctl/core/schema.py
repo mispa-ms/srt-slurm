@@ -1307,7 +1307,23 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         f"rm -rf /tmp/dynamo-src && mkdir -p /tmp/dynamo-src && "
         f"tar -xzf {cache}/dynamo-src.tar.gz -C /tmp/dynamo-src && "
         f"pip install --break-system-packages -e /tmp/dynamo-src/dynamo && "
-        f"echo 'Dynamo installed from source ({dynamo_hash})'"
+        f"echo 'Dynamo installed from source ({dynamo_hash})'" + _dynamo_post_install()
+    )
+
+
+# Runtime patches that must land *after* dynamo is installed, not before.
+# `setup_script` runs ahead of the install, so anything that edits the dynamo
+# source tree cannot go there -- /tmp/dynamo-src does not exist yet. This hook
+# is the seam for that. Optional: absent file is a no-op.
+DYNAMO_POST_INSTALL_HOOK = "/configs/patches/dynamo-post-install.sh"
+
+
+def _dynamo_post_install() -> str:
+    """Bash tail that runs the post-install hook when the recipe ships one."""
+    return (
+        f" && if [ -f {DYNAMO_POST_INSTALL_HOOK} ]; then "
+        f"echo '--- dynamo post-install hook ---' && "
+        f"bash {DYNAMO_POST_INSTALL_HOOK}; fi"
     )
 
 
@@ -1335,7 +1351,7 @@ def _live_source_install_for_top_of_tree() -> str:
         "cd /sgl-workspace/dynamo/ && "
         "pip install -e . && "
         "cd /sgl-workspace/sglang/ && "
-        "echo 'Dynamo installed from source (HEAD)'"
+        "echo 'Dynamo installed from source (HEAD)'" + _dynamo_post_install()
     )
 
     portable = (
@@ -1356,7 +1372,7 @@ def _live_source_install_for_top_of_tree() -> str:
         "cd /tmp/dynamo_build/dynamo/ && "
         "pip install --break-system-packages -e . && "
         "cd $ORIG_DIR && "
-        "echo 'Dynamo installed from source (HEAD)'"
+        "echo 'Dynamo installed from source (HEAD)'" + _dynamo_post_install()
     )
 
     return (
