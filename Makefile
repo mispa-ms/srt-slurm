@@ -105,8 +105,24 @@ setup:
 		echo "⬇️  Downloading uv for $(ARCH)..."; \
 		mkdir -p bin; \
 		UV_URL="https://github.com/astral-sh/uv/releases/latest/download/uv-$(ARCH)-unknown-linux-gnu.tar.gz"; \
-		curl -LsSf "$$UV_URL" | tar -xz --strip-components=1 -C bin; \
+		UV_TAR="bin/.uv-download.tar.gz"; \
+		uv_ok=0; \
+		for attempt in 1 2 3; do \
+			rm -f "$$UV_TAR"; \
+			if curl -LsSf --retry 3 --retry-connrefused --retry-delay 2 -o "$$UV_TAR" "$$UV_URL" && tar -tzf "$$UV_TAR" >/dev/null 2>&1; then uv_ok=1; break; fi; \
+			echo "   attempt $$attempt failed (download or archive truncated); retrying"; \
+			sleep 5; \
+		done; \
+		if [ "$$uv_ok" != "1" ]; then \
+			echo "❌ could not fetch a complete uv archive from $$UV_URL" >&2; \
+			rm -f "$$UV_TAR"; exit 1; \
+		fi; \
+		tar -xzf "$$UV_TAR" --strip-components=1 -C bin || { echo "❌ uv archive did not extract" >&2; rm -f "$$UV_TAR"; exit 1; }; \
+		rm -f "$$UV_TAR"; \
 		chmod +x bin/uv bin/uvx 2>/dev/null; \
+		if [ ! -s bin/uv ] || ! file bin/uv | grep -q "$$ARCH_FILE_PATTERN"; then \
+			echo "❌ bin/uv is missing or not $(ARCH): $$(file bin/uv 2>&1)" >&2; exit 1; \
+		fi; \
 		echo "✅ uv installed to bin/uv ($$(file bin/uv | grep -o 'ARM aarch64\|x86-64'))"; \
 	fi; \
 	echo ""; \
