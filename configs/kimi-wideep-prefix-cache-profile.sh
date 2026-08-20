@@ -137,8 +137,20 @@ mkdir -p /logs/profile-benchmark
 # request. Advisory unless PROFILE_REQUIRE_KV_FIT=1, because the pool line is a
 # log format we do not own.
 WORKING_SET=$(( NUM_PROMPTS * ISL ))
-KV_POOL=$(grep -ohE "GPU KV cache size: [0-9,]+ tokens" /logs/*prefill*.out /logs/*prefill*.out.log /logs/*agg*.out /logs/*agg*.out.log 2>/dev/null \
-    | head -1 | grep -oE "[0-9,]+" | tr -d ,)
+# Only pass files that exist. A glob with no match stays literal, grep exits 2
+# because it cannot open it, and under `set -euo pipefail` that kills the run --
+# which is what this check did to the first disagg PP arm, silently, because the
+# 2>/dev/null that was meant to quiet "no such file" also hid the cause. An
+# advisory check must not be able to fail the job it is advising.
+_kv_logs=()
+for _pat in /logs/*prefill*.out /logs/*prefill*.out.log /logs/*agg*.out /logs/*agg*.out.log; do
+    [[ -f "${_pat}" ]] && _kv_logs+=("${_pat}")
+done
+KV_POOL=""
+if (( ${#_kv_logs[@]} > 0 )); then
+    KV_POOL=$(grep -ohE "GPU KV cache size: [0-9,]+ tokens" "${_kv_logs[@]}" 2>/dev/null \
+        | head -1 | grep -oE "[0-9,]+" | tr -d , || true)
+fi
 if [[ -z "${KV_POOL}" ]]; then
     echo "KV-fit check: could not read 'GPU KV cache size' from /logs; skipping."
 else
