@@ -1,0 +1,167 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 762e5eba92..dc3e0d01bd 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -232,6 +233,14 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
+     return _align_up(data_size, _DIRECT_IO_ALIGNMENT) + _DIRECT_IO_PADDING_BYTES
+ 
+ 
++def _group_index_from_key(key: str) -> int:
++    """KV cache group encoded in a pool key, or -1 if the key predates it."""
++    for part in key.split("@"):
++        if part.startswith("group:"):
++            return int(part.removeprefix("group:"))
++    return -1
++
++
+ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
+     return sum(sum(size) for size in sizes)
+ 
+@@ -931,6 +940,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     self.replicate_config,
+                 )
+                 failed = [i for i, v in enumerate(res) if v < 0]
++                if envs.VLLM_MOONCAKE_STORE_KEY_LOG:
++                    for key, value in zip(keys, res, strict=True):
++                        logger.info(
++                            "Mooncake store key: req_id=%s key=%s put=%d",
++                            req_id,
++                            key,
++                            value,
++                        )
+                 self._record_operation(
+                     "save_put",
+                     put_start,
+@@ -1053,6 +1070,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         size_list: list[list[int]] = []
+         key_list: list[str] = []
+         block_id_list: list[int] = []
++        # Where each requested key sits, so a failure can be placed against
++        # token_len instead of being reported as a bare hash.
++        key_span: dict[str, tuple[int, int, int]] = {}
+         for g_idx, db in enumerate(self.token_databases):
+             mask = load_mask_per_group[g_idx]
+             chunks: list[tuple[int, int]] = []
+@@ -1062,7 +1082,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 chunk_idx = start // db.block_size
+                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                     continue
+-                key_list.append(db.key_for(block_hash))
++                key = db.key_for(block_hash)
++                key_list.append(key)
++                key_span[key] = (chunk_idx, start, end)
+                 chunks.append((start, end))
+             g_addrs, g_sizes, g_block_ids = db.prepare_values(
+                 chunks, req_meta.block_ids[g_idx]
+@@ -1127,6 +1149,24 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         current_batch_keys: list[str] = key_list_c
+         current_batch_block_ids: list[int] = block_id_list_c
+         batch_bytes = 0
++        failure_scan = envs.VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN
++        scanned_failures: dict[int, int] = {}
++        if failure_scan:
++            # The denominator. Failures alone cannot distinguish "this group is
++            # broken" from "this group is most of what a load asks for".
++            requested: dict[int, int] = {}
++            for key in key_list_c:
++                g_idx = _group_index_from_key(key)
++                requested[g_idx] = requested.get(g_idx, 0) + 1
++            logger.info(
++                "Mooncake load requested: req_id=%s keys=%d by_group=%s "
++                "token_len=%d mask_num=%d",
++                req_id,
++                len(key_list_c),
++                dict(sorted(requested.items())),
++                token_len,
++                mask_num,
++            )
+         try:
+             for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
+                 current_batch_keys = batch_keys
+@@ -1170,7 +1210,33 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                         len(batch_keys),
+                         [(key, value) for key, value, _ in failed[:3]],
+                     )
+-                    break
++                    if not failure_scan:
++                        break
++                    for key, _value, _block_id in failed:
++                        g_idx = _group_index_from_key(key)
++                        scanned_failures[g_idx] = scanned_failures.get(g_idx, 0) + 1
++                    # -704 is OBJECT_NOT_FOUND. Asking the store about the same
++                    # keys now separates "exists but the GET disagrees" from
++                    # "the object is simply not there". Never let a diagnostic
++                    # change the outcome of the load it is observing.
++                    try:
++                        failed_keys = [key for key, _v, _b in failed]
++                        present = self.store.batch_is_exist(failed_keys)
++                        for key, exists in zip(failed_keys, present, strict=True):
++                            idx, s, e = key_span.get(key, (-1, -1, -1))
++                            logger.warning(
++                                "Mooncake load failure recheck: req_id=%s key=%s "
++                                "exists=%s chunk=%d span=%d-%d token_len=%d",
++                                req_id,
++                                key,
++                                exists,
++                                idx,
++                                s,
++                                e,
++                                token_len,
++                            )
++                    except Exception as e:
++                        logger.warning("Mooncake failure recheck errored: %s", e)
+         except Exception as e:
+             self._add_load_error_block_ids(current_batch_block_ids)
+             self._record_operation(
+@@ -1187,6 +1253,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 e,
+             )
+ 
++        if scanned_failures:
++            logger.warning(
++                "Mooncake load failure scan: req_id=%s failed_keys=%d by_group=%s "
++                "sub_batches=%d",
++                req_id,
++                sum(scanned_failures.values()),
++                dict(sorted(scanned_failures.items())),
++                len(load_batches),
++            )
++
+         self.set_finished_request(req_id)
+         self.request_queue.task_done()
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index c2314891cb..9383ee37b5 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -219,6 +219,8 @@ if TYPE_CHECKING:
+     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
+     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
+     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
++    VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN: bool = False
++    VLLM_MOONCAKE_STORE_KEY_LOG: bool = False
+     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
+     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+     MOONCAKE_PREFERRED_SEGMENT: str | None = None
+@@ -1634,6 +1636,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
+         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
+     ),
++    # Diagnostic: attempt every GET sub-batch even after one fails, so the full
++    # set of unretrievable keys is observable. The load is already doomed at the
++    # first failure -- the scheduler truncates there -- so this trades wasted
++    # transfers for a complete picture and must stay off outside investigation.
++    "VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN": lambda: (
++        os.getenv("VLLM_MOONCAKE_STORE_LOAD_FAILURE_SCAN", "False").lower()
++        in ("true", "1")
++    ),
++    # Diagnostic: log every stored key with its put return code. One line per
++    # key, so this is c1-scale only. Its purpose is to let a failed GET key be
++    # joined against what was actually written -- the full string, because a
++    # prefix or hash-unit mismatch must read as a near-miss and not as absence.
++    "VLLM_MOONCAKE_STORE_KEY_LOG": lambda: (
++        os.getenv("VLLM_MOONCAKE_STORE_KEY_LOG", "False").lower() in ("true", "1")
++    ),
+     # Number of parallel KV-load receive threads per worker rank. Lets the
+     # per-request control overhead (Python prep + master key lookup) of one
+     # request overlap with the RDMA transfer of another, keeping the transfer

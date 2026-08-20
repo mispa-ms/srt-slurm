@@ -725,6 +725,7 @@ async def benchmark(
     slow_down_servers: list[str] | None = None,
     slow_down_sleep_time: float = 1.0,
     slow_down_wait_time: float = 60.0,
+    skip_initial_test: bool = False,
     request_session: aiohttp.ClientSession | None = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
@@ -734,31 +735,33 @@ async def benchmark(
     if backend == "dynamo" and request_session is not None:
         request_func = partial(request_func, session=request_session)
 
-    print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = input_requests[0]
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError("Multi-modal content is only supported on 'openai-chat' backend.")
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        best_of=best_of,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-    )
-
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
-        )
+    if skip_initial_test:
+        print("Skipping initial single prompt test run.")
     else:
+        print("Starting initial single prompt test run...")
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            best_of=best_of,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+        )
+
+        test_output = await request_func(request_func_input=test_input)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}"
+            )
         print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
@@ -1264,6 +1267,7 @@ def main(args: argparse.Namespace):
             slow_down_servers=args.slow_down_servers,
             slow_down_sleep_time=args.slow_down_sleep_time,
             slow_down_wait_time=args.slow_down_wait_time,
+            skip_initial_test=args.skip_initial_test,
         )
     )
 
@@ -1467,6 +1471,11 @@ if __name__ == "__main__":
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
+    )
+    parser.add_argument(
+        "--skip-initial-test",
+        action="store_true",
+        help="Start the benchmark without sending a preliminary request.",
     )
     parser.add_argument(
         "--profile",
