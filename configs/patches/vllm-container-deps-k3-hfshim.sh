@@ -21,12 +21,11 @@
 #   incomplete, because the alternative is silently burning job walltime on a
 #   1.4 TB download.
 #
-# CAVEAT: the sha is read from the Hub at run time and the staged directory is
-#   then labelled with it. If upstream publishes a new commit after the copy was
-#   staged, this presents stale weights under the new sha rather than
-#   re-downloading — deliberate (a 1.4 TB pull inside a benchmark job is worse),
-#   but it means the staged copy is the source of truth, not the Hub. Re-stage
-#   when the upstream repo changes.
+# REVISION: the staged copy is the source of truth and is labelled with a fixed sha
+#   (FALLBACK_SHA, overridable via K3_HFSHIM_SHA). The Hub is deliberately not asked at
+#   run time. Asking it was the old behaviour and it broke every K3 job within minutes
+#   of upstream publishing a commit, because the staged directory then carried a label
+#   whose file list it could not satisfy. Re-stage and move the pin together.
 # =============================================================================
 set -euo pipefail
 
@@ -36,7 +35,9 @@ fi
 
 REPO_ID="moonshotai/Kimi-K3"
 STAGED_DIR="${K3_STAGED_DIR:-/lustre/share/coreai_comparch_aarwlt/hf_repos/moonshotai/Kimi-K3}"
-# HEAD of moonshotai/Kimi-K3 as of 2026-07-27; only used if the Hub is unreachable.
+# The revision the shared copy was staged from, and the one every K3 number on this
+# workstream was measured under. This is the pin, not a fallback -- see the note at the
+# labelling step for why the Hub is no longer asked.
 FALLBACK_SHA="9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 
 echo "=== k3-hfshim: wiring HF cache to the pre-staged K3 checkpoint ==="
@@ -68,13 +69,26 @@ else
         exit 1
     fi
 
-    SHA="$(git ls-remote "https://huggingface.co/$REPO_ID" HEAD 2>/dev/null | awk '{print $1}' | head -1 || true)"
-    if [[ -z "$SHA" ]]; then
-        SHA="$FALLBACK_SHA"
-        echo "[k3-hfshim] Hub unreachable; using pinned sha $SHA"
-    else
-        echo "[k3-hfshim] resolved $REPO_ID main -> $SHA"
-    fi
+    # Label the staged copy with the revision it actually IS, not with whatever the
+    # Hub happens to be serving now.
+    #
+    # This used to read HEAD from the Hub every job. That works only while upstream is
+    # frozen, and it broke the moment it was not: moonshotai pushed a590ce09 on
+    # 2026-08-20T04:57Z adding four .eval_results/*.yaml, and from the next job onward
+    # every K3 arm died in the offline check below --
+    #
+    #   IncompleteSnapshotError: the cached snapshot for 'moonshotai/Kimi-K3'
+    #   (revision 'main', commit a590ce09...) is incomplete: 12 file(s) are missing
+    #
+    # -- because the staged directory was being presented under a sha whose file list
+    # it does not satisfy. Nothing was wrong with the weights; the label was a lie.
+    # Eight arms lost an hour each to it.
+    #
+    # So the pin is now the default and the Hub is not consulted. Set K3_HFSHIM_SHA
+    # after re-staging to move it; the offline check below fails loudly if the pin and
+    # the staged contents ever disagree, which is the failure we want.
+    SHA="${K3_HFSHIM_SHA:-$FALLBACK_SHA}"
+    echo "[k3-hfshim] using pinned sha $SHA (staged copy is the source of truth, not the Hub)"
 
     mkdir -p "$CACHE_ENTRY/refs" "$CACHE_ENTRY/snapshots"
     ln -sfn "$STAGED_DIR" "$CACHE_ENTRY/snapshots/$SHA"
