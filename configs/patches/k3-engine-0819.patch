@@ -215,12 +215,15 @@ index 83c6d16e1b..fbe969ba77 100644
          self._kv_cache_groups: list[KVCacheGroupSpec] = groups
          spec_cfg = getattr(vllm_config, "speculative_config", None)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-index d2c073676d..90813c19f7 100644
+index d2c073676d..4f551fcccc 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-@@ -12,6 +12,7 @@ import uuid
+@@ -10,8 +10,9 @@ import threading
+ import time
+ import uuid
  from collections import defaultdict
- from collections.abc import Iterator
+-from collections.abc import Iterator
++from collections.abc import Iterator, Sequence
  from concurrent.futures import Future, ThreadPoolExecutor
 +from dataclasses import dataclass
  from functools import cached_property
@@ -341,7 +344,7 @@ index d2c073676d..90813c19f7 100644
          num_fa_descs = self.num_regions * num_blocks
  
          # All-attention fast path: single vectorized broadcast.
-@@ -251,6 +322,219 @@ class NixlBaseConnectorWorker:
+@@ -251,6 +322,248 @@ class NixlBaseConnectorWorker:
          """
          return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
  
@@ -445,19 +448,48 @@ index d2c073676d..90813c19f7 100644
 +        """
 +        return self._supports_member_identity and self._is_hma_required
 +
-+    def _requires_member_identity(self) -> bool:
-+        """Whether this worker's local layout must be routed by layer name.
++    def _requires_member_identity(
++        self, remote_region_members: Sequence[Sequence[str]] = ()
++    ) -> bool:
++        """Whether transfers to this peer must be routed by layer name.
 +
-+        True for a PP-sharded push producer whose local KV layout is hybrid
-+        (HMA) or packed: region indices are not a stable identity across the
-+        P/D layer split, so transfers must be keyed by member name. Independent
-+        of the remote peer.
++        Region indices identify a region only relative to the layer set that
++        produced them, so they stop being a shared identity as soon as the two
++        sides hold different layer sets. That is a property of the *pair*, not
++        of us: a PP=1 producer writing to a PP-sharded consumer has the same
++        problem as a PP-sharded producer, because the consumer's stage holds a
++        subset of our layers at region indices that mean something else.
++
++        Checking only ``self.pp_size`` -- as this did -- silently left the
++        PP=1 x PP>1 direction on region-index routing, where it fails the
++        descriptor-count check or, past it, transfers the wrong layers.
++
++        With no remote members advertised the answer is the local one: an old
++        peer that cannot describe its members is one we could not member-route
++        to anyway.
 +        """
-+        return (
-+            self._supports_member_identity
-+            and self.pp_size > 1
-+            and (self._is_hma_required or bool(self._packed_layer_info))
-+        )
++        if not self._supports_member_identity:
++            return False
++        if not (self._is_hma_required or bool(self._packed_layer_info)):
++            return False
++        if self.pp_size > 1:
++            return True
++        return self._peer_layer_set_differs(remote_region_members)
++
++    def _peer_layer_set_differs(
++        self, remote_region_members: Sequence[Sequence[str]]
++    ) -> bool:
++        """Whether the peer advertised a different set of KV layers than ours.
++
++        Identical sets mean the two sides partitioned the model the same way and
++        region indices line up, which is the long-standing TP-only case; leaving
++        it on region-index routing keeps that path untouched.
++        """
++        if not remote_region_members:
++            return False
++        remote = {name for members in remote_region_members for name in members}
++        local = {name for members in self.region_members for name in members}
++        return bool(local) and remote != local
 +
 +    def _use_member_identity(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
 +        """Whether to route this remote's regions by layer name.
@@ -469,7 +501,7 @@ index d2c073676d..90813c19f7 100644
 +                with ``enforce_handshake_compat=false``; falling back to
 +                region-index routing here would silently transfer stale KV.
 +        """
-+        if not self._requires_member_identity():
++        if not self._requires_member_identity(nixl_agent_meta.region_members):
 +            return False
 +        if not nixl_agent_meta.region_members:
 +            raise RuntimeError(
@@ -561,7 +593,7 @@ index d2c073676d..90813c19f7 100644
      def __init__(
          self,
          vllm_config: "VllmConfig",
-@@ -441,18 +725,32 @@ class NixlBaseConnectorWorker:
+@@ -441,18 +754,32 @@ class NixlBaseConnectorWorker:
          # transfers into the matching sub-range of a PP=1 remote's regions.
          self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
          self._remote_region_offset = 0
@@ -602,7 +634,7 @@ index d2c073676d..90813c19f7 100644
          # Keep heartbeat handshakes to a PP-sharded producer notif-only.
          self._hb_handshake_notif_only = False
  
-@@ -465,7 +763,17 @@ class NixlBaseConnectorWorker:
+@@ -465,7 +792,17 @@ class NixlBaseConnectorWorker:
          # Per-source split handles, keyed by (tp_ratio, remote_block_size).
          self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
          # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
@@ -621,7 +653,7 @@ index d2c073676d..90813c19f7 100644
  
          # Map of engine_id -> num_blocks. All ranks in the same deployment will
          # have the same number of blocks.
-@@ -554,6 +862,17 @@ class NixlBaseConnectorWorker:
+@@ -554,6 +891,17 @@ class NixlBaseConnectorWorker:
          # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
          self.block_len_per_layer = list[int]()
  
@@ -639,7 +671,7 @@ index d2c073676d..90813c19f7 100644
          # Per-engine TP mappings. Generated during handshake.
          self.tp_mappings: dict[EngineId, TPMapping] = {}
  
-@@ -618,9 +937,15 @@ class NixlBaseConnectorWorker:
+@@ -618,9 +966,25 @@ class NixlBaseConnectorWorker:
          best_rtt = float("inf")
          best_offset: float | None = None
  
@@ -648,7 +680,17 @@ index d2c073676d..90813c19f7 100644
 +        # could address, and planning a member transfer against it raises rather
 +        # than yielding an empty plan. Same rule the transfer and the notif
 +        # count use, so a stage we skip here is one we never write to or wait on.
-+        remote_pp_ranks = self._overlapping_remote_pp_ranks(remote_pp_size)
++        #
++        # Notif-only registration is exempt. It skips descriptor setup entirely,
++        # so it never plans a member transfer and cannot hit that failure -- the
++        # reason for filtering does not apply, and knowing every stage's agent
++        # name costs nothing. Leaving this path alone also keeps heartbeat
++        # discovery of a PP-sharded producer exactly as it was.
++        remote_pp_ranks = (
++            list(range(remote_pp_size))
++            if notif_agents_only
++            else self._overlapping_remote_pp_ranks(remote_pp_size)
++        )
          with zmq_ctx(zmq.REQ, path) as sock:
              for remote_pp_rank, remote_rank in itertools.product(
 -                range(remote_pp_size), p_remote_ranks
@@ -656,7 +698,7 @@ index d2c073676d..90813c19f7 100644
              ):
                  logger.debug(
                      "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
-@@ -715,7 +1040,7 @@ class NixlBaseConnectorWorker:
+@@ -715,7 +1079,7 @@ class NixlBaseConnectorWorker:
                      )
                  else:
                      remote_agent_name = self.add_remote_agent(
@@ -665,7 +707,7 @@ index d2c073676d..90813c19f7 100644
                      )
                  setup_agent_time = time.perf_counter()
                  logger.debug(
-@@ -960,12 +1285,12 @@ class NixlBaseConnectorWorker:
+@@ -960,12 +1324,12 @@ class NixlBaseConnectorWorker:
      def _register_packed_kv_cache(
          self,
          storage: torch.UntypedStorage,
@@ -681,7 +723,7 @@ index d2c073676d..90813c19f7 100644
          """
          self.transfer_topo = TransferTopology(
              tp_rank=self.tp_rank,
-@@ -986,11 +1311,30 @@ class NixlBaseConnectorWorker:
+@@ -986,11 +1350,30 @@ class NixlBaseConnectorWorker:
          )
  
          total_size = storage.nbytes()
@@ -712,7 +754,7 @@ index d2c073676d..90813c19f7 100644
          logger.info(
              "Registering packed KV cache: total_size=%s, block_stride=%s, "
              "num_blocks=%s, num_regions=1",
-@@ -1007,6 +1351,13 @@ class NixlBaseConnectorWorker:
+@@ -1007,6 +1390,13 @@ class NixlBaseConnectorWorker:
          self.num_descs = self.num_blocks
          self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
  
@@ -726,7 +768,7 @@ index d2c073676d..90813c19f7 100644
          descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
          self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
          self._registered_descs.append(descs)
-@@ -1033,6 +1384,9 @@ class NixlBaseConnectorWorker:
+@@ -1033,6 +1423,9 @@ class NixlBaseConnectorWorker:
              physical_blocks_per_logical_kv_block=(
                  self._physical_blocks_per_logical_kv_block
              ),
@@ -736,7 +778,7 @@ index d2c073676d..90813c19f7 100644
          )
          assert self.compat_hash is not None
          encoder = msgspec.msgpack.Encoder()
-@@ -1041,20 +1395,36 @@ class NixlBaseConnectorWorker:
+@@ -1041,20 +1434,36 @@ class NixlBaseConnectorWorker:
              agent_metadata_bytes=encoder.encode(agent_metadata),
          )
  
@@ -784,7 +826,7 @@ index d2c073676d..90813c19f7 100644
                  self.device_kv_caches = kv_caches
                  return
  
-@@ -1105,6 +1475,9 @@ class NixlBaseConnectorWorker:
+@@ -1105,6 +1514,9 @@ class NixlBaseConnectorWorker:
          # With hybrid allocator, layers can share a kv cache tensor
          seen_base_addresses: list[int] = []
  
@@ -794,7 +836,7 @@ index d2c073676d..90813c19f7 100644
          # K and V are packed into the content dim, so each attention layer is a
          # single NIXL region whose block transfers as one unit. Mamba layers instead
          # register separate conv/ssm sub-regions (see `_build_mamba_local`).
-@@ -1162,11 +1535,15 @@ class NixlBaseConnectorWorker:
+@@ -1162,11 +1574,15 @@ class NixlBaseConnectorWorker:
                  # layer registered it first.
                  idx = seen_base_addresses.index(base_addr)
                  self._region_is_mla[idx] |= is_mla_region
@@ -810,7 +852,7 @@ index d2c073676d..90813c19f7 100644
              seen_base_addresses.append(base_addr)
              # Only record non-Mamba page sizes.
              if isinstance(layer_spec, MambaSpec):
-@@ -1220,7 +1597,9 @@ class NixlBaseConnectorWorker:
+@@ -1220,7 +1636,9 @@ class NixlBaseConnectorWorker:
          self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
          self.num_regions = len(caches_data)
  
@@ -821,7 +863,7 @@ index d2c073676d..90813c19f7 100644
              start_layer, end_layer = self.model_config.get_layers_start_end_indices(
                  self.vllm_config.parallel_config
              )
-@@ -1277,6 +1656,7 @@ class NixlBaseConnectorWorker:
+@@ -1277,6 +1695,7 @@ class NixlBaseConnectorWorker:
              physical_blocks_per_logical_kv_block=(
                  self._physical_blocks_per_logical_kv_block
              ),
@@ -829,7 +871,7 @@ index d2c073676d..90813c19f7 100644
          )
          # Wrap metadata in payload with hash for defensive decoding
          assert self.compat_hash is not None
-@@ -1286,7 +1666,11 @@ class NixlBaseConnectorWorker:
+@@ -1286,7 +1705,11 @@ class NixlBaseConnectorWorker:
              agent_metadata_bytes=encoder.encode(agent_metadata),
          )
  
@@ -842,7 +884,7 @@ index d2c073676d..90813c19f7 100644
          """Build desc regions (conv sub-projections + ssm) per layer for
          local mamba blocks with DS conv layout, as an Nx3 uint64 array.
  
-@@ -1328,8 +1712,15 @@ class NixlBaseConnectorWorker:
+@@ -1328,8 +1751,15 @@ class NixlBaseConnectorWorker:
          device_id = self.device_id
          block_arange = np.arange(num_blocks, dtype=np.uint64)
  
@@ -859,7 +901,7 @@ index d2c073676d..90813c19f7 100644
              # Jump one page_size, but ssm page_size may be bigger when kernel
              # locks block size to a specific value (physical_per_logical scale).
              page_stride = self.block_len_per_layer[i] * physical_per_logical
-@@ -1345,6 +1736,7 @@ class NixlBaseConnectorWorker:
+@@ -1345,6 +1775,7 @@ class NixlBaseConnectorWorker:
          nixl_agent_meta: NixlAgentMetadata,
          tp_ratio: int,
          transfer_info: EngineTransferInfo,
@@ -867,7 +909,7 @@ index d2c073676d..90813c19f7 100644
      ) -> np.ndarray:
          """Build remote desc regions (conv sub-projections + ssm) per layer.
          For hetero-TP, each D rank reads only its sub-projection slice from
-@@ -1370,10 +1762,18 @@ class NixlBaseConnectorWorker:
+@@ -1370,10 +1801,18 @@ class NixlBaseConnectorWorker:
          device_id = nixl_agent_meta.device_id
          block_arange = np.arange(num_blocks, dtype=np.uint64)
  
@@ -887,7 +929,7 @@ index d2c073676d..90813c19f7 100644
              page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
              blk_addrs = base_addr + block_arange * page_stride
              for off, sz in conv_offsets:
-@@ -1395,15 +1795,49 @@ class NixlBaseConnectorWorker:
+@@ -1395,15 +1834,49 @@ class NixlBaseConnectorWorker:
          self,
          base_addresses: list[int],
          block_size_ratio: int,
@@ -939,7 +981,7 @@ index d2c073676d..90813c19f7 100644
              # K/V are packed into the content dim, so the whole block transfers
              # as one unit: desc length equals the block stride.
              block_len = self.block_len_per_layer[i] // block_size_ratio
-@@ -1416,12 +1850,32 @@ class NixlBaseConnectorWorker:
+@@ -1416,12 +1889,32 @@ class NixlBaseConnectorWorker:
          plan: TPMapping,
          nixl_agent_meta: NixlAgentMetadata,
          block_size_ratio: int,
@@ -973,7 +1015,7 @@ index d2c073676d..90813c19f7 100644
          fa_group_idx = next(
              i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
          )
-@@ -1431,11 +1885,23 @@ class NixlBaseConnectorWorker:
+@@ -1431,11 +1924,23 @@ class NixlBaseConnectorWorker:
          num_blocks = nixl_agent_meta.num_blocks
          device_id = nixl_agent_meta.device_id
          block_arange = np.arange(num_blocks, dtype=np.uint64)
@@ -1000,7 +1042,7 @@ index d2c073676d..90813c19f7 100644
              remote_kv_block_len = local_block_len // block_size_ratio
              if block_size_ratio > 1:
                  # ..using remote kv_block_len as transfer unit
-@@ -1457,6 +1923,7 @@ class NixlBaseConnectorWorker:
+@@ -1457,6 +1962,7 @@ class NixlBaseConnectorWorker:
      def register_local_xfer_handler(
          self,
          block_size: int,
@@ -1008,7 +1050,7 @@ index d2c073676d..90813c19f7 100644
      ) -> tuple[int, np.ndarray]:
          """
          Function used for register local xfer handler with local block_size or
-@@ -1468,12 +1935,18 @@ class NixlBaseConnectorWorker:
+@@ -1468,12 +1974,18 @@ class NixlBaseConnectorWorker:
          When remote block size is less than local block size, we need to use
          register another local_xfer_handler using remote block len to ensure
          data copy correctness.
@@ -1028,7 +1070,7 @@ index d2c073676d..90813c19f7 100644
          logger.debug(
              "Created %s blocks for src engine %s and rank %s on device id %s",
              len(blocks_data),
-@@ -1482,7 +1955,13 @@ class NixlBaseConnectorWorker:
+@@ -1482,7 +1994,13 @@ class NixlBaseConnectorWorker:
              self.device_id,
          )
          if self._has_mamba:
@@ -1043,7 +1085,7 @@ index d2c073676d..90813c19f7 100644
              # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
              # is unnecessary — a single conv desc per block suffices.  Consider
              # adding a fast path that falls back to the standard 2-region
-@@ -1490,7 +1969,7 @@ class NixlBaseConnectorWorker:
+@@ -1490,7 +2008,7 @@ class NixlBaseConnectorWorker:
              # remote has been seen.  Currently we always register 4 regions
              # because local descs are created before knowing the remote TP.
              logger.debug("Registering local Mamba descriptors (4 regions/layer)")
@@ -1052,7 +1094,7 @@ index d2c073676d..90813c19f7 100644
              blocks_data = np.concatenate([blocks_data, mamba])
  
          descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-@@ -1502,6 +1981,7 @@ class NixlBaseConnectorWorker:
+@@ -1502,6 +2020,7 @@ class NixlBaseConnectorWorker:
          nixl_agent_meta: NixlAgentMetadata,
          remote_tp_rank: int = 0,
          remote_tp_size: int = 1,
@@ -1060,7 +1102,7 @@ index d2c073676d..90813c19f7 100644
      ) -> str:
          """
          Add the remote NIXL agent and prepare the descriptors for reading cache
-@@ -1548,31 +2028,40 @@ class NixlBaseConnectorWorker:
+@@ -1548,31 +2067,40 @@ class NixlBaseConnectorWorker:
          """  # noqa: E501
          engine_id = nixl_agent_meta.engine_id
          # TODO re-evaluate refreshing for scaling/recovery
@@ -1119,7 +1161,7 @@ index d2c073676d..90813c19f7 100644
  
          ### Register remote engine in TransferTopology (idempotent).
          assert self.transfer_topo is not None
-@@ -1615,7 +2104,9 @@ class NixlBaseConnectorWorker:
+@@ -1615,7 +2143,9 @@ class NixlBaseConnectorWorker:
          self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
              nixl_agent_meta.kv_caches_base_addr
          )
@@ -1130,7 +1172,7 @@ index d2c073676d..90813c19f7 100644
  
          # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
          # this is the ratio between the two sizes.
-@@ -1677,9 +2168,7 @@ class NixlBaseConnectorWorker:
+@@ -1677,9 +2207,7 @@ class NixlBaseConnectorWorker:
  
          # Register all remote blocks, but only the corresponding kv heads.
          blocks_data = self._build_fa_remote(
@@ -1141,7 +1183,7 @@ index d2c073676d..90813c19f7 100644
          )
          logger.debug(
              "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
-@@ -1694,24 +2183,31 @@ class NixlBaseConnectorWorker:
+@@ -1694,24 +2222,31 @@ class NixlBaseConnectorWorker:
                  engine_id,
                  remote_tp_rank,
              )
@@ -1180,7 +1222,7 @@ index d2c073676d..90813c19f7 100644
          remote_engine_id = nixl_agent_meta.engine_id
  
          assert self.transfer_topo is not None
-@@ -1722,6 +2218,19 @@ class NixlBaseConnectorWorker:
+@@ -1722,6 +2257,19 @@ class NixlBaseConnectorWorker:
          block_size_ratio = self.transfer_topo.block_size_ratio(
              nixl_agent_meta.block_size
          )
@@ -1200,7 +1242,7 @@ index d2c073676d..90813c19f7 100644
          # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
          # Mamba models can have replicated FA KV with tp_ratio < 0.
          # MLA models do not need to handle kv replication.
-@@ -1823,17 +2332,39 @@ class NixlBaseConnectorWorker:
+@@ -1823,17 +2371,39 @@ class NixlBaseConnectorWorker:
              # match up to the kernel block size ratio even under
              # heterogeneous TP (remote kernel blocks may be smaller).
              # SSM geometry is validated via ssm_sizes/conv offsets instead.
@@ -1244,7 +1286,7 @@ index d2c073676d..90813c19f7 100644
              )
              model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
                  remote_engine_id
-@@ -1841,8 +2372,9 @@ class NixlBaseConnectorWorker:
+@@ -1841,8 +2411,9 @@ class NixlBaseConnectorWorker:
              total_kv_heads = self.transfer_topo.total_num_kv_heads
              local_heads = self.transfer_topo.local_physical_heads
              remote_heads = max(1, total_kv_heads // remote_tp_size)
@@ -1256,7 +1298,7 @@ index d2c073676d..90813c19f7 100644
                  remote_len = nixl_agent_meta.block_lens[i]
                  if replicated:
                      assert local_len // block_size_ratio == remote_len, (
-@@ -1873,8 +2405,12 @@ class NixlBaseConnectorWorker:
+@@ -1873,8 +2444,12 @@ class NixlBaseConnectorWorker:
  
          # TP workers that handhshake with same remote have same #blocks.
          assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
@@ -1271,7 +1313,7 @@ index d2c073676d..90813c19f7 100644
  
      def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
          """copy recved kv from host buffer to device."""
-@@ -2571,6 +3107,11 @@ class NixlBaseConnectorWorker:
+@@ -2571,6 +3146,11 @@ class NixlBaseConnectorWorker:
          # Notif-only engines (push-mode D side) have no descriptor state.
          for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
              self.nixl_wrapper.release_dlist_handle(handle)
@@ -1505,7 +1547,7 @@ index 6efe491be8..ad9f80ca1c 100644
              "remote_engine_id": params["remote_engine_id"],
              "remote_host": params["remote_host"],
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
-index 0721bf9d1d..7e409eabd6 100644
+index 0721bf9d1d..3c252eaa2c 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
 @@ -79,6 +79,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -1546,7 +1588,7 @@ index 0721bf9d1d..7e409eabd6 100644
  
          # Expand D's logical IDs using the ratio learned during the
          # NIXL handshake. ``meta`` is freshly built by
-@@ -526,9 +536,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -526,9 +536,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
          replicate_attn = self.use_mla and tp_ratio < 0
          if replicate_attn and not self._has_mamba:
              assert len(plan.all_source_ranks) == 1
@@ -1557,11 +1599,18 @@ index 0721bf9d1d..7e409eabd6 100644
          else:
 -            write_ranks = list(plan.all_source_ranks)
 +            tp_targets = list(plan.all_source_ranks)
-+        write_ranks = [(stage, tp) for stage in write_stages for tp in tp_targets]
++        # Carry the TP *index* alongside the rank: the local split handles are
++        # one per TP target, so indexing them by position in this list would
++        # run off the end as soon as there is more than one decode stage.
++        write_ranks = [
++            (stage, tp_index, tp)
++            for stage in write_stages
++            for tp_index, tp in enumerate(tp_targets)
++        ]
  
          def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
              return [
-@@ -541,15 +554,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -541,15 +561,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
  
          read_specs = [
              ReadSpec(
@@ -1573,12 +1622,12 @@ index 0721bf9d1d..7e409eabd6 100644
 +                remote_block_ids=group_ids(remote_block_ids, tp),
              )
 -            for rank in write_ranks
-+            for (_stage, tp) in write_ranks
++            for (_stage, _tp_index, tp) in write_ranks
          ]
  
          handles: list[int] = []
-         for i, spec in enumerate(read_specs):
-+            remote_pp_rank = write_ranks[i][0]
+-        for i, spec in enumerate(read_specs):
++        for (remote_pp_rank, tp_index, _tp), spec in zip(write_ranks, read_specs):
 +            member_state = self._member_xfer_state.get((engine_id, remote_pp_rank))
 +            member_groups = (
 +                member_state.plan.group_ids if member_state is not None else None
@@ -1586,7 +1635,7 @@ index 0721bf9d1d..7e409eabd6 100644
              remote_block_size = remote_info.remote_block_size
              logger.debug(
                  "Remote agent %s available, calling _xfer_blocks"
-@@ -559,7 +577,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -559,19 +583,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                  remote_block_size,
                  req_id,
              )
@@ -1597,7 +1646,14 @@ index 0721bf9d1d..7e409eabd6 100644
                  # Multiple targets: write each rank its chunk of local memory.
                  # Hybrid MLA+SSM also lands here: its split handles replicate
                  # the attention descriptors and chunk only the SSM state.
-@@ -571,7 +591,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+                 split_key = (tp_ratio, remote_block_size)
+-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
++                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][
++                    tp_index
++                ]
+             else:
+                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
+                     remote_block_size
                  ]
  
              remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
@@ -1606,7 +1662,7 @@ index 0721bf9d1d..7e409eabd6 100644
              ]
  
              handle = self._xfer_blocks(
-@@ -581,6 +601,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -581,6 +609,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                  remote_request_id=meta.remote.request_id,
                  local_xfer_side_handle=local_xfer_side_handle,
                  remote_xfer_side_handle=remote_xfer_side_handle,
@@ -1614,7 +1670,7 @@ index 0721bf9d1d..7e409eabd6 100644
              )
              if handle is not None:
                  handles.append(handle)
-@@ -600,6 +621,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -600,6 +629,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
          remote_request_id: str,
          local_xfer_side_handle: int,
          remote_xfer_side_handle: int,
@@ -1622,7 +1678,7 @@ index 0721bf9d1d..7e409eabd6 100644
      ) -> int | None:
          """Post a WRITE point-to-point xfer request.
  
-@@ -657,12 +679,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -657,12 +687,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              dst_num_blocks=self.dst_num_blocks[dst_engine_id],
              block_size_ratio=None,
              physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
@@ -1637,7 +1693,7 @@ index 0721bf9d1d..7e409eabd6 100644
          )
  
          assert len(local_block_descs_ids) == len(remote_block_descs_ids)
-@@ -726,11 +750,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+@@ -726,11 +758,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
              # Not tracked as a P-side send/process for this notif.
              if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
                  if (meta := self._recving_metadata.get(req_id)) is not None:
