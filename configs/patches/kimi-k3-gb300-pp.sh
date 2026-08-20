@@ -92,14 +92,18 @@ else
     fi
     # Dry-run first. A partially applied engine is worse than a failed job: it
     # starts, serves, and is wrong in a way no perf metric shows.
-    if ! patch -p1 -d "${VLLM_ROOT}" --dry-run --forward < "${PATCH}" > /tmp/k3-all-dry.log 2>&1; then
+    if ! patch -p1 -d "${VLLM_ROOT}" --batch --dry-run --forward < "${PATCH}" > /tmp/k3-all-dry.log 2>&1; then
         echo "[k3-pp] FATAL: patch does not apply to this image." >&2
         echo "[k3-pp] The patch is generated against nightly 5a4c8d9924; if the" \
              "container tag moved, regenerate it from mispa-ms/vllm@misunp/k3-engine-0819." >&2
         cat /tmp/k3-all-dry.log >&2
         exit 1
     fi
-    patch -p1 -d "${VLLM_ROOT}" --forward < "${PATCH}"
+    # --batch: without it, a patch naming a file the image does not have
+    # prompts "File to patch:" and reads the answer from stdin -- which is
+    # the patch itself. It then eats patch lines as answers and applies a
+    # truncated diff while reporting success.
+    patch -p1 -d "${VLLM_ROOT}" --batch --forward < "${PATCH}"
     echo "[k3-pp] applied"
 fi
 
@@ -140,6 +144,22 @@ if "does not support pipeline_parallel_size > 1 with Mamba" in nixl_worker:
 if not os.path.exists(os.path.join(
         root, "vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py")):
     fail.append("member_transfer.py (the transfer planner) is missing")
+
+# Decode-side PP. Counting completions per overlapping producer stage is only
+# half of it -- the transfer must also reach every decode stage, or a
+# PP-sharded consumer waits forever on notifs nobody sends. Assert both halves
+# and the absence of the refusal that stood in for them, because an arm that
+# comes up and hangs at the first request is the expensive way to find out.
+push_worker = src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py")
+if "_overlapping_remote_pp_ranks" not in nixl_worker:
+    fail.append("the overlapping-stage rule is missing from the NIXL worker")
+if "decode_pp_size" not in src(
+        "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py"):
+    fail.append("PUSH_REG does not advertise decode_pp_size; P cannot see D's split")
+if "decode_pp_size" not in push_worker:
+    fail.append("the push write path does not read decode_pp_size")
+if "not supported yet (got" in push_worker:
+    fail.append("the decode-side PP refusal is still present in the push worker")
 
 if "MLADCPManager" not in src("vllm/models/kimi_k3/nvidia/mla.py"):
     fail.append("K3 DCP (#50484) missing from this image")

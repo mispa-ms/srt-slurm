@@ -92,14 +92,18 @@ else
     fi
     # Dry-run first. A partially applied engine is worse than a failed job: it
     # starts, serves, and is wrong in a way no perf metric shows.
-    if ! patch -p1 -d "${VLLM_ROOT}" --dry-run --forward < "${PATCH}" > /tmp/k3-all-dry.log 2>&1; then
+    if ! patch -p1 -d "${VLLM_ROOT}" --batch --dry-run --forward < "${PATCH}" > /tmp/k3-all-dry.log 2>&1; then
         echo "[k3-dcp8pp2] FATAL: patch does not apply to this image." >&2
         echo "[k3-dcp8pp2] The patch is generated against nightly 5a4c8d9924; if the" \
              "container tag moved, regenerate it from mispa-ms/vllm@misunp/k3-all-on-0819." >&2
         cat /tmp/k3-all-dry.log >&2
         exit 1
     fi
-    patch -p1 -d "${VLLM_ROOT}" --forward < "${PATCH}"
+    # --batch: without it, a patch naming a file the image does not have
+    # prompts "File to patch:" and reads the answer from stdin -- which is
+    # the patch itself. It then eats patch lines as answers and applies a
+    # truncated diff while reporting success.
+    patch -p1 -d "${VLLM_ROOT}" --batch --forward < "${PATCH}"
     echo "[k3-dcp8pp2] applied"
 fi
 
