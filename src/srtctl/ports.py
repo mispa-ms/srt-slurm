@@ -34,6 +34,14 @@ MOONCAKE_METRICS_PORT = 8702
 # vLLM backend ports.
 VLLM_NIXL_PORT_BASE = 5400
 VLLM_DATA_PARALLEL_RPC_PORT = 8400
+# vLLM's multi-node rendezvous port. Left unset, vLLM defaults to 29500(+1) and
+# a stale bind from any earlier job on the node kills the run with
+# "server socket has failed to listen ... port: 29501 ... EADDRINUSE".
+# Derived per SLURM job so two runs, or a run and someone's leftovers, do not
+# share it. 1024 slots is far more than a cluster runs at once.
+VLLM_MASTER_PORT_BASE = 26000
+VLLM_MASTER_PORT_SLOTS = 1024
+
 VLLM_PORT_BASE = 20000
 VLLM_PORT_STRIDE = 50
 
