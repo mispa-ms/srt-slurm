@@ -2101,7 +2101,7 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..1f8a8eb0d1 100644
+index 767ea00334..a31ccce649 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -28,6 +28,9 @@ from vllm.v1.request import Request
@@ -2114,15 +2114,16 @@ index 767ea00334..1f8a8eb0d1 100644
  
  def _validate_prefix_cache_retention_interval(
      retention_interval: int | None,
-@@ -104,6 +107,7 @@ class KVCacheCoordinator(ABC):
+@@ -104,6 +107,8 @@ class KVCacheCoordinator(ABC):
          )
  
          # KV cache group indices that get the EAGLE last-block drop.
 +        self._hit_reconcile_logs = 0
++        self._hit_reconcile_misses = 0
          self.eagle_group_ids: set[int] = {
              i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
          }
-@@ -782,6 +786,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -782,6 +787,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          num_groups = len(self.kv_cache_config.kv_cache_groups)
          hit_length = max_cache_hit_length
          longest_hit_length = 0
@@ -2130,7 +2131,7 @@ index 767ea00334..1f8a8eb0d1 100644
          hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
          hit_length_by_group: list[int] = [0] * num_groups
  
-@@ -854,6 +859,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -854,6 +860,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                  elif _new_hit_length < curr_hit_length:
                      # length shrunk; invalidate previous eagle verifications
                      eagle_verified.clear()
@@ -2148,7 +2149,7 @@ index 767ea00334..1f8a8eb0d1 100644
                  curr_hit_length = _new_hit_length
                  for group_id, blocks in zip(group_ids, hit_blocks):
                      hit_blocks_by_group[group_id] = blocks
-@@ -886,6 +902,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +903,51 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2160,7 +2161,23 @@ index 767ea00334..1f8a8eb0d1 100644
 +        # hypothesis the log exists to test. ``max_len`` is the candidate the
 +        # group was asked for and ``hit`` what it returned, so a uniform
 +        # shortening is visible as every group losing the same amount.
-+        if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS and _trace:
++        # Only reconciliations that produced a hit. Every previous run spent its
++        # whole budget on wave-1 cold lookups, where every group returns 0 and
++        # the trace says nothing about which group decides a hit. Count the
++        # misses separately so their absence from the log is not read as their
++        # absence from the run.
++        if hit_length == 0:
++            self._hit_reconcile_misses += 1
++            if self._hit_reconcile_misses in (1, 100, 1000):
++                logger.info(
++                    "Prefix hit reconciled to 0 (%d such so far)",
++                    self._hit_reconcile_misses,
++                )
++        if (
++            hit_length > 0
++            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
++            and _trace
++        ):
 +            self._hit_reconcile_logs += 1
 +            # ``align`` and ``partial`` decide the granularity a hit can land
 +            # on, and they are the difference a length alone cannot show:
