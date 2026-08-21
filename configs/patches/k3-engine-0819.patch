@@ -2077,7 +2077,7 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..e01bc48511 100644
+index 767ea00334..7d81c9efbd 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -1,5 +1,6 @@
@@ -2105,7 +2105,7 @@ index 767ea00334..e01bc48511 100644
          self.eagle_group_ids: set[int] = {
              i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
          }
-@@ -886,6 +891,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +891,41 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2121,18 +2121,25 @@ index 767ea00334..e01bc48511 100644
 +            and longest_hit_length > hit_length
 +        ):
 +            self._hit_reconcile_logs += 1
++            # ``eagle`` matters as much as the lengths. is_eagle_group is only
++            # ever set for deepseek_v4 (kv_cache_utils, behind its own FIXME),
++            # so on any other model with a draft the set comes up empty and the
++            # constructor's fallback flags *every* group. Then "the draft group
++            # hit short" and "every group took the eagle drop" produce the same
++            # truncation, and only this column tells them apart.
 +            per_group = [
 +                (
 +                    i,
 +                    type(self.single_type_managers[i].kv_cache_spec).__name__,
 +                    self.single_type_managers[i].block_size,
 +                    hit_length_by_group[i],
++                    i in self.eagle_group_ids,
 +                )
 +                for i in range(len(hit_length_by_group))
 +            ]
 +            logger.info(
 +                "Prefix hit reconciled to %d of %d tokens; per group "
-+                "(id, spec, block_size, hit): %s",
++                "(id, spec, block_size, hit, eagle): %s",
 +                hit_length,
 +                longest_hit_length,
 +                per_group,
