@@ -170,16 +170,29 @@ run_phase "${CACHE_FILL_OSL}"
 
 echo "Cache fill complete; launching the identical-prompt replay"
 echo "Profile replay: ${NUM_PROMPTS} prompts, ISL=${ISL}, OSL=${OSL}, concurrency=${CONCURRENCY}"
-decode_marker="/logs/profile-benchmark/decode-active-c${CONCURRENCY}"
-rm -f "${decode_marker}"
-export SRT_BENCH_DECODE_ACTIVE_MARKER="${decode_marker}"
-export SRT_BENCH_DECODE_ACTIVE_TARGET="${CONCURRENCY}"
-run_phase "${OSL}" "results_isl${ISL}_osl${OSL}_c${CONCURRENCY}.json" &
-replay_pid=$!
-unset SRT_BENCH_DECODE_ACTIVE_MARKER SRT_BENCH_DECODE_ACTIVE_TARGET
-wait_for_full_decode_concurrency "${decode_marker}" "${replay_pid}"
-start_all_profiling
-wait "${replay_pid}"
+# The concurrency window exists to time start_all_profiling: a decode-only
+# capture is only decode-only while every stream is generating. With profiling
+# off there is nothing to time, and waiting for a marker no one writes turns a
+# finished benchmark into a failed job -- which is what it did to the decode-PP
+# DSpark arm (63781035). That arm completed 64/64 in both waves and was killed
+# afterwards, by this, for never holding all 64 streams at once. Gate on the
+# same predicate start_all_profiling uses, so the two cannot disagree.
+if profiling__is_enabled; then
+    decode_marker="/logs/profile-benchmark/decode-active-c${CONCURRENCY}"
+    rm -f "${decode_marker}"
+    export SRT_BENCH_DECODE_ACTIVE_MARKER="${decode_marker}"
+    export SRT_BENCH_DECODE_ACTIVE_TARGET="${CONCURRENCY}"
+    run_phase "${OSL}" "results_isl${ISL}_osl${OSL}_c${CONCURRENCY}.json" &
+    replay_pid=$!
+    unset SRT_BENCH_DECODE_ACTIVE_MARKER SRT_BENCH_DECODE_ACTIVE_TARGET
+    # Still fatal here: a capture taken outside the window measures the wrong
+    # thing, and that is worse than no capture.
+    wait_for_full_decode_concurrency "${decode_marker}" "${replay_pid}"
+    start_all_profiling
+    wait "${replay_pid}"
+else
+    run_phase "${OSL}" "results_isl${ISL}_osl${OSL}_c${CONCURRENCY}.json"
+fi
 
 stop_all_profiling
 trap - EXIT
