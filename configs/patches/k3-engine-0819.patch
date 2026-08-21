@@ -2077,7 +2077,7 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..06e244bbdd 100644
+index 767ea00334..1f8a8eb0d1 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -28,6 +28,9 @@ from vllm.v1.request import Request
@@ -2124,7 +2124,7 @@ index 767ea00334..06e244bbdd 100644
                  curr_hit_length = _new_hit_length
                  for group_id, blocks in zip(group_ids, hit_blocks):
                      hit_blocks_by_group[group_id] = blocks
-@@ -886,6 +902,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +902,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2138,12 +2138,23 @@ index 767ea00334..06e244bbdd 100644
 +        # shortening is visible as every group losing the same amount.
 +        if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS and _trace:
 +            self._hit_reconcile_logs += 1
++            # ``align`` and ``partial`` decide the granularity a hit can land
++            # on, and they are the difference a length alone cannot show:
++            # 122880 is both 960 x 128 and 10 x 12288, so the observed hit is
++            # consistent with either the fine hash block or the coarse
++            # scheduler block. Printing the two settles it without another arm.
 +            logger.info(
-+                "Prefix hit reconciled to %d of %d tokens (eagle groups: %s); "
-+                "per group (idx, spec, block_size, max_len, hit, drop_eagle): %s",
++                "Prefix hit reconciled to %d of %d tokens "
++                "(eagle groups: %s, align=%d, partial_hash=%s, hash_block=%d, "
++                "sched_block=%d); per group "
++                "(idx, spec, block_size, max_len, hit, drop_eagle): %s",
 +                hit_length,
 +                longest_hit_length,
 +                sorted(self.eagle_group_ids),
++                self._cache_hit_alignment_tokens,
++                self.enable_partial_hash_hits,
++                self.hash_block_size,
++                self.scheduler_block_size,
 +                _trace,
 +            )
          return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
