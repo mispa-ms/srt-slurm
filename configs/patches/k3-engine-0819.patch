@@ -2229,7 +2229,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..c954531b6c 100644
+index 75acb7f497..8241f35ac1 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2249,7 +2249,7 @@ index 75acb7f497..c954531b6c 100644
  
  class SingleTypeKVCacheManager(ABC):
      """
-@@ -461,6 +464,23 @@ class SingleTypeKVCacheManager(ABC):
+@@ -461,6 +464,41 @@ class SingleTypeKVCacheManager(ABC):
              retention_interval=retention_interval,
              reachable_boundaries=reachable_boundaries,
          )
@@ -2260,7 +2260,25 @@ index 75acb7f497..c954531b6c 100644
 +        # boundary is a no-op, and why what differs between a request that
 +        # recovers the previous chunk and one that recovers nothing has to be
 +        # either the marked set or the window the mask was asked for.
-+        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
++        # Only the call whose window actually contains the wanted block, or one
++        # that marked something. cache_blocks runs incrementally as blocks fill
++        # -- windows arrive as [0,10), [10,20), ... -- and three earlier versions
++        # of this trace spent their whole budget before the window reached the
++        # boundary. This filter is not another guess: the previous run printed
++        # the wanted block and the window stride, so the condition is read off
++        # the data rather than assumed.
++        if (
++            isinstance(self.kv_cache_spec, MambaSpec)
++            and _MambaTailTrace.want()
++            and _MambaTailTrace.interesting(
++                reachable_boundaries,
++                num_cached_blocks,
++                num_full_blocks,
++                self.scheduler_block_size,
++                self.block_size,
++                block_mask,
++            )
++        ):
 +            _MambaTailTrace.log_mask(
 +                reachable_boundaries,
 +                num_cached_blocks,
@@ -2273,7 +2291,7 @@ index 75acb7f497..c954531b6c 100644
          self.block_pool.cache_full_blocks(
              request=request,
              blocks=self.req_to_blocks[request.request_id],
-@@ -1722,25 +1742,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1760,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2335,7 +2353,7 @@ index 75acb7f497..c954531b6c 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1805,67 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1823,85 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
@@ -2347,6 +2365,24 @@ index 75acb7f497..c954531b6c 100644
 +    @classmethod
 +    def want(cls) -> bool:
 +        return cls._left > 0
++
++    @classmethod
++    def interesting(
++        cls,
++        boundaries: list[int],
++        start_block: int,
++        end_block: int,
++        alignment: int,
++        block_size: int,
++        mask: list[bool] | None,
++    ) -> bool:
++        """Whether this call could have retained the boundary block."""
++        if mask is None or any(mask):
++            return True
++        return any(
++            start_block <= b // alignment * alignment // block_size - 1 < end_block
++            for b in boundaries
++        )
 +
 +    @classmethod
 +    def log_mask(
