@@ -2229,7 +2229,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..b735143717 100644
+index 75acb7f497..5910016698 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2249,7 +2249,7 @@ index 75acb7f497..b735143717 100644
  
  class SingleTypeKVCacheManager(ABC):
      """
-@@ -1722,25 +1725,44 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1725,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2283,7 +2283,13 @@ index 75acb7f497..b735143717 100644
 +                skip = "block index past the request's blocks"
 +            elif blocks[block_idx].is_null:
 +                skip = "source block is null"
-+        if _MambaTailTrace.want():
++        # Only the decisions near the prompt tail are informative. A first
++        # attempt logged every call and spent its whole budget on early chunks
++        # -- all of them multiples of the Mamba block and handled by the
++        # full-block path -- without ever reaching the boundary in question.
++        if skip != "on a block boundary, cached by the full-block path" and (
++            _MambaTailTrace.want()
++        ):
 +            _MambaTailTrace.log(
 +                num_tokens,
 +                latest_prompt_hash_boundary,
@@ -2305,7 +2311,7 @@ index 75acb7f497..b735143717 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1782,38 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1788,38 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
