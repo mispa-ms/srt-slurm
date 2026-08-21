@@ -17,13 +17,14 @@ index c3e0866b45..2899202cef 100644
              distributed_executor_backend=target_parallel_config.distributed_executor_backend,
              max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
-index 297fc22ad8..7d9c39f965 100644
+index 297fc22ad8..11a1abd766 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
-@@ -118,10 +118,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+@@ -117,11 +117,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                     f"{cache_block_size} (mamba_cache_mode != 'align')"
                  )
          pcp = vllm_config.parallel_config.prefill_context_parallel_size
-         dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        dcp = vllm_config.parallel_config.decode_context_parallel_size
 -        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
 -            unsupported.append(
 -                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
