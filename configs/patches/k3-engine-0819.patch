@@ -2229,7 +2229,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..5910016698 100644
+index 75acb7f497..ad6e5c6a97 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2249,7 +2249,28 @@ index 75acb7f497..5910016698 100644
  
  class SingleTypeKVCacheManager(ABC):
      """
-@@ -1722,25 +1725,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -452,6 +455,20 @@ class SingleTypeKVCacheManager(ABC):
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
++        # Which full-block boundaries survive retention, and how many there are
++        # to fall back to. The partial-tail trace shows only the sub-block entry,
++        # so a request that cannot reach it is invisible here: whether the next
++        # boundary down was kept is exactly the blind spot. At most two are
++        # retained, and the second only when shared_prefix_boundary is set.
++        if isinstance(self.kv_cache_spec, MambaSpec) and _MambaTailTrace.want():
++            _MambaTailTrace.log_boundaries(
++                reachable_boundaries,
++                num_cached_blocks,
++                num_full_blocks,
++                self.block_size,
++                self.use_eagle,
++            )
++
+         block_mask = self.reachable_block_mask(
+             start_block=num_cached_blocks,
+             end_block=num_full_blocks,
+@@ -1722,25 +1739,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2311,7 +2332,7 @@ index 75acb7f497..5910016698 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1788,38 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1802,57 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
@@ -2323,6 +2344,25 @@ index 75acb7f497..5910016698 100644
 +    @classmethod
 +    def want(cls) -> bool:
 +        return cls._left > 0
++
++    @classmethod
++    def log_boundaries(
++        cls,
++        boundaries: list[int],
++        start_block: int,
++        end_block: int,
++        block_size: int,
++        use_eagle: bool,
++    ) -> None:
++        cls._left -= 1
++        logger.info(
++            "Mamba retained boundaries: %s (blocks %d..%d of %d tokens each, eagle=%s)",
++            boundaries,
++            start_block,
++            end_block,
++            block_size,
++            use_eagle,
++        )
 +
 +    @classmethod
 +    def log(
