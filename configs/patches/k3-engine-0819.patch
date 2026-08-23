@@ -2100,6 +2100,42 @@ index f1166695fd..6453c5641d 100644
  
          if self.use_attn_res:
              assert prefix_sum is not None
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index a8a6c1ca94..527badf6ee 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -191,6 +191,7 @@ class BlockPool:
+         self.null_block.is_null = True
+ 
+         self.enable_kv_cache_events = enable_kv_cache_events
++        self._masked_but_null = 0
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
+         self.metrics_collector = metrics_collector
+@@ -273,6 +274,23 @@ class BlockPool:
+             # like sliding window attention, or Mamba models with prefix-caching
+             # in align mode. We skip null blocks here.
+             if blk.is_null or (block_mask is not None and not block_mask[i]):
++                # Count the case the mask cannot express: it asked for this
++                # block to be kept, and by the time caching runs the block is
++                # already null. remove_skipped_blocks frees the previous Mamba
++                # state block inside the same allocate_slots call, 59 lines
++                # earlier (kv_cache_manager.py:507 against :566), and is_null is
++                # tested before the mask, so the retention policy and the free
++                # policy never meet. A non-zero count here is the whole
++                # explanation for a Mamba prefix hit that was marked, windowed,
++                # and still absent from the pool.
++                if blk.is_null and block_mask is not None and block_mask[i]:
++                    self._masked_but_null += 1
++                    if self._masked_but_null in (1, 100, 1000, 10000):
++                        logger.info(
++                            "cache_full_blocks skipped a block the mask asked "
++                            "to keep because it was already null (%d such)",
++                            self._masked_but_null,
++                        )
+                 continue
+             block_hash = new_block_hashes[i]
+             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
 index 767ea00334..94af2dbbc7 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
@@ -2329,7 +2365,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..8241f35ac1 100644
+index 75acb7f497..04cde6352b 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2349,7 +2385,7 @@ index 75acb7f497..8241f35ac1 100644
  
  class SingleTypeKVCacheManager(ABC):
      """
-@@ -461,6 +464,41 @@ class SingleTypeKVCacheManager(ABC):
+@@ -461,6 +464,43 @@ class SingleTypeKVCacheManager(ABC):
              retention_interval=retention_interval,
              reachable_boundaries=reachable_boundaries,
          )
@@ -2387,11 +2423,13 @@ index 75acb7f497..8241f35ac1 100644
 +                self.block_size,
 +                self.use_eagle,
 +                block_mask,
++                self.req_to_blocks[request.request_id],
++                num_tokens,
 +            )
          self.block_pool.cache_full_blocks(
              request=request,
              blocks=self.req_to_blocks[request.request_id],
-@@ -1722,25 +1760,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1762,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2453,7 +2491,7 @@ index 75acb7f497..8241f35ac1 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1823,85 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1825,107 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
@@ -2494,7 +2532,20 @@ index 75acb7f497..8241f35ac1 100644
 +        block_size: int,
 +        use_eagle: bool,
 +        mask: list[bool] | None,
++        blocks: list[KVCacheBlock],
++        num_tokens: int,
 +    ) -> None:
++        """Whether a marked block is still a real block when caching runs.
++
++        ``cache_full_blocks`` skips a block that ``is_null`` *before* it looks at
++        the mask, and in align mode ``remove_skipped_blocks`` has already freed
++        the previous state block and put ``_null_block`` in its place -- in the
++        same ``allocate_slots`` call, 59 lines earlier. So marking a block is not
++        enough; it has to still hold a state at this moment. ``live`` is that
++        question, and ``chunk_aligned`` is the suspected reason it sometimes is
++        not: a step that ends off a Mamba block boundary carries the state past
++        the block the mask wants.
++        """
 +        cls._left -= 1
 +        marked = (
 +            "dense"
@@ -2502,14 +2553,23 @@ index 75acb7f497..8241f35ac1 100644
 +            else [i + start_block for i, m in enumerate(mask) if m]
 +        )
 +        want = [b // alignment * alignment // block_size - 1 for b in boundaries]
++        live = [
++            (i, not blocks[i].is_null)
++            for i in (want if mask is None else marked)
++            if 0 <= i < len(blocks)
++        ]
 +        logger.info(
 +            "Mamba mask: boundaries=%s -> want blocks %s | window [%d,%d) | "
-+            "marked %s | eagle=%s",
++            "marked %s | live(idx,not_null) %s | num_tokens=%d "
++            "(%% block_size = %d) | eagle=%s",
 +            boundaries,
 +            want,
 +            start_block,
 +            end_block,
 +            marked,
++            live,
++            num_tokens,
++            num_tokens % block_size,
 +            use_eagle,
 +        )
 +
