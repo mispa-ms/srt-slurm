@@ -2573,7 +2573,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..d87984e544 100644
+index 75acb7f497..18f592b2a2 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2637,7 +2637,7 @@ index 75acb7f497..d87984e544 100644
          self.block_pool.cache_full_blocks(
              request=request,
              blocks=self.req_to_blocks[request.request_id],
-@@ -471,6 +511,45 @@ class SingleTypeKVCacheManager(ABC):
+@@ -471,6 +511,56 @@ class SingleTypeKVCacheManager(ABC):
              block_mask=block_mask,
          )
  
@@ -2670,20 +2670,31 @@ index 75acb7f497..d87984e544 100644
 +                    hashes[b], [self.kv_cache_group_id]
 +                ):
 +                    found.append(b)
-+            _MambaTailTrace.log_readback(
-+                request.request_id,
-+                self.kv_cache_group_id,
-+                request.num_prompt_tokens,
-+                num_tokens,
-+                marked,
-+                found,
-+                [b for b in marked if b < len(blocks) and blocks[b].is_null],
++            # Spend the budget on the calls that decide something. Caching
++            # runs once per chunk, and the boundary block only enters the
++            # window near the end of the prompt -- the first attempt logged
++            # chunks 15,360 / 30,720 / 46,080, all with an empty mask, and ran
++            # out four chunks before the one that matters. Filtering on
++            # ordering rather than on the condition has now cost five traces;
++            # this filters on the condition.
++            near_tail = num_tokens + 2 * self.scheduler_block_size >= (
++                request.num_prompt_tokens
 +            )
++            if marked or near_tail:
++                _MambaTailTrace.log_readback(
++                    request.request_id,
++                    self.kv_cache_group_id,
++                    request.num_prompt_tokens,
++                    num_tokens,
++                    marked,
++                    found,
++                    [b for b in marked if b < len(blocks) and blocks[b].is_null],
++                )
 +
          self.num_cached_block[request.request_id] = num_full_blocks
  
      @classmethod
-@@ -1722,25 +1801,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1812,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2745,7 +2756,7 @@ index 75acb7f497..d87984e544 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1864,146 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1875,146 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
