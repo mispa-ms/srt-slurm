@@ -2283,7 +2283,7 @@ index a8a6c1ca94..552a65c38a 100644
              block.reset_hash()
  
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..94af2dbbc7 100644
+index 767ea00334..80a5da06f0 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -28,6 +28,9 @@ from vllm.v1.request import Request
@@ -2359,7 +2359,7 @@ index 767ea00334..94af2dbbc7 100644
                  curr_hit_length = _new_hit_length
                  for group_id, blocks in zip(group_ids, hit_blocks):
                      hit_blocks_by_group[group_id] = blocks
-@@ -886,6 +931,106 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +931,114 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2433,10 +2433,18 @@ index 767ea00334..94af2dbbc7 100644
 +                        if found:
 +                            probes.append(pos)
 +                    pos += bs
++                # ``gid`` indexes attention_groups, which merge kv cache groups,
++                # so it is not the id the insertion counter reports -- that one
++                # comes off the block hash key. Print the kv ids too, or the two
++                # logs name different groups by the same number. They also say
++                # whether get_cached_block was asked for more than one group: it
++                # returns None unless *every* id hits, so a multi-id group turns
++                # one absent entry into a probe that reads as empty.
 +                logger.info(
-+                    "Mamba store probe (group %d, block=%d): %d of %d block "
-+                    "boundaries are in the pool%s",
++                    "Mamba store probe (attn group %d, kv groups %s, block=%d): "
++                    "%d of %d block boundaries are in the pool%s",
 +                    gid,
++                    list(group.group_ids),
 +                    bs,
 +                    len(probes),
 +                    max_cache_hit_length // bs,
