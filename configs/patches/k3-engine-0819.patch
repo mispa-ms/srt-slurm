@@ -2101,20 +2101,22 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index a8a6c1ca94..a11e17aaac 100644
+index a8a6c1ca94..4f019e46de 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -191,6 +191,9 @@ class BlockPool:
+@@ -191,6 +191,11 @@ class BlockPool:
          self.null_block.is_null = True
  
          self.enable_kv_cache_events = enable_kv_cache_events
 +        self._masked_but_null = 0
 +        self._evicted_total = 0
 +        self._evicted_per_group: dict[int, int] = {}
++        self._recache_total = 0
++        self._recache_dropped: dict[int, int] = {}
          self.kv_event_queue: list[KVCacheEvent] = []
  
          self.metrics_collector = metrics_collector
-@@ -273,6 +276,23 @@ class BlockPool:
+@@ -273,6 +278,23 @@ class BlockPool:
              # like sliding window attention, or Mamba models with prefix-caching
              # in align mode. We skip null blocks here.
              if blk.is_null or (block_mask is not None and not block_mask[i]):
@@ -2138,7 +2140,37 @@ index a8a6c1ca94..a11e17aaac 100644
                  continue
              block_hash = new_block_hashes[i]
              num_hash_tokens = (num_cached_blocks + i + 1) * block_size
-@@ -687,6 +707,33 @@ class BlockPool:
+@@ -288,6 +310,29 @@ class BlockPool:
+                     blk.block_hash_num_tokens is not None
+                     and blk.block_hash_num_tokens < num_hash_tokens
+                 )
++                # A block arriving here with a hash is supposed to be the same
++                # cache block being promoted from partial to full. The
++                # speculative recycle loop in MambaManager breaks that: it moves
++                # a physical block to a later index and nulls the slot it came
++                # from, so caching reaches it again at a new position while it
++                # still carries the hash of the state it held before. The assert
++                # above only checks that the token count grew, which moving
++                # forward always satisfies, so the old entry is dropped in
++                # silence -- no eviction involved, which is why a counter on
++                # _maybe_evict_cached_block stayed at zero.
++                self._recache_dropped[kv_cache_group_id] = (
++                    self._recache_dropped.get(kv_cache_group_id, 0) + 1
++                )
++                self._recache_total += 1
++                if self._recache_total in (1, 10, 100, 1000, 10000, 100000):
++                    logger.info(
++                        "Re-cached a block that still held a hash: %d so far, "
++                        "per group %s; this one %s -> %s tokens",
++                        self._recache_total,
++                        dict(sorted(self._recache_dropped.items())),
++                        blk.block_hash_num_tokens,
++                        num_hash_tokens,
++                    )
+                 removed_hashes = self._remove_cached_block_hashes(blk)
+                 self._emit_block_removed_events(removed_hashes)
+             self._insert_block_hash(
+@@ -687,6 +732,33 @@ class BlockPool:
          Returns:
              True if the block is evicted, False otherwise.
          """
