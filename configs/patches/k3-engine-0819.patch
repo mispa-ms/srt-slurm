@@ -2101,14 +2101,15 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index a8a6c1ca94..552a65c38a 100644
+index a8a6c1ca94..a96ad4eab9 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -191,6 +191,15 @@ class BlockPool:
+@@ -191,6 +191,16 @@ class BlockPool:
          self.null_block.is_null = True
  
          self.enable_kv_cache_events = enable_kv_cache_events
 +        self._masked_but_null = 0
++        self._masked_but_null_per_group: dict[int, int] = {}
 +        self._evicted_total = 0
 +        self._evicted_per_group: dict[int, int] = {}
 +        self._recache_total = 0
@@ -2120,7 +2121,7 @@ index a8a6c1ca94..552a65c38a 100644
          self.kv_event_queue: list[KVCacheEvent] = []
  
          self.metrics_collector = metrics_collector
-@@ -273,6 +282,23 @@ class BlockPool:
+@@ -273,6 +283,34 @@ class BlockPool:
              # like sliding window attention, or Mamba models with prefix-caching
              # in align mode. We skip null blocks here.
              if blk.is_null or (block_mask is not None and not block_mask[i]):
@@ -2135,16 +2136,27 @@ index a8a6c1ca94..552a65c38a 100644
 +                # and still absent from the pool.
 +                if blk.is_null and block_mask is not None and block_mask[i]:
 +                    self._masked_but_null += 1
++                    self._masked_but_null_per_group[kv_cache_group_id] = (
++                        self._masked_but_null_per_group.get(kv_cache_group_id, 0) + 1
++                    )
 +                    if self._masked_but_null in (1, 100, 1000, 10000):
++                        # Per group, because the insertion counter already names
++                        # which one is short -- one Mamba group behind its five
++                        # siblings, and get_cached_block needs all six. This skip
++                        # is the only step between "the mask asked to keep it"
++                        # and the insert, so a deficit that matches here is the
++                        # answer; one that does not moves the question earlier.
 +                        logger.info(
 +                            "cache_full_blocks skipped a block the mask asked "
-+                            "to keep because it was already null (%d such)",
++                            "to keep because it was already null (%d such, "
++                            "per group %s)",
 +                            self._masked_but_null,
++                            dict(sorted(self._masked_but_null_per_group.items())),
 +                        )
                  continue
              block_hash = new_block_hashes[i]
              num_hash_tokens = (num_cached_blocks + i + 1) * block_size
-@@ -288,6 +314,29 @@ class BlockPool:
+@@ -288,6 +326,29 @@ class BlockPool:
                      blk.block_hash_num_tokens is not None
                      and blk.block_hash_num_tokens < num_hash_tokens
                  )
@@ -2174,7 +2186,7 @@ index a8a6c1ca94..552a65c38a 100644
                  removed_hashes = self._remove_cached_block_hashes(blk)
                  self._emit_block_removed_events(removed_hashes)
              self._insert_block_hash(
-@@ -503,6 +552,26 @@ class BlockPool:
+@@ -503,6 +564,26 @@ class BlockPool:
              and block.block_hash_num_tokens is not None
              and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
          ):
@@ -2201,7 +2213,7 @@ index a8a6c1ca94..552a65c38a 100644
              removed_hashes = self._remove_cached_block_hashes(block)
              self._emit_block_removed_events(removed_hashes)
          self._insert_block_hash(
-@@ -610,6 +679,35 @@ class BlockPool:
+@@ -610,6 +691,35 @@ class BlockPool:
          block: KVCacheBlock,
          num_tokens: int | None,
      ) -> None:
@@ -2237,7 +2249,7 @@ index a8a6c1ca94..552a65c38a 100644
          if block.block_hash == block_hash_with_group_id:
              return
  
-@@ -687,6 +785,33 @@ class BlockPool:
+@@ -687,6 +797,33 @@ class BlockPool:
          Returns:
              True if the block is evicted, False otherwise.
          """
@@ -2271,7 +2283,7 @@ index a8a6c1ca94..552a65c38a 100644
          # Clean up metrics tracking first to prevent leaks
          if self.metrics_collector:
              self.metrics_collector.on_block_evicted(block)
-@@ -784,6 +909,10 @@ class BlockPool:
+@@ -784,6 +921,10 @@ class BlockPool:
          self.cached_block_hashes_by_block.clear()
  
          # Remove all hashes from all blocks.
@@ -2283,7 +2295,7 @@ index a8a6c1ca94..552a65c38a 100644
              block.reset_hash()
  
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..80a5da06f0 100644
+index 767ea00334..cbbb7d05f0 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -28,6 +28,9 @@ from vllm.v1.request import Request
@@ -2306,7 +2318,28 @@ index 767ea00334..80a5da06f0 100644
          self.eagle_group_ids: set[int] = {
              i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
          }
-@@ -782,6 +788,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -149,6 +155,20 @@ class KVCacheCoordinator(ABC):
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
+ 
++        # Which kv-cache-group id holds which spec. Every group-level reading so
++        # far has inferred this from block sizes; print it once so it is read.
++        logger.info(
++            "KV cache groups: %s",
++            {
++                i: (
++                    type(g.kv_cache_spec).__name__,
++                    g.kv_cache_spec.block_size,
++                    len(g.layer_names),
++                )
++                for i, g in enumerate(kv_cache_config.kv_cache_groups)
++            },
++        )
++
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+         # 0 = keep only the latest replay boundary; None = dense;
+@@ -782,6 +802,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          num_groups = len(self.kv_cache_config.kv_cache_groups)
          hit_length = max_cache_hit_length
          longest_hit_length = 0
@@ -2314,7 +2347,7 @@ index 767ea00334..80a5da06f0 100644
          hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
          hit_length_by_group: list[int] = [0] * num_groups
  
-@@ -854,6 +861,44 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -854,6 +875,44 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                  elif _new_hit_length < curr_hit_length:
                      # length shrunk; invalidate previous eagle verifications
                      eagle_verified.clear()
@@ -2359,7 +2392,7 @@ index 767ea00334..80a5da06f0 100644
                  curr_hit_length = _new_hit_length
                  for group_id, blocks in zip(group_ids, hit_blocks):
                      hit_blocks_by_group[group_id] = blocks
-@@ -886,6 +931,114 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +945,135 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2422,17 +2455,38 @@ index 767ea00334..80a5da06f0 100644
 +                    continue
 +                mgr = self.single_type_managers[group.group_ids[0]]
 +                bs = mgr.block_size
++                # Per kv-cache-group, not all-or-nothing. get_cached_block
++                # returns a block only when *every* id in group_ids has the
++                # hash, so a probe that passes the whole list cannot say which
++                # one is missing -- and the insertion counts show they do not
++                # move together (1239/1239/1238/1238/1238/1162 at 10k total).
++                # Splitting it turns "nothing is stored" into "these groups have
++                # it and that one does not", which is the difference between a
++                # store that never ran and a store that ran unevenly.
 +                probes = []
++                per_group: dict[int, int] = {gid_: 0 for gid_ in group.group_ids}
 +                pos = bs
 +                while pos <= max_cache_hit_length:
 +                    idx = pos // self.hash_block_size - 1
 +                    if 0 <= idx < len(block_hashes):
++                        for gid_ in group.group_ids:
++                            if self.block_pool.get_cached_block(
++                                block_hashes[idx], [gid_]
++                            ):
++                                per_group[gid_] += 1
 +                        found = self.block_pool.get_cached_block(
 +                            block_hashes[idx], group.group_ids
 +                        )
 +                        if found:
 +                            probes.append(pos)
 +                    pos += bs
++                logger.info(
++                    "Mamba store probe, per kv-cache-group: %s (of %d block "
++                    "boundaries); all-groups-together %d",
++                    dict(sorted(per_group.items())),
++                    max_cache_hit_length // bs,
++                    len(probes),
++                )
 +                # ``gid`` indexes attention_groups, which merge kv cache groups,
 +                # so it is not the id the insertion counter reports -- that one
 +                # comes off the block hash key. Print the kv ids too, or the two
