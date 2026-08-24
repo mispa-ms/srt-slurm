@@ -2295,7 +2295,7 @@ index a8a6c1ca94..a96ad4eab9 100644
              block.reset_hash()
  
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 767ea00334..cbbb7d05f0 100644
+index 767ea00334..2a735c61c7 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -28,6 +28,9 @@ from vllm.v1.request import Request
@@ -2392,7 +2392,7 @@ index 767ea00334..cbbb7d05f0 100644
                  curr_hit_length = _new_hit_length
                  for group_id, blocks in zip(group_ids, hit_blocks):
                      hit_blocks_by_group[group_id] = blocks
-@@ -886,6 +945,135 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -886,6 +945,147 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          cache_hit_blocks = tuple(
              blocks if blocks is not None else [] for blocks in hit_blocks_by_group
          )
@@ -2480,12 +2480,24 @@ index 767ea00334..cbbb7d05f0 100644
 +                        if found:
 +                            probes.append(pos)
 +                    pos += bs
++                # The reader's key at the same position the writer logs, so
++                # the two can be compared directly rather than inferred equal.
++                # 122,880 is fine index 959; the writer prints the first eight
++                # bytes of the hash it registered for block 79.
++                probe_idx = 122880 // self.hash_block_size - 1
++                reader_key = (
++                    bytes(block_hashes[probe_idx])[:8].hex()
++                    if 0 <= probe_idx < len(block_hashes)
++                    else "out-of-range"
++                )
 +                logger.info(
 +                    "Mamba store probe, per kv-cache-group: %s (of %d block "
-+                    "boundaries); all-groups-together %d",
++                    "boundaries); all-groups-together %d; reader key at "
++                    "122,880 is %s",
 +                    dict(sorted(per_group.items())),
 +                    max_cache_hit_length // bs,
 +                    len(probes),
++                    reader_key,
 +                )
 +                # ``gid`` indexes attention_groups, which merge kv cache groups,
 +                # so it is not the id the insertion counter reports -- that one
@@ -2573,7 +2585,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..18f592b2a2 100644
+index 75acb7f497..90327b6f48 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2637,7 +2649,7 @@ index 75acb7f497..18f592b2a2 100644
          self.block_pool.cache_full_blocks(
              request=request,
              blocks=self.req_to_blocks[request.request_id],
-@@ -471,6 +511,56 @@ class SingleTypeKVCacheManager(ABC):
+@@ -471,6 +511,63 @@ class SingleTypeKVCacheManager(ABC):
              block_mask=block_mask,
          )
  
@@ -2689,12 +2701,19 @@ index 75acb7f497..18f592b2a2 100644
 +                    marked,
 +                    found,
 +                    [b for b in marked if b < len(blocks) and blocks[b].is_null],
++                    # The key itself. Registration is now observed to work on a
++                    # single request -- block 79 marked, written and present one
++                    # line after the write -- and no removal path fires, yet a
++                    # later lookup finds nothing. The remaining possibility is
++                    # that the reader asks for a different key, so print the
++                    # bytes the writer used.
++                    [bytes(hashes[b])[:8].hex() for b in marked if b < len(hashes)],
 +                )
 +
          self.num_cached_block[request.request_id] = num_full_blocks
  
      @classmethod
-@@ -1722,25 +1812,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1819,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2756,7 +2775,7 @@ index 75acb7f497..18f592b2a2 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1875,146 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1882,148 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
@@ -2792,13 +2811,14 @@ index 75acb7f497..18f592b2a2 100644
 +        marked: list[int],
 +        found: list[int],
 +        null_marked: list[int],
++        keys: list[str],
 +    ) -> None:
 +        if cls._rb_left <= 0:
 +            return
 +        cls._rb_left -= 1
 +        logger.info(
 +            "Mamba readback req=%s group=%d prompt=%d computed=%d | marked %s "
-+            "| in-pool right after the write %s | marked-but-null %s",
++            "| in-pool right after the write %s | marked-but-null %s | keys %s",
 +            request_id[:12],
 +            group_id,
 +            num_prompt,
@@ -2806,6 +2826,7 @@ index 75acb7f497..18f592b2a2 100644
 +            marked,
 +            found,
 +            null_marked,
++            keys,
 +        )
 +
 +    @classmethod
