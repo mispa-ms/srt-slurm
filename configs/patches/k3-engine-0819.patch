@@ -2101,10 +2101,10 @@ index f1166695fd..6453c5641d 100644
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index a8a6c1ca94..4f019e46de 100644
+index a8a6c1ca94..a0c1abc68e 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -191,6 +191,11 @@ class BlockPool:
+@@ -191,6 +191,13 @@ class BlockPool:
          self.null_block.is_null = True
  
          self.enable_kv_cache_events = enable_kv_cache_events
@@ -2113,10 +2113,12 @@ index a8a6c1ca94..4f019e46de 100644
 +        self._evicted_per_group: dict[int, int] = {}
 +        self._recache_total = 0
 +        self._recache_dropped: dict[int, int] = {}
++        self._partial_total = 0
++        self._partial_dropped: dict[int, int] = {}
          self.kv_event_queue: list[KVCacheEvent] = []
  
          self.metrics_collector = metrics_collector
-@@ -273,6 +278,23 @@ class BlockPool:
+@@ -273,6 +280,23 @@ class BlockPool:
              # like sliding window attention, or Mamba models with prefix-caching
              # in align mode. We skip null blocks here.
              if blk.is_null or (block_mask is not None and not block_mask[i]):
@@ -2140,7 +2142,7 @@ index a8a6c1ca94..4f019e46de 100644
                  continue
              block_hash = new_block_hashes[i]
              num_hash_tokens = (num_cached_blocks + i + 1) * block_size
-@@ -288,6 +310,29 @@ class BlockPool:
+@@ -288,6 +312,29 @@ class BlockPool:
                      blk.block_hash_num_tokens is not None
                      and blk.block_hash_num_tokens < num_hash_tokens
                  )
@@ -2170,7 +2172,34 @@ index a8a6c1ca94..4f019e46de 100644
                  removed_hashes = self._remove_cached_block_hashes(blk)
                  self._emit_block_removed_events(removed_hashes)
              self._insert_block_hash(
-@@ -687,6 +732,33 @@ class BlockPool:
+@@ -503,6 +550,26 @@ class BlockPool:
+             and block.block_hash_num_tokens is not None
+             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+         ):
++            # The other site that drops a live entry, and the one the mask
++            # cannot gate: _cache_partial_tail_block calls this from outside
++            # cache_full_blocks' loop, so it fires whatever retention is set to.
++            # That fits what the hit rates say -- dense removes the mask and
++            # should make the gated site (cache_full_blocks) fire *more*, yet
++            # dense raises the hit rate from 22.7% to 49.1%. A deletion channel
++            # that does not grow with dense is the better candidate.
++            self._partial_dropped[kv_cache_group_id] = (
++                self._partial_dropped.get(kv_cache_group_id, 0) + 1
++            )
++            self._partial_total += 1
++            if self._partial_total in (1, 10, 100, 1000, 10000, 100000):
++                logger.info(
++                    "Partial-tail cache dropped a live entry: %d so far, per "
++                    "group %s; this one %s -> %s tokens",
++                    self._partial_total,
++                    dict(sorted(self._partial_dropped.items())),
++                    block.block_hash_num_tokens,
++                    num_hash_blocks * self.hash_block_size,
++                )
+             removed_hashes = self._remove_cached_block_hashes(block)
+             self._emit_block_removed_events(removed_hashes)
+         self._insert_block_hash(
+@@ -687,6 +754,33 @@ class BlockPool:
          Returns:
              True if the block is evicted, False otherwise.
          """
@@ -2204,6 +2233,17 @@ index a8a6c1ca94..4f019e46de 100644
          # Clean up metrics tracking first to prevent leaks
          if self.metrics_collector:
              self.metrics_collector.on_block_evicted(block)
+@@ -784,6 +878,10 @@ class BlockPool:
+         self.cached_block_hashes_by_block.clear()
+ 
+         # Remove all hashes from all blocks.
++        # A global wipe empties every group at once, which is the shape of
++        # '0 of 85 boundaries in the pool'. Never confirmed to fire here; one
++        # line rules it in or out.
++        logger.info("reset_prefix_cache: wiping the whole prefix cache")
+         for block in self.blocks:
+             block.reset_hash()
+ 
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
 index 767ea00334..94af2dbbc7 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
