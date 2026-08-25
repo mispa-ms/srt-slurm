@@ -59,27 +59,46 @@ if "[emptycache]" in src:
     print("[emptycache] already applied: " + target)
     sys.exit(0)
 
-anchor = "                self.speculator.load_model(self.model)"
-if src.count(anchor) != 1:
+# Match the call on its own line at whatever indent it sits at, and build the
+# insertion to match. The anchor used to be hard-coded at 16 spaces, which was right
+# for 728d3ad but silently wrong on a newer nightly: there the call moved inside
+#
+#     if isinstance(self.speculator, DraftModelSpeculator):
+#         with use_workspace_lane(self._draft_workspace_lane):
+#             self.speculator.load_model(self.model)
+#
+# so the 16-space anchor matched the tail of a 20-space line, str.replace spliced the
+# block in at the wrong depth, and the `with` was left with an empty body --
+# IndentationError at import, after the job had already spent eleven minutes.
+CALL = "self.speculator.load_model(self.model)"
+hits = [ln for ln in src.splitlines() if ln.strip() == CALL]
+if len(hits) != 1:
     sys.exit(
-        "[emptycache] FATAL: anchor found %d times in %s" % (src.count(anchor), target)
+        "[emptycache] FATAL: found %d lines calling the speculator loader in %s; "
+        "the load path moved and this patch needs re-deriving" % (len(hits), target)
     )
+anchor = hits[0]
+pad = anchor[: len(anchor) - len(anchor.lstrip())]
 
-addition = """                # [emptycache] The draft model's MLA allocates its own direct-DCP
-                # symmetric-memory workspace, which comes from the driver rather
-                # than the caching allocator. After the target weights load, the
-                # loader's freed staging buffers leave the driver with nothing.
-                free_before, total = torch.cuda.mem_get_info()
-                torch.cuda.empty_cache()
-                free_after, _ = torch.cuda.mem_get_info()
-                logger.info(
-                    "[emptycache] driver-visible free before draft load: "
-                    "%.2f -> %.2f GiB of %.2f GiB",
-                    free_before / 2**30, free_after / 2**30, total / 2**30,
-                )
-""" + anchor
+addition = "\n".join(
+    pad + line if line else ""
+    for line in [
+        "# [emptycache] The draft model's MLA allocates its own direct-DCP",
+        "# symmetric-memory workspace, which comes from the driver rather",
+        "# than the caching allocator. After the target weights load, the",
+        "# loader's freed staging buffers leave the driver with nothing.",
+        "free_before, total = torch.cuda.mem_get_info()",
+        "torch.cuda.empty_cache()",
+        "free_after, _ = torch.cuda.mem_get_info()",
+        'logger.info(',
+        '    "[emptycache] driver-visible free before draft load: "',
+        '    "%.2f -> %.2f GiB of %.2f GiB",',
+        "    free_before / 2**30, free_after / 2**30, total / 2**30,",
+        ")",
+    ]
+) + "\n" + anchor
 
-patched = src.replace(anchor, addition)
+patched = src.replace(anchor, addition, 1)
 compile(patched, target, "exec")
 open(target, "w").write(patched)
 print("[emptycache] applied: " + target)
