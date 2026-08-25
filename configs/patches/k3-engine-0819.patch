@@ -2618,7 +2618,7 @@ index e4a2132866..9070e3ef61 100644
                  req_num_computed_tokens + self.block_size - 1
              ) // self.block_size
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75acb7f497..fc8437e61c 100644
+index 75acb7f497..9320fde074 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,7 @@ from collections import defaultdict
@@ -2644,7 +2644,7 @@ index 75acb7f497..fc8437e61c 100644
      """
      An abstract base class for a manager that handle the kv cache management
      logic of one specific type of attention layer.
-@@ -415,7 +422,40 @@ class SingleTypeKVCacheManager(ABC):
+@@ -415,7 +422,47 @@ class SingleTypeKVCacheManager(ABC):
          """
          req_blocks = self.req_to_blocks[request_id]
          assert block_idx < len(req_blocks)
@@ -2660,6 +2660,13 @@ index 75acb7f497..fc8437e61c 100644
 +            # than killing the engine, and count it: the rate decides whether
 +            # preserving the partial hit is worth a real fix.
 +            held = req_blocks[block_idx]
++            if not held.is_null:
++                # Overwriting the slot drops this request's reference to
++                # whatever sits there. The null block is shared and carries no
++                # per-request reference, but a real block would never come back
++                # to the pool -- the assertion this replaced at least made that
++                # loud.
++                self.block_pool.free_blocks([held])
 +            SingleTypeKVCacheManager._cow_slot_mismatches += 1
 +            if SingleTypeKVCacheManager._cow_slot_mismatches in (
 +                1,
@@ -2686,7 +2693,7 @@ index 75acb7f497..fc8437e61c 100644
          assert not source_block.is_null and source_block.ref_cnt > 0
          req_blocks[block_idx] = cow_block
          self._pending_cow_copies.append((source_block, cow_block))
-@@ -460,7 +500,45 @@ class SingleTypeKVCacheManager(ABC):
+@@ -460,7 +507,45 @@ class SingleTypeKVCacheManager(ABC):
              use_eagle=self.use_eagle,
              retention_interval=retention_interval,
              reachable_boundaries=reachable_boundaries,
@@ -2732,7 +2739,7 @@ index 75acb7f497..fc8437e61c 100644
          self.block_pool.cache_full_blocks(
              request=request,
              blocks=self.req_to_blocks[request.request_id],
-@@ -471,6 +549,78 @@ class SingleTypeKVCacheManager(ABC):
+@@ -471,6 +556,78 @@ class SingleTypeKVCacheManager(ABC):
              block_mask=block_mask,
          )
  
@@ -2811,7 +2818,7 @@ index 75acb7f497..fc8437e61c 100644
          self.num_cached_block[request.request_id] = num_full_blocks
  
      @classmethod
-@@ -483,6 +633,7 @@ class SingleTypeKVCacheManager(ABC):
+@@ -483,6 +640,7 @@ class SingleTypeKVCacheManager(ABC):
          use_eagle: bool,
          retention_interval: int | None = None,
          reachable_boundaries: Sequence[int] = (),
@@ -2819,7 +2826,7 @@ index 75acb7f497..fc8437e61c 100644
      ) -> list[bool] | None:
          """Per-block mask for ``cache_full_blocks``. ``None`` means cache
          every (non-null) block — the default for full attention.
-@@ -1008,6 +1159,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+@@ -1008,6 +1166,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
          use_eagle: bool,
          retention_interval: int | None = None,
          reachable_boundaries: Sequence[int] = (),
@@ -2827,7 +2834,7 @@ index 75acb7f497..fc8437e61c 100644
      ) -> list[bool] | None:
          assert isinstance(kv_cache_spec, SlidingWindowSpec)
          if alignment_tokens is None:
-@@ -1380,6 +1532,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1380,6 +1539,7 @@ class MambaManager(SingleTypeKVCacheManager):
          use_eagle: bool,
          retention_interval: int | None = None,
          reachable_boundaries: Sequence[int] = (),
@@ -2835,7 +2842,19 @@ index 75acb7f497..fc8437e61c 100644
      ) -> list[bool] | None:
          """Sparse Mamba state-snapshot retention.
  
-@@ -1398,34 +1551,46 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1392,40 +1552,64 @@ class MambaManager(SingleTypeKVCacheManager):
+         ``reachable_boundaries`` are proven reuse points (the replay boundary and
+         any cross-request shared-prefix junction, Marconi-style APC); their
+         boundary state is always kept so sparse retention does not defeat reuse.
++
++        ``num_tokens`` is the chunk end this call is caching at, and it is what
++        names the one block holding a state. A caller that cannot supply it --
++        the mooncake store coordinator filters blocks it already holds, with no
++        chunk in hand -- gets dense, because an empty mask there would silently
++        stop the tier from keeping any mamba block at all.
+         """
+         if retention_interval is None or alignment_tokens is None:
+             # Dense caching (default) or no alignment constraint imposed.
              return None
          assert isinstance(kv_cache_spec, MambaSpec)
          block_size = kv_cache_spec.block_size
@@ -2877,7 +2896,13 @@ index 75acb7f497..fc8437e61c 100644
 +        # it as null. Measured on Kimi-K3: chunk ends ran ..., 115,200, 129,024,
 +        # 130,944, a 13,824-token step straight over the boundary that rounding
 +        # designated (122,880), and half the requests cached no full block.
-+        if num_tokens is None or num_tokens % block_size:
++        if num_tokens is None:
++            # No chunk to name a block with: keep everything rather than
++            # nothing. Returning the empty mask here stopped the mooncake store
++            # coordinator, which filters blocks it already holds, from retaining
++            # any mamba block.
++            return None
++        if num_tokens % block_size:
 +            # A chunk ending mid-block leaves no full block holding a state.
 +            return mask
 +        state_block = end_block - 1
@@ -2907,7 +2932,7 @@ index 75acb7f497..fc8437e61c 100644
          return mask
  
      def remove_skipped_blocks(
-@@ -1722,25 +1887,50 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1722,25 +1906,50 @@ class MambaManager(SingleTypeKVCacheManager):
          num_tokens: int,
      ) -> BlockHashWithGroupId | None:
          hash_block_size = self.block_pool.hash_block_size
@@ -2969,7 +2994,7 @@ index 75acb7f497..fc8437e61c 100644
  
          partial_hash = self.block_pool.cache_partial_block(
              request=request,
-@@ -1760,6 +1950,171 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1760,6 +1969,171 @@ class MambaManager(SingleTypeKVCacheManager):
          return partial_hash
  
  
