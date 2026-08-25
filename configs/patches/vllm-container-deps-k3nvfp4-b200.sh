@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Kimi-K3-NVFP4 on B200: JET checkpoint, vLLM PR #53324, and the DCP dummy-batch fix.
+# Kimi-K3-NVFP4 on B200: JET checkpoint plus the DCP dummy-batch fix.
 # =============================================================================
-# The NVFP4 counterpart of vllm-container-deps-k3-b200-dcp8.sh. Three things before
-# the server starts, and one deliberate omission.
+# The NVFP4 counterpart of vllm-container-deps-k3-b200-dcp8.sh. Two things before the
+# server starts, and two deliberate omissions.
 #
-#   1. vllm-container-deps-k3nvfp4-pr53324.sh, which itself chains the NVFP4 HF cache
-#      shim. That resolves nvidia/Kimi-K3-NVFP4 to the JET copy mounted at
-#      /jet-k3nvfp4 instead of pulling 1.6 TB inside the job, and applies vLLM
-#      PR #53324 (MooncakeStore with hybrid DCP prefix caching) -- still not merged
-#      upstream as of main@80771bbb, and we run Mooncake with DCP8.
+#   1. vllm-container-deps-k3nvfp4-hfshim.sh, which resolves nvidia/Kimi-K3-NVFP4 to
+#      the JET copy mounted at /jet-k3nvfp4 instead of pulling 1.6 TB inside the job.
 #
 #   2. The DCP dummy-batch fix, inlined below. make_dummy() leaves
 #      dcp_local_seq_lens unset while the MLA metadata builder swaps it in for
@@ -25,11 +22,19 @@
 #
 #   patch                      728d3ad (Xin's branch)   nightly @ main
 #   NVFP4 hfshim               needed                   needed
-#   PR #53324                  needed                   needed
 #   dcp_local_seq_lens dummy   already present          absent, applied here
 #
 #   Both paths are idempotent -- the marker check below prints and exits rather than
 #   patching twice -- so the same script is correct on either image.
+#
+# NOT INCLUDED: vLLM PR #53324, MooncakeStore with hybrid DCP prefix caching. The GB300
+#   NVFP4 arm carries it because Wei Zhao runs it for nvfp4 + trtllm-moe + dep16, but the
+#   diff was taken against his base and does not apply to this image -- the first attempt
+#   died with "no applier succeeded (git apply, patch, patch-ng)" against
+#   0.1.dev19908+g728d3ad09. It is also not something this stack has been shown to need:
+#   every MXFP4 arm on this workstream runs Mooncake with DCP8 without it. If NVFP4
+#   surfaces the Mooncake -7 the PR fixes, re-derive the diff against the image actually
+#   in use and add it back here.
 #
 # NOT INCLUDED: the empty_cache() before the draft load. That is a DSpark requirement
 #   and these are no-spec arms; nothing builds a drafter, so the symm_mem workspace it
@@ -37,7 +42,7 @@
 # =============================================================================
 set -euo pipefail
 
-bash /configs/patches/vllm-container-deps-k3nvfp4-pr53324.sh
+bash /configs/patches/vllm-container-deps-k3nvfp4-hfshim.sh
 
 echo "=== k3nvfp4-b200: applying the DCP dummy-batch fix ==="
 
