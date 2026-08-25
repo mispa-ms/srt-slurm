@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Telemetry configuration helpers."""
+"""Tachometer configuration helpers."""
 
 from __future__ import annotations
 
@@ -10,11 +10,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from srtctl.core.slurm import get_hostname_ip
+from srtctl.ports import FRONTEND_PUBLIC_PORT
 
 if TYPE_CHECKING:
     from srtctl.cli.mixins.frontend_stage import FrontendTopology
     from srtctl.core.runtime import RuntimeContext
-    from srtctl.core.schema import TelemetryConfig
+    from srtctl.core.schema import TachometerConfig, TelemetryExporterConfig
     from srtctl.core.topology import Process
 
 
@@ -30,20 +31,18 @@ class TelemetryEndpoint:
     gpu_metadata: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-def generate_telemetry_config(
+def generate_tachometer_config(
     *,
     processes: list[Process],
     frontend_topology: FrontendTopology,
     runtime: RuntimeContext,
-    telemetry: TelemetryConfig,
+    tachometer: TachometerConfig,
+    dcgm_exporter: TelemetryExporterConfig | None = None,
     frontend_type: str = "dynamo",
 ) -> str:
-    """Generate telemetry TOML from backend and frontend topology."""
-    dcgm_exporter = telemetry.dcgm_exporter
-    node_exporter = telemetry.node_exporter
-    if dcgm_exporter is None or node_exporter is None:
-        raise ValueError("Telemetry exporters must be configured before generating telemetry config")
-
+    """Generate Tachometer TOML from backend and frontend topology."""
+    dcgm_exporter = dcgm_exporter or tachometer.dcgm_exporter
+    node_exporter = tachometer.node_exporter
     endpoints: list[TelemetryEndpoint] = []
     physical_nodes: dict[str, list[Process]] = {}
     for process in processes:
@@ -52,7 +51,7 @@ def generate_telemetry_config(
     for node in sorted(physical_nodes):
         node_processes = physical_nodes[node]
         node_metadata = {"hostname": node, "job_id": runtime.job_id, "run_name": runtime.run_name}
-        node_metadata.update(telemetry.extra_metadata)
+        node_metadata.update(tachometer.extra_metadata)
 
         gpu_metadata: dict[str, dict[str, str]] = {}
         for process in node_processes:
@@ -63,61 +62,75 @@ def generate_telemetry_config(
                     "worker_role": process.endpoint_mode,
                 }
 
-        endpoints.append(
-            TelemetryEndpoint(
-                name=f"dcgm_{node}",
-                url=f"http://{node}:{dcgm_exporter.port}/metrics",
-                frequency=telemetry.default_frequency,
-                filter="dcgm",
-                node_metadata=node_metadata,
-                gpu_metadata=gpu_metadata,
+        if dcgm_exporter is not None:
+            endpoints.append(
+                TelemetryEndpoint(
+                    name=f"dcgm_{node}",
+                    url=f"http://{node}:{dcgm_exporter.port}/metrics",
+                    frequency=tachometer.default_frequency,
+                    filter="dcgm",
+                    node_metadata=node_metadata,
+                    gpu_metadata=gpu_metadata,
+                )
             )
-        )
-        endpoints.append(
-            TelemetryEndpoint(
-                name=f"node_exporter_{node}",
-                url=f"http://{node}:{node_exporter.port}/metrics",
-                frequency=telemetry.default_frequency,
-                filter="node_exporter",
-                node_metadata=node_metadata,
+        if node_exporter is not None:
+            endpoints.append(
+                TelemetryEndpoint(
+                    name=f"node_exporter_{node}",
+                    url=f"http://{node}:{node_exporter.port}/metrics",
+                    frequency=tachometer.default_frequency,
+                    filter="node_exporter",
+                    node_metadata=node_metadata,
+                )
             )
-        )
 
     for process in sorted(processes, key=lambda p: (p.endpoint_mode, p.endpoint_index, p.node_rank, p.node)):
+        if frontend_type == "vllm" and process.endpoint_mode == "agg" and not process.is_leader:
+            continue
         node_ip = get_hostname_ip(process.node, runtime.network_interface)
-        port = process.http_port if frontend_type == "vllm" else process.sys_port
+        port = FRONTEND_PUBLIC_PORT if frontend_type == "vllm" and process.endpoint_mode == "agg" else process.sys_port
         node_metadata = {
             "hostname": process.node,
             "worker_index": str(process.endpoint_index),
             "worker_process": str(process.node_rank),
             "worker_role": process.endpoint_mode,
         }
-        node_metadata.update(telemetry.extra_metadata)
+        node_metadata.update(tachometer.extra_metadata)
         endpoints.append(
             TelemetryEndpoint(
                 name=f"backend_{process.endpoint_mode}{process.endpoint_index}_rank{process.node_rank}",
                 url=f"http://{node_ip}:{port}/metrics",
-                frequency=telemetry.default_frequency,
+                frequency=tachometer.default_frequency,
                 filter="backend",
                 node_metadata=node_metadata,
             )
         )
 
-    # Direct vLLM is an embedded frontend: its aggregate backend entry above is
-    # already the public /metrics endpoint, so do not scrape it a second time.
-    frontend_nodes = [] if frontend_type == "vllm" else frontend_topology.frontend_nodes
+    frontend_nodes = frontend_topology.frontend_nodes
+    if frontend_type == "vllm":
+        # Direct vLLM has no separate frontend process. Its public endpoint is
+        # the aggregate leader, which may differ from the Slurm/orchestrator
+        # head recorded in FrontendTopology.
+        agg_leader_nodes = [
+            process.node
+            for process in sorted(processes, key=lambda p: (p.endpoint_index, p.node_rank, p.node))
+            if process.endpoint_mode == "agg" and process.is_leader
+        ]
+        if agg_leader_nodes:
+            frontend_nodes = list(dict.fromkeys(agg_leader_nodes))
+
     for frontend_index, node in enumerate(frontend_nodes):
         node_ip = get_hostname_ip(node, runtime.network_interface)
         node_metadata = {
             "frontend_index": str(frontend_index),
             "hostname": node,
         }
-        node_metadata.update(telemetry.extra_metadata)
+        node_metadata.update(tachometer.extra_metadata)
         endpoints.append(
             TelemetryEndpoint(
                 name=f"frontend{frontend_index}",
                 url=f"http://{node_ip}:{frontend_topology.frontend_port}/metrics",
-                frequency=telemetry.default_frequency,
+                frequency=tachometer.default_frequency,
                 filter="frontend",
                 node_metadata=node_metadata,
             )
@@ -125,7 +138,7 @@ def generate_telemetry_config(
 
     return _dump_toml(
         endpoints=endpoints,
-        storage=f"/logs/{telemetry.storage_subdir}",
+        storage=str(runtime.log_dir / tachometer.storage_subdir),
     )
 
 

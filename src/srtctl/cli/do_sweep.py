@@ -323,7 +323,7 @@ class SweepOrchestrator(
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
-        logger.info("Frontend URL: http://%s:%d", self.runtime.nodes.head, FRONTEND_PUBLIC_PORT)
+        logger.info("Frontend URL: http://%s:%d", self._public_api_node(), FRONTEND_PUBLIC_PORT)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -473,7 +473,7 @@ class SweepOrchestrator(
             return
         except ImportError:
             logger.debug("huggingface_hub not installed on host, will use container to check/download")
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.debug("Model '%s' not fully cached, will pre-download", model_id)
 
         download_node = self.runtime.nodes.worker[0]
@@ -492,16 +492,18 @@ class SweepOrchestrator(
         download_cmd = [
             "bash",
             "-c",
-            f"export HF_HOME={q_hf_home}; "
-            f"find {q_hf_home} -name '*.lock' -mmin +30 -delete 2>/dev/null; "
-            f"DL_CMD='hf download'; "
-            f"command -v hf >/dev/null 2>&1 || DL_CMD='huggingface-cli download'; "
-            f"if HF_HUB_OFFLINE=1 $DL_CMD {q_model_id} --quiet 2>/dev/null; then "
-            f"echo 'Model already cached'; "
-            f"else "
-            f"echo 'Downloading model...'; "
-            f"$DL_CMD {q_model_id} --quiet; "
-            f"fi",
+            (
+                f"export HF_HOME={q_hf_home}; "
+                f"find {q_hf_home} -name '*.lock' -mmin +30 -delete 2>/dev/null; "
+                f"DL_CMD='hf download'; "
+                f"command -v hf >/dev/null 2>&1 || DL_CMD='huggingface-cli download'; "
+                f"if HF_HUB_OFFLINE=1 $DL_CMD {q_model_id} --quiet 2>/dev/null; then "
+                f"echo 'Model already cached'; "
+                f"else "
+                f"echo 'Downloading model...'; "
+                f"$DL_CMD {q_model_id} --quiet; "
+                f"fi"
+            ),
         ]
 
         download_log = self.runtime.log_dir / "model_download.out"
@@ -561,7 +563,7 @@ class SweepOrchestrator(
             hc = self.config.health_check
             logger.info("EVAL_ONLY: Waiting for server health before eval...")
             if not wait_for_model(
-                host=self.runtime.nodes.head,
+                host=self._public_api_node(),
                 port=FRONTEND_PUBLIC_PORT,
                 n_prefill=n_prefill,
                 n_decode=n_decode,
@@ -574,7 +576,7 @@ class SweepOrchestrator(
                 logger.error("Server did not become healthy for eval")
                 return 1
         else:
-            if not wait_for_port(self.runtime.nodes.head, FRONTEND_PUBLIC_PORT, timeout=30):
+            if not wait_for_port(self._public_api_node(), FRONTEND_PUBLIC_PORT, timeout=30):
                 logger.error("Server health check failed before eval - skipping")
                 return 1
 
@@ -725,8 +727,17 @@ class SweepOrchestrator(
             for proc in frontend_procs:
                 registry.add_process(proc)
 
-            telemetry_procs = self.start_telemetry()
-            for proc in telemetry_procs:
+            if self.config.telemetry.enabled:
+                if os.environ.get("EVAL_ONLY", "false").lower() == "true":
+                    # Eval-only runs skip the benchmark stage, so every expected
+                    # measurement window would be missing and required telemetry
+                    # would fail an otherwise successful evaluation.
+                    logger.info("EVAL_ONLY=true: skipping dcgm-power telemetry (no benchmark to measure)")
+                else:
+                    self.start_power_telemetry(registry)
+
+            tachometer_procs = self.start_tachometer()
+            for proc in tachometer_procs:
                 registry.add_process(proc)
 
             self._print_connection_info()
@@ -739,6 +750,10 @@ class SweepOrchestrator(
                     logger.error("Eval-only evaluation failed with exit code %d", exit_code)
                 else:
                     logger.info("Eval-only evaluation completed successfully")
+            elif self.power_telemetry_blocks_benchmark():
+                logger.error("Required power telemetry failed startup - skipping the formal benchmark")
+                reporter.report(JobStatus.FAILED, JobStage.BENCHMARK, "Required power telemetry failed startup")
+                exit_code = 1
             else:
                 # Stage 4: Benchmark (status reported AFTER health check passes)
                 exit_code = self.run_benchmark(registry, stop_event, reporter)
@@ -754,12 +769,14 @@ class SweepOrchestrator(
                         logger.info("Post-benchmark eval completed successfully")
 
         except Exception as e:
-            logger.exception("Error during sweep: %s", e)
+            logger.exception("Error during sweep")
             reporter.report(JobStatus.FAILED, JobStage.CLEANUP, str(e))
             exit_code = 1
 
         finally:
             logger.info("Cleanup")
+            # NOTE: finalize before registry.cleanup() so samples and manifest are durable.
+            exit_code = self.finalize_power_telemetry(exit_code, interrupted=stop_event.is_set())
             stop_event.set()
             registry.cleanup()
             if exit_code != 0:
@@ -813,8 +830,8 @@ def main():
 
         sys.exit(exit_code)
 
-    except Exception as e:
-        logger.exception("Fatal error: %s", e)
+    except Exception:
+        logger.exception("Fatal error")
         sys.exit(1)
 
 
