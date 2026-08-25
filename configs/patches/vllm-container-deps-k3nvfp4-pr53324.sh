@@ -88,10 +88,43 @@ if n != 8:
     sys.exit(f"[filter] FATAL: expected 8 vllm/ files, got {n} — the PR changed shape")
 PY
 
+# git apply first: it is the applier the diff was checked against before submission,
+# and the only one that reports which hunk failed. The image ships neither git nor
+# patch, so install whichever is missing -- the benchmark stage already apt-gets git
+# in these containers, so the index is reachable.
+if ! command -v git >/dev/null 2>&1 || ! command -v patch >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq git patch >/dev/null 2>&1 || true
+fi
+
 applied=0
-if python3 -m pip install --quiet --disable-pip-version-check patch-ng 2>/dev/null; then
+
+# Run from $SITE, not `git -C $SITE`: -C makes git treat it as a repository and it is
+# not one, which fails before the patch is even read. Plain `git apply` in a non-repo
+# directory patches files in place, which is what we want.
+if [[ "$applied" -eq 0 ]] && command -v git >/dev/null 2>&1; then
+    echo "[k3nvfp4-pr$PR_NUM] trying git apply"
+    if (cd "$SITE" && git apply --check -p1 -v "$DIFF") && (cd "$SITE" && git apply -p1 "$DIFF"); then
+        applied=1
+        echo "[k3nvfp4-pr$PR_NUM] applied with git apply"
+    fi
+fi
+
+if [[ "$applied" -eq 0 ]] && command -v patch >/dev/null 2>&1; then
+    echo "[k3nvfp4-pr$PR_NUM] trying patch -p1"
+    if (cd "$SITE" && patch -p1 --forward --batch < "$DIFF"); then
+        applied=1
+        echo "[k3nvfp4-pr$PR_NUM] applied with patch"
+    fi
+fi
+
+if [[ "$applied" -eq 0 ]] && python3 -m pip install --quiet --disable-pip-version-check patch-ng 2>/dev/null; then
+    echo "[k3nvfp4-pr$PR_NUM] trying patch-ng"
     if python3 - "$DIFF" "$SITE" <<'PY'
-import sys, patch_ng
+import logging, sys, patch_ng
+# patch-ng reports every failure through this logger and configures no handler of
+# its own, so without this an unapplied hunk is a bare False and nothing else.
+logging.basicConfig(level=logging.DEBUG, format="[patch-ng] %(levelname)s %(message)s")
 ps = patch_ng.fromfile(sys.argv[1])
 if not ps:
     sys.exit("[patch-ng] could not parse the diff")
@@ -103,16 +136,10 @@ PY
     fi
 fi
 
-if [[ "$applied" -eq 0 ]] && command -v git >/dev/null 2>&1; then
-    if git -C "$SITE" apply -p1 --unsafe-paths --directory=. "$DIFF"; then
-        applied=1
-        echo "[k3nvfp4-pr$PR_NUM] applied with git apply"
-    fi
-fi
-
 if [[ "$applied" -eq 0 ]]; then
-    echo "[k3nvfp4-pr$PR_NUM] FATAL: no applier succeeded (patch-ng, git apply)." >&2
-    echo "[k3nvfp4-pr$PR_NUM] The container's vLLM has most likely drifted from the PR base." >&2
+    echo "[k3nvfp4-pr$PR_NUM] FATAL: no applier succeeded (git apply, patch, patch-ng)." >&2
+    echo "[k3nvfp4-pr$PR_NUM] Installed vLLM: $(python3 -c 'import vllm; print(vllm.__version__)' 2>&1)" >&2
+    echo "[k3nvfp4-pr$PR_NUM] Expected the tree of the commit the image tag names." >&2
     exit 1
 fi
 
