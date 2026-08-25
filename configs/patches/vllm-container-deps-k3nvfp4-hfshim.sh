@@ -50,10 +50,21 @@ FALLBACK_SHA="f8c5234a0a880bcc6cbf779a315e7ee2f405b812"
 
 echo "=== k3nvfp4-hfshim: wiring HF cache to the JET checkpoint ==="
 
+# HF_HOME is set in the recipe's aggregated_environment, but it does not always reach
+# this script: three GB300 runs (oci-aga 566436, lyris 2788759, and 64537688) died here
+# with it empty while the patched config plainly carried it. Rather than block on that,
+# fall back to the directory an env-less huggingface_hub would use anyway -- the point
+# is that the worker and this script agree on where the cache is, not that the recipe
+# was the one to say so. Loud, because a run that silently used the wrong cache would
+# be worse than one that stopped.
 if [[ -z "${HF_HOME:-}" ]]; then
-    echo "[k3nvfp4-hfshim] FATAL: HF_HOME is not set; cannot place the cache entry." >&2
-    exit 1
+    export HF_HOME="${HOME:-/root}/.cache/huggingface"
+    echo "[k3nvfp4-hfshim] WARNING: HF_HOME was not in this script's environment." >&2
+    echo "[k3nvfp4-hfshim] WARNING: falling back to $HF_HOME, which is where a worker" >&2
+    echo "[k3nvfp4-hfshim] WARNING: without HF_HOME will look. The recipe sets HF_HOME;" >&2
+    echo "[k3nvfp4-hfshim] WARNING: that it is missing here is a separate bug worth chasing." >&2
 fi
+mkdir -p "$HF_HOME"
 
 if [[ ! -d "$STAGED_DIR" ]]; then
     echo "[k3nvfp4-hfshim] FATAL: checkpoint not found at $STAGED_DIR" >&2
