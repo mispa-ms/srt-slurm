@@ -44,6 +44,35 @@ set -euo pipefail
 
 bash /configs/patches/vllm-container-deps-k3nvfp4-hfshim.sh
 
+echo "=== k3nvfp4-b200: NVFP4 checkpoint support in the loader ==="
+
+# The checkpoint declares quant_method modelopt_mixed / MIXED_PRECISION, and an image
+# without this support dies loading the first layer:
+#
+#   vllm/models/kimi_k3/nvidia/model.py:1401  param = params_dict[name]
+#   KeyError: 'layers.0.self_attn.b_proj.weight_scale'
+#
+# That is not a lookup failure -- the module never registered the parameter. kda.py has
+# to recognise a BlockQuantScaleParameter and replicate rather than shard it when the
+# scale's output dim is smaller than TP, and modelopt.py has to pad an FP8_PB_WO output
+# width that is not block-aligned instead of raising. Both landed upstream between our
+# image and main, so this is a no-op on a current nightly: the applier reports
+# "Reversed (or previously applied)" and we skip. Verified by dry-run on both trees --
+# 0 failed, 0 fuzz on 728d3ad, already-present on main.
+if python3 -c "import sys,importlib.util,os; r=os.path.dirname(os.path.dirname(importlib.util.find_spec('vllm').origin)); sys.exit(0 if 'BlockQuantScaleParameter' in open(os.path.join(r,'vllm/models/kimi_k3/nvidia/kda.py')).read() else 1)"; then
+    echo "[k3nvfp4-b200] loader already supports the NVFP4 checkpoint; skipping"
+else
+    VLLM_ROOT=$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')
+    command -v patch >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq patch; }
+    if ! patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 < /configs/patches/k3-nvfp4-loader.patch > /tmp/nvfp4-loader-dry.log 2>&1; then
+        echo "[k3nvfp4-b200] FATAL: the NVFP4 loader patch does not apply to this image" >&2
+        cat /tmp/nvfp4-loader-dry.log >&2
+        exit 1
+    fi
+    patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < /configs/patches/k3-nvfp4-loader.patch
+    echo "[k3nvfp4-b200] NVFP4 loader support applied"
+fi
+
 echo "=== k3nvfp4-b200: applying the DCP dummy-batch fix ==="
 
 python3 - <<'PY'
