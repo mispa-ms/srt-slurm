@@ -1,0 +1,1157 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index d3b4af1cf060..169d0d5c58a3 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1636,7 +1636,8 @@ def create_draft_parallel_config(
+         This is mostly a copy of the target parallel config, except the tp_size.
+         """
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            # Drafter runs on the last PP stage only; do not inherit target PP.
++            pipeline_parallel_size=1,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index acde48a931a2..d0574df6a41f 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2495,12 +2495,6 @@ def _get_v2_model_runner_unsupported_features(self) -> list[str]:
+             ):
+                 unsupported.append("parallel drafting for EAGLE speculative decoding")
+ 
+-            if (
+-                speculative_config.method == "eagle3"
+-                and self.parallel_config.pipeline_parallel_size > 1
+-            ):
+-                unsupported.append("EAGLE3 with pipeline parallelism")
+-
+             if (
+                 speculative_config.enable_adaptive_verification
+                 and self.lora_config is not None
+diff --git a/vllm/model_executor/models/deepseek_eagle3.py b/vllm/model_executor/models/deepseek_eagle3.py
+index 63673093439d..80c41501e6e9 100644
+--- a/vllm/model_executor/models/deepseek_eagle3.py
++++ b/vllm/model_executor/models/deepseek_eagle3.py
+@@ -285,9 +285,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             base_vocab_size = getattr(self.config, "vocab_size", None)
+             self.config.draft_vocab_size = base_vocab_size
+ 
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+ 
+         # Store target layer count in draft config
+         self.config.target_layer_count = target_layer_num
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index d9f84be396d0..502879572841 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -1504,8 +1504,40 @@ def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+ class EagleModelMixin:
+     aux_hidden_state_layers: tuple[int, ...] = ()
+ 
++    # Set by models that forward auxiliary hidden states between PP stages.
++    supports_aux_hidden_states_over_pp: ClassVar[bool] = False
++
++    AUX_HIDDEN_STATE_KEY: ClassVar[str] = "aux_hidden_states_"
++
++    # Cached at setup: get_pp_indices logs on uneven splits, and dynamo cannot
++    # trace logging inside the forward.
++    _aux_slot_base_cached: int = 0
++    _aux_upstream_total_cached: int = 0
++
+     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+-        self.aux_hidden_state_layers = layers
++        self.aux_hidden_state_layers = tuple(sorted(layers))
++        self._cache_aux_pp_layout()
++
++    def _cache_aux_pp_layout(self) -> None:
++        """Resolve this rank's slot layout, off the forward path."""
++        from vllm.distributed.parallel_state import (
++            get_pp_group,
++            model_parallel_is_initialized,
++        )
++
++        # Models are also built outside a worker, where there is no PP group
++        # and so nothing to forward.
++        if not model_parallel_is_initialized():
++            return
++        pp = get_pp_group()
++        if pp.world_size < 2:
++            return
++        self._aux_slot_base_cached = self._aux_slot_base(
++            pp.rank_in_group, pp.world_size
++        )
++        self._aux_upstream_total_cached = self._aux_slot_base(
++            pp.world_size - 1, pp.world_size
++        )
+ 
+     def _maybe_add_hidden_state(
+         self,
+@@ -1519,6 +1551,78 @@ def _maybe_add_hidden_state(
+             aux_hidden_states.append(value)
+         return aux_hidden_states
+ 
++    @staticmethod
++    def local_aux_layer_ids(
++        start_layer: int,
++        end_layer: int,
++        aux_ids: tuple[int, ...],
++        is_first_rank: bool,
++    ) -> tuple[int, ...]:
++        """Auxiliary layer outputs produced by this stage."""
++        out: list[int] = []
++        if is_first_rank and start_layer in aux_ids:
++            out.append(start_layer)
++        for layer_idx in range(start_layer, end_layer):
++            if (layer_idx + 1) in aux_ids:
++                out.append(layer_idx + 1)
++        return tuple(out)
++
++    def _total_num_layers(self) -> int:
++        num_layers = getattr(getattr(self, "config", None), "num_hidden_layers", None)
++        if num_layers is None:
++            raise RuntimeError(
++                "aux-over-PP transport needs config.num_hidden_layers on the model"
++            )
++        return num_layers
++
++    def _num_local_aux_layers(self, rank: int, pp_world_size: int) -> int:
++        from vllm.distributed.utils import get_pp_indices
++
++        start, end = get_pp_indices(self._total_num_layers(), rank, pp_world_size)
++        return len(
++            self.local_aux_layer_ids(
++                start, end, tuple(self.aux_hidden_state_layers), rank == 0
++            )
++        )
++
++    def _aux_slot_base(self, rank: int, pp_world_size: int) -> int:
++        """Global slot index of ``rank``'s first auxiliary hidden state."""
++        return sum(self._num_local_aux_layers(r, pp_world_size) for r in range(rank))
++
++    def pack_local_aux_hidden_states(
++        self, aux_hidden_states: list[torch.Tensor]
++    ) -> dict[str, torch.Tensor]:
++        """Add this stage's auxiliary hidden states to the PP handoff."""
++        if not aux_hidden_states:
++            return {}
++        base = self._aux_slot_base_cached
++        return {
++            f"{self.AUX_HIDDEN_STATE_KEY}{base + i}": t
++            for i, t in enumerate(aux_hidden_states)
++        }
++
++    def collect_remote_aux_hidden_states(
++        self, intermediate_tensors: "IntermediateTensors | None"
++    ) -> list[torch.Tensor]:
++        """Read earlier stages' auxiliary hidden states in layer order."""
++        total = self._aux_upstream_total_cached
++        if total == 0:
++            return []
++
++        assert intermediate_tensors is not None
++        out: list[torch.Tensor] = []
++        for i in range(total):
++            key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
++            if key not in intermediate_tensors.tensors:
++                # Substituting zeros here would cost acceptance without failing.
++                raise RuntimeError(
++                    f"{key} missing from the last stage's intermediate-tensor "
++                    "buffer; the aux slots were not reserved "
++                    f"(got {sorted(intermediate_tensors.tensors)})"
++                )
++            out.append(intermediate_tensors[key])
++        return out
++
+ 
+ @runtime_checkable
+ class SupportsEagle(SupportsEagleBase, Protocol):
+diff --git a/vllm/model_executor/models/laguna_dflash.py b/vllm/model_executor/models/laguna_dflash.py
+index 28f299b71700..65a7e9e88934 100644
+--- a/vllm/model_executor/models/laguna_dflash.py
++++ b/vllm/model_executor/models/laguna_dflash.py
+@@ -249,9 +249,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             raise ValueError("Laguna DFlash config requires `draft_vocab_size`.")
+         self.has_own_embed_tokens = False
+         self.has_own_lm_head = False
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+         self.config.target_layer_count = target_layer_num
+         target_vocab_size = vllm_config.model_config.get_vocab_size()
+         if self.config.draft_vocab_size != target_vocab_size:
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index f136cea23b1a..f620acd3c1ed 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -73,6 +73,7 @@
+     make_empty_intermediate_tensors_factory,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ 
+ 
+@@ -352,6 +353,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
+             ".up_proj": (".gate_up_proj", 1),
+         }
+     )
++    supports_aux_hidden_states_over_pp = True
+ 
+     def __init__(
+         self,
+@@ -370,8 +372,10 @@ def __init__(
+ 
+         self.vocab_size = config.vocab_size
+ 
+-        if get_pp_group().is_first_rank or (
+-            config.tie_word_embeddings and get_pp_group().is_last_rank
++        if (
++            get_pp_group().is_first_rank
++            or (config.tie_word_embeddings and get_pp_group().is_last_rank)
++            or spec_decode_needs_target_embed(vllm_config)
+         ):
+             self.embed_tokens = VocabParallelEmbedding(
+                 self.vocab_size,
+@@ -416,9 +420,18 @@ def forward(
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        remote_aux: list[torch.Tensor] = []
++        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
++            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++
++        aux_hidden_states: list[torch.Tensor] = []
++        if get_pp_group().is_first_rank:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, self.start_layer, hidden_states, residual
++            )
+         for idx, layer in enumerate(
+-            islice(self.layers, self.start_layer, self.end_layer)
++            islice(self.layers, self.start_layer, self.end_layer),
++            start=self.start_layer,
+         ):
+             hidden_states, residual = layer(
+                 positions, hidden_states, residual, **extra_layer_kwargs
+@@ -428,12 +441,18 @@ def forward(
+             )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++            # Merged by unpacking rather than dict.update: the compile wrapper
++            # rejects a forward whose bytecode names `update`.
++            tensors = {
++                "hidden_states": hidden_states,
++                "residual": residual,
++                **self.pack_local_aux_hidden_states(aux_hidden_states),
++            }
++            return IntermediateTensors(tensors)
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
+ 
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/model_executor/models/llama_eagle3.py b/vllm/model_executor/models/llama_eagle3.py
+index 93c94e759949..92faddc1b5b2 100644
+--- a/vllm/model_executor/models/llama_eagle3.py
++++ b/vllm/model_executor/models/llama_eagle3.py
+@@ -278,9 +278,9 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         if getattr(self.config, "draft_vocab_size", None) is None:
+             base_vocab_size = getattr(self.config, "vocab_size", None)
+             self.config.draft_vocab_size = base_vocab_size
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        # Total, not this rank's slice, so the drafter's layer ids stay unique
++        # however the target is split across PP stages.
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+ 
+         # Store target layer count in draft config for
+         # proper layer_types indexing in draft models
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 3820f5e39b42..95b4f5c353db 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -74,6 +74,7 @@
+     make_empty_intermediate_tensors_factory,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ 
+ 
+@@ -330,6 +331,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+             ".up_proj": (".gate_up_proj", 1),
+         }
+     )
++    supports_aux_hidden_states_over_pp = True
+ 
+     def __init__(
+         self,
+@@ -360,8 +362,10 @@ def __init__(
+         self.quant_config = quant_config
+         self.vocab_size = config.vocab_size
+ 
+-        if get_pp_group().is_first_rank or (
+-            config.tie_word_embeddings and get_pp_group().is_last_rank
++        if (
++            get_pp_group().is_first_rank
++            or (config.tie_word_embeddings and get_pp_group().is_last_rank)
++            or spec_decode_needs_target_embed(vllm_config)
+         ):
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+@@ -412,9 +416,18 @@ def forward(
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        remote_aux: list[torch.Tensor] = []
++        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
++            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++
++        aux_hidden_states: list[torch.Tensor] = []
++        if get_pp_group().is_first_rank:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, self.start_layer, hidden_states, residual
++            )
+         for idx, layer in enumerate(
+-            islice(self.layers, self.start_layer, self.end_layer)
++            islice(self.layers, self.start_layer, self.end_layer),
++            start=self.start_layer,
+         ):
+             hidden_states, residual = layer(positions, hidden_states, residual)
+             self._maybe_add_hidden_state(
+@@ -422,12 +435,18 @@ def forward(
+             )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++            # Merged by unpacking rather than dict.update: the compile wrapper
++            # rejects a forward whose bytecode names `update`.
++            tensors = {
++                "hidden_states": hidden_states,
++                "residual": residual,
++                **self.pack_local_aux_hidden_states(aux_hidden_states),
++            }
++            return IntermediateTensors(tensors)
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
+ 
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+ 
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index b7b5b29d41d3..2236e1d480dc 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -712,9 +712,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         self.config = self.draft_model_config.hf_config
+         if getattr(self.config, "draft_vocab_size", None) is None:
+             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+         self.model = self.model_cls(
+             vllm_config=vllm_config,
+             prefix=maybe_prefix(prefix, "model"),
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 2cee016124c7..7c37c6db368e 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -182,9 +182,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         self.config = self.draft_model_config.hf_config
+         if getattr(self.config, "draft_vocab_size", None) is None:
+             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+         self.model = Qwen3DSparkModel(
+             vllm_config=vllm_config,
+             prefix=maybe_prefix(prefix, "model"),
+diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
+index 5b4e5a7a57cd..39d0173b3ce9 100644
+--- a/vllm/model_executor/models/qwen3_eagle3.py
++++ b/vllm/model_executor/models/qwen3_eagle3.py
+@@ -288,9 +288,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         if getattr(self.config, "draft_vocab_size", None) is None:
+             base_vocab_size = getattr(self.config, "vocab_size", None)
+             self.config.draft_vocab_size = base_vocab_size
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+ 
+         # Store target layer count in draft config for
+         # proper layer_types indexing in draft models
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index 9c6c7f6bb2cb..7892f6468843 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -829,6 +829,33 @@ def forward(self, *args, **kwargs):
+         return args[0] if args else next(iter(kwargs.values()))
+ 
+ 
++def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
++    """Whether the last PP rank must instantiate the target's ``embed_tokens``.
++
++    These drafters run on the last rank and alias the target's input embedding
++    when their own checkpoint ships none, which is the norm for DSpark and for
++    most EAGLE heads (e.g. yuhuili/EAGLE3-LLaMA3.1-Instruct-8B). The target's
++    embedding otherwise lives on the first rank only; instantiating it here lets
++    the regular weight loader populate it for maybe_share_target_embed().
++
++    Which draft checkpoints ship their own is unknown until the draft weights
++    load, i.e. after the target is built, so provision it for every method that
++    might need it and accept a duplicate embedding when it turns out not to.
++    """
++    from vllm.distributed.parallel_state import get_pp_group
++
++    speculative_config = vllm_config.speculative_config
++    if speculative_config is None or speculative_config.method not in (
++        "eagle",
++        "eagle3",
++        "dflash",
++        "dspark",
++    ):
++        return False
++    pp = get_pp_group()
++    return pp.world_size > 1 and pp.is_last_rank
++
++
+ def make_layers(
+     num_hidden_layers: int,
+     layer_fn: LayerFn,
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 37a43e7af7da..e12b3f4ef1fe 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -66,6 +66,7 @@
+     is_pp_missing_parameter,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.models.common.ops.sequence_parallel import (
+@@ -1218,6 +1219,8 @@ def forward(
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -1255,7 +1258,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             dtype=torch.int32,
+         )
+ 
+-        if get_pp_group().is_first_rank:
++        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
+@@ -1366,6 +1369,9 @@ def forward(
+             input_ids = sp_shard(input_ids)
+ 
+         residual, post_mix, res_mix = None, None, None
++        remote_aux: list[torch.Tensor] = []
++        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
++            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+         aux_hidden_states: list[torch.Tensor] = []
+         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+         for idx, layer in enumerate(
+@@ -1400,7 +1406,13 @@ def forward(
+                 )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors({"hidden_states": hidden_states})
++            # Merged by unpacking rather than dict.update: the compile wrapper
++            # rejects a forward whose bytecode names `update`.
++            tensors = {
++                "hidden_states": hidden_states,
++                **self.pack_local_aux_hidden_states(aux_hidden_states),
++            }
++            return IntermediateTensors(tensors)
+ 
+         if self.use_sequence_parallel:
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+@@ -1418,6 +1430,7 @@ def forward(
+             self.hc_eps,
+         )
+         hidden_states = self.norm(hidden_states)
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/models/kimi_k3/nvidia/dspark_mla.py b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+index 5008015abdc8..97febda0c86e 100644
+--- a/vllm/models/kimi_k3/nvidia/dspark_mla.py
++++ b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+@@ -421,9 +421,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         assert vllm_config.speculative_config is not None
+         self.draft_model_config = vllm_config.speculative_config.draft_model_config
+         self.config = self.draft_model_config.hf_config
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+         self.model = K3DSparkModel(
+             vllm_config=vllm_config,
+             start_layer_id=target_layer_num,
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 15ac51cd41a6..d75a2467c86a 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -85,6 +85,7 @@
+     is_pp_missing_parameter,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ from vllm.model_executor.models.vision import is_vit_use_data_parallel
+ from vllm.models.common.ops.sequence_parallel import (
+@@ -1122,6 +1123,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+     }
+ 
++    # Auxiliary hidden states are forwarded to the last PP stage.
++    supports_aux_hidden_states_over_pp = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -1146,7 +1150,7 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+             vllm_config, self.use_sequence_parallel
+         )
+ 
+-        if get_pp_group().is_first_rank:
++        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
+@@ -1230,14 +1234,10 @@ def make_empty_intermediate_tensors(
+     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+         super()._set_aux_hidden_state_layers(layers)
+         if self.use_attn_res:
+-            # Emitted once, at configuration time. Which layers are tapped and
+-            # which convention is in force are the two things you need to
+-            # confirm from a running process, and neither is recoverable from
+-            # the served output.
+             logger.info_once(
+                 "Kimi-K3 aux hidden capture: layers=%s mode=%s "
+                 "(VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=%d)",
+-                layers,
++                self.aux_hidden_state_layers,
+                 "attn_res_stream" if self._aux_attn_res_stream else "prefix_only",
+                 int(self._aux_attn_res_stream),
+             )
+@@ -1253,7 +1253,7 @@ def _capture_aux_hidden_stream(
+         pending_mlp_out: torch.Tensor | None,
+         block_residual: torch.Tensor,
+     ) -> torch.Tensor:
+-        """Auxiliary feature tapped after ``layer_idx`` under AttnRes.
++        """Auxiliary hidden state after ``layer_idx`` under AttnRes.
+ 
+         The wire between layers only carries the current block's running prefix;
+         the committed blocks live in the bank. The value the next consumer
+@@ -1289,7 +1289,7 @@ def _capture_aux_hidden_stream(
+             # Last layer of a non-final pipeline stage: the consumer lives on
+             # the next rank and the output-side aggregation only exists on the
+             # last one, so there is nothing here to mix against. Falling back
+-            # to the running prefix keeps the tap defined rather than reaching
++            # to the running prefix keeps the state defined rather than reaching
+             # for weights this rank does not construct.
+             return prefix
+ 
+@@ -1339,9 +1339,16 @@ def forward(
+             hidden_states = sp_shard(hidden_states)
+             assert residual is None, "Currently, SP is not supported with PP"
+ 
++        remote_aux: list[torch.Tensor] = []
++        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
++            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++
+         # sharded aux hidden states when sp is enabled
+         aux_hidden_states: list[torch.Tensor] = []
+-        if self.start_layer in self.aux_hidden_state_layers:
++        if (
++            get_pp_group().is_first_rank
++            and self.start_layer in self.aux_hidden_state_layers
++        ):
+             if self.use_attn_res or residual is None:
+                 aux_hidden_states.append(hidden_states)
+             else:
+@@ -1391,9 +1398,14 @@ def forward(
+             )
+             if prefix_sum is not None:
+                 hidden_states = hidden_states + prefix_sum
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++            # Merged by unpacking rather than dict.update: the compile wrapper
++            # rejects a forward whose bytecode names `update`.
++            tensors = {
++                "hidden_states": hidden_states,
++                "residual": residual,
++                **self.pack_local_aux_hidden_states(aux_hidden_states),
++            }
++            return IntermediateTensors(tensors)
+ 
+         if self.use_attn_res:
+             assert prefix_sum is not None
+@@ -1429,6 +1441,7 @@ def forward(
+ 
+         # NOTE: the final norm is applied in compute_logits instead of here, so
+         # the MTP draft model receives the pre-norm hidden states.
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if aux_hidden_states:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ce3de50016da..20693806900a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -138,6 +138,7 @@
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
++    verify_supports_aux_hidden_states_over_pp,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+     RejectionSampler,
+@@ -256,11 +257,6 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+             ):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
+-                    raise ValueError(
+-                        f"{self.speculative_config.method} with pipeline parallel "
+-                        "is not supported."
+-                    )
+ 
+         # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+@@ -379,6 +375,13 @@ def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+             if self.use_aux_hidden_state_outputs:
+                 assert self.speculative_config is not None
+                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
++                if self.use_pp:
++                    assert self.speculative_config.method is not None
++                    verify_supports_aux_hidden_states_over_pp(
++                        self.model, self.speculative_config.method
++                    )
++                    assert self.pp_handler is not None
++                    self.pp_handler.configure_aux_hidden_state_relay(self.model)
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 with use_workspace_lane(self._draft_workspace_lane):
+                     self.speculator.load_model(self.model)
+@@ -947,7 +950,9 @@ def update_pp_decode_requests(self):
+         # For non-last PP ranks, update decode requests with sampler output from
+         # the prior step in which they were scheduled (pp_size steps ago).
+         if self.pp_handler is not None:
+-            outputs = self.pp_handler.get_prev_sampled_outputs()
++            outputs = self.pp_handler.get_prev_sampled_outputs(
++                self.req_states.draft_tokens
++            )
+             if outputs is not None:
+                 self.postprocess_sampled(**outputs)
+ 
+@@ -1692,7 +1697,11 @@ def execute_model(
+ 
+         if not self.is_last_pp_rank:
+             # Non-last PP rank: return IntermediateTensors for sending.
+-            return output_intermediate_tensors
++            assert output_intermediate_tensors is not None
++            assert self.pp_handler is not None
++            return self.pp_handler.relay_aux_hidden_states(
++                model_inputs["intermediate_tensors"], output_intermediate_tensors
++            )
+         return None
+ 
+     @torch.inference_mode()
+@@ -1845,6 +1854,12 @@ def sample_tokens(
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
++            # The other PP ranks have no drafter, so hand them the proposals
++            # they must feed the target on the next step.
++            if self.pp_handler is not None:
++                self.pp_handler.broadcast_drafts(
++                    self.req_states.draft_tokens, input_batch
++                )
+ 
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe4cf..fac65a55fff6 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -10,6 +10,7 @@
+ 
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.platforms import current_platform
++from vllm.sequence import IntermediateTensors
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
+@@ -30,6 +31,8 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Draft proposals for the step this slot feeds, when spec decoding is on.
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -43,8 +46,12 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     assert max_seq_len is not None  # always populated under PP
+     # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+-    # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
++    # Discount drafts: scheduler advances num_computed by full width before
++    # PP peers consume the sample broadcast.
++    finish_computed = old_computed
++    if input_batch.num_draft_tokens_per_req is not None:
++        finish_computed = old_computed - input_batch.num_draft_tokens_per_req
++    not_finishing = np.maximum(finish_computed, prefill_len) + 1 < max_seq_len
+     need_sampled_mask = produces_sample & not_finishing
+     return need_sampled_mask if need_sampled_mask.any() else None
+ 
+@@ -65,6 +72,7 @@ def __init__(
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        self.num_speculative_steps = num_speculative_steps
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -86,11 +94,37 @@ def __init__(
+         self.broadcast_group = get_pp_group().make_sibling_device_group(
+             group_desc="pp_broadcast"
+         )
++        self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+ 
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
++    def configure_aux_hidden_state_relay(self, model: torch.nn.Module) -> None:
++        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
++            aux_hidden_state_relay_keys,
++        )
++
++        self.aux_hidden_state_relay_keys = aux_hidden_state_relay_keys(model)
++
++    def relay_aux_hidden_states(
++        self,
++        intermediate_tensors: IntermediateTensors | None,
++        output_intermediate_tensors: IntermediateTensors,
++    ) -> IntermediateTensors:
++        if not self.aux_hidden_state_relay_keys:
++            return output_intermediate_tensors
++        assert intermediate_tensors is not None
++        return IntermediateTensors(
++            output_intermediate_tensors.tensors
++            | {
++                key: intermediate_tensors[key]
++                for key in self.aux_hidden_state_relay_keys
++            }
++        )
++
++    def get_prev_sampled_outputs(
++        self, draft_tokens_to_update: torch.Tensor | None = None
++    ) -> dict[str, torch.Tensor] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+         """
+@@ -116,6 +150,19 @@ def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+ 
+         self.main_stream.wait_event(slot.event)
++        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
++            draft_tokens = slot.draft_tokens
++            draft_idx_mapping = slot.idx_mapping
++            # A freed index may already belong to a new request.
++            if exclude_mask.any():
++                keep = ~exclude_mask
++                keep_t = torch.as_tensor(keep, device=self.device)
++                draft_tokens = draft_tokens[keep_t]
++                draft_idx_mapping = async_copy_to_gpu(
++                    slot.idx_mapping_np[keep], device=self.device
++                )
++            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
++
+         return dict(
+             sampled_tokens=slot.sampled_tokens,
+             num_sampled=slot.num_sampled,
+@@ -123,6 +170,21 @@ def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+             idx_mapping=idx_mapping,
+         )
+ 
++    def broadcast_drafts(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Broadcast draft proposals so non-last ranks can embed real token ids."""
++        assert self.is_last_rank
++        if compute_need_sampled_mask(input_batch) is None:
++            return
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            send = draft_tokens[input_batch.idx_mapping].contiguous()
++            torch.distributed.broadcast(
++                send, src=self.last_rank, group=self.broadcast_group
++            )
++            send.record_stream(self.broadcast_stream)
++
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+@@ -149,12 +211,25 @@ def receive(self, input_batch: InputBatch) -> bool:
+             torch.distributed.broadcast(
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
++            draft_tokens = None
++            if self.num_speculative_steps > 0:
++                draft_tokens = torch.empty(
++                    num_reqs,
++                    self.num_speculative_steps,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +239,7 @@ def receive(self, input_batch: InputBatch) -> bool:
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -186,8 +262,17 @@ def broadcast(
+ 
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            # Pad to max_sample_len so send width matches receive().
++            send_tokens = sampled_token_ids
++            width = send_tokens.shape[-1]
++            if width < self.max_sample_len:
++                padded = send_tokens.new_zeros(
++                    send_tokens.shape[0], self.max_sample_len
++                )
++                padded[:, :width] = send_tokens
++                send_tokens = padded
+             torch.distributed.broadcast(
+-                sampled_token_ids.contiguous(),
++                send_tokens.contiguous(),
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index b9e6ea02f466..8dbc253c20d7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -3,11 +3,11 @@
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
+-from vllm.distributed.parallel_state import get_pp_group
+ from vllm.model_executor.model_loader import get_model
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+     _should_share,
+     get_target_lm_head,
++    maybe_share_target_embed,
+ )
+ 
+ 
+@@ -60,18 +60,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     target_inner = getattr(target_language_model, "model", target_language_model)
+     draft_inner = dflash_model.model
+ 
+-    # Skip embedding sharing under PP — each rank owns its own embedding.
+-    if get_pp_group().world_size == 1:
+-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+-            target_inner, "embedding", None
+-        )
+-        draft_embed = getattr(draft_inner, "embed_tokens", None)
+-        if target_embed is not None and _should_share(
+-            dflash_model, "has_own_embed_tokens", draft_embed, target_embed
+-        ):
+-            if draft_embed is not None:
+-                del draft_inner.embed_tokens
+-            draft_inner.embed_tokens = target_embed
++    maybe_share_target_embed(dflash_model, draft_inner, target_inner)
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(dflash_model, "lm_head", None)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 177060747ab8..29fc047b6716 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -4,7 +4,6 @@
+ import torch.nn as nn
+ 
+ from vllm.config import ModelConfig, VllmConfig, replace
+-from vllm.distributed.parallel_state import get_pp_group
+ from vllm.logger import init_logger
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+@@ -43,6 +42,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+         _should_share,
+         get_target_lm_head,
++        maybe_share_target_embed,
+     )
+ 
+     draft_attention_backend = _resolve_dspark_attention_backend(
+@@ -76,9 +76,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             vllm_config=draft_vllm_config, model_config=draft_model_config
+         )
+ 
+-    if get_pp_group().world_size != 1:
+-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+-
+     target_language_model = (
+         target_model.get_language_model()
+         if hasattr(target_model, "get_language_model")
+@@ -88,18 +85,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     draft_inner = draft_model.model
+     target_vocab_size = vllm_config.model_config.get_vocab_size()
+ 
+-    target_embed = getattr(target_inner, "embed_tokens", None)
+-    draft_embed = getattr(draft_inner, "embed_tokens", None)
+-    if (
+-        target_embed is not None
+-        and draft_model_config.get_vocab_size() <= target_vocab_size
+-        and _should_share(
+-            draft_model, "has_own_embed_tokens", draft_embed, target_embed
+-        )
+-    ):
+-        if draft_embed is not None:
+-            del draft_inner.embed_tokens
+-        draft_inner.embed_tokens = target_embed
++    maybe_share_target_embed(draft_model, draft_inner, target_inner)
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(draft_model, "lm_head", None)
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index a37a4c83b3e5..4e291d76dc1a 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from typing import cast
+ 
++import torch
+ import torch.nn as nn
+ 
+ from vllm.config import SpeculativeConfig
+@@ -30,6 +31,81 @@ def set_eagle3_aux_hidden_state_layers(
+         aux_layers = eagle3_model.get_eagle3_default_aux_hidden_state_layers()
+         logger.info("Using Eagle3 auxiliary layers from model: %s", aux_layers)
+     eagle3_model.set_aux_hidden_state_layers(aux_layers)
++    reserve_aux_intermediate_tensor_slots(model)
++
++
++def _inner_decoder(model: nn.Module) -> nn.Module | None:
++    parent_ref = model
++    if hasattr(model, "get_language_model"):
++        parent_ref = model.get_language_model()
++    elif hasattr(model, "language_model"):
++        parent_ref = model.language_model
++    return getattr(parent_ref, "model", None)
++
++
++def verify_supports_aux_hidden_states_over_pp(model: nn.Module, method: str) -> None:
++    inner = _inner_decoder(model)
++    if not getattr(inner, "supports_aux_hidden_states_over_pp", False):
++        raise ValueError(
++            f"{method} with pipeline parallel is not supported by "
++            f"{type(model).__name__}: it does not forward auxiliary hidden states "
++            "across pipeline stages."
++        )
++
++
++def aux_hidden_state_relay_keys(model: nn.Module) -> tuple[str, ...]:
++    """Auxiliary hidden-state keys this stage forwards."""
++    from vllm.distributed.parallel_state import get_pp_group
++
++    pp = get_pp_group()
++    if pp.world_size < 2 or pp.is_first_rank or pp.is_last_rank:
++        return ()
++    inner = _inner_decoder(model)
++    if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
++        return ()
++    num_upstream = inner._aux_slot_base(pp.rank_in_group, pp.world_size)
++    key = inner.AUX_HIDDEN_STATE_KEY
++    return tuple(f"{key}{i}" for i in range(num_upstream))
++
++
++def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
++    """Declare the aux slots this stage receives from upstream.
++
++    The runner copies received tensors into a persistent buffer built once from
++    `make_empty_intermediate_tensors`, silently dropping keys that buffer lacks.
++    An undeclared slot therefore costs acceptance without failing.
++    """
++    from vllm.distributed.parallel_state import get_pp_group
++
++    pp = get_pp_group()
++    if pp.world_size < 2 or pp.is_first_rank:
++        return
++    inner = _inner_decoder(model)
++    if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
++        return
++
++    num_aux_states = inner._aux_slot_base(pp.rank_in_group, pp.world_size)
++    if num_aux_states == 0:
++        return
++
++    key = inner.AUX_HIDDEN_STATE_KEY
++    hidden_size = inner.config.hidden_size
++    make_empty = model.make_empty_intermediate_tensors
++
++    def make_empty_with_aux(batch_size, dtype, device):
++        tensors = make_empty(batch_size, dtype, device)
++        for i in range(num_aux_states):
++            tensors[f"{key}{i}"] = torch.zeros(
++                (batch_size, hidden_size), dtype=dtype, device=device
++            )
++        return tensors
++
++    model.make_empty_intermediate_tensors = make_empty_with_aux
++    logger.info(
++        "Reserved %d auxiliary hidden-state slot(s) from PP stages 0..%d.",
++        num_aux_states,
++        pp.rank_in_group - 1,
++    )
+ 
+ 
+ def get_eagle3_aux_layers_from_config(
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 579652bc7d64..78578112993b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -7,6 +7,7 @@
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.lora.layers.base import BaseLayerWithLoRA
+ from vllm.model_executor.model_loader import get_model
++from vllm.model_executor.models.utils import PPMissingLayer
+ 
+ 
+ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
+@@ -33,6 +34,58 @@ def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module
+     )
+ 
+ 
++def maybe_share_target_embed(
++    draft_model: nn.Module, draft_inner: nn.Module, target_inner: nn.Module
++) -> None:
++    """Alias the target's input embedding into the drafter when it needs one.
++
++    Under PP the drafter runs on the last stage, where the target's embedding
++    exists only because spec_decode_needs_target_embed() asked for it.
++    """
++    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
++        target_inner, "embedding", None
++    )
++    if isinstance(target_embed, PPMissingLayer):
++        target_embed = None
++    # If the target's embedding is LoRA-wrapped, share the underlying base
++    # layer. The draft is not part of the LoRA adapter; sharing the wrapper
++    # would make the draft run the LoRA embedding kernel with the target's
++    # punica metadata (sized for the target's token count), causing an
++    # out-of-bounds GPU access during multi-step draft decode.
++    if isinstance(target_embed, BaseLayerWithLoRA):
++        target_embed = target_embed.base_layer
++    draft_embed = getattr(draft_inner, "embed_tokens", None)
++
++    if get_pp_group().world_size > 1 and not hasattr(
++        draft_model, "has_own_embed_tokens"
++    ):
++        # MTP-style drafts load an embedding from the target checkpoint, and the
++        # flag that would tell a loaded one from a missing one is EAGLE-only.
++        return
++
++    if target_embed is None:
++        # hasattr, not draft_embed is not None: DSpark drafts declare
++        # embed_tokens as None and wait for the alias, and they are the ones
++        # that cannot run without it.
++        if hasattr(draft_inner, "embed_tokens") and not getattr(
++            draft_model, "has_own_embed_tokens", False
++        ):
++            raise RuntimeError(
++                f"{type(draft_model).__name__} ships no input embedding of its "
++                "own and the target's is absent on this pipeline stage, "
++                "leaving the drafter nothing to embed its proposals with. "
++                "spec_decode_needs_target_embed() must be true for "
++                f"{type(target_inner).__name__} so the last stage instantiates "
++                "the target's embed_tokens."
++            )
++        return
++
++    if _should_share(draft_model, "has_own_embed_tokens", draft_embed, target_embed):
++        if draft_embed is not None:
++            del draft_inner.embed_tokens
++        draft_inner.embed_tokens = target_embed
++
++
+ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+     from vllm.compilation.backends import set_model_tag
+ 
+@@ -60,25 +113,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+     target_inner = target_language_model.model
+     draft_inner = eagle_model.model
+ 
+-    # Skip embedding sharing under PP — each rank owns its own embedding.
+-    if get_pp_group().world_size == 1:
+-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+-            target_inner, "embedding", None
+-        )
+-        # If the target's embedding is LoRA-wrapped, share the underlying base
+-        # layer. The draft is not part of the LoRA adapter; sharing the wrapper
+-        # would make the draft run the LoRA embedding kernel with the target's
+-        # punica metadata (sized for the target's token count), causing an
+-        # out-of-bounds GPU access during multi-step draft decode.
+-        if isinstance(target_embed, BaseLayerWithLoRA):
+-            target_embed = target_embed.base_layer
+-        draft_embed = getattr(draft_inner, "embed_tokens", None)
+-        if target_embed is not None and _should_share(
+-            eagle_model, "has_own_embed_tokens", draft_embed, target_embed
+-        ):
+-            if draft_embed is not None:
+-                del draft_inner.embed_tokens
+-            draft_inner.embed_tokens = target_embed
++    maybe_share_target_embed(eagle_model, draft_inner, target_inner)
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(eagle_model, "lm_head", None)
