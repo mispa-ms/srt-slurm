@@ -95,6 +95,54 @@ if "DSpark does not support pipeline parallelism" in u:
 print("[k3-pr50514] verified: aux-over-PP present, draft PP pinned, refusal gone")
 PY
 
+# ── 1a. vLLM PR #53682, the graph-pool assert ─────────────────────────────────
+# This is what actually killed stage 1, and it took a note from Hanjie in the K3
+# channel to see it. The stacks showed stage 1 idle in worker_busy_loop while stage 0
+# blocked in a gloo send, and this workstream read that as "stage 1 is stuck on
+# something local". It was not stuck. It was dead:
+#
+#   10:59:04  stage 1  kernel_warmup.py:194                    last healthy line
+#   10:59:06  stage 1  RuntimeError: it->second->use_count > 0 INTERNAL ASSERT FAILED
+#   10:59:22  stage 0  Graph capturing finished                carries on alone
+#             stage 0  isend_tensor_dict -> 1800 s gloo timeout
+#
+# Stage 1 raised, its RPC unwound, and it went back to the busy loop looking idle.
+# Stage 0 then waited forever for a peer that no longer existed.
+#
+# PR #53682 "[Bugfix][MRV2] Run cudagraph memory profiling in a throwaway graph pool"
+# is exactly this: profiling captures graphs before the real KV cache exists and
+# discards them at teardown, dropping the persistent pool's use_count to zero, so the
+# real capture trips create_or_incref_pool when it re-opens that pool.
+#
+# It merged 2026-08-25 18:52 UTC. Our nightly is a9a17e70, built 2026-08-25 04:32 UTC
+# -- fourteen hours short. Confirmed by content: throwaway_pool and _capture_model
+# appear zero times in the image.
+#
+# One file, independent of #50514 (which does not touch cudagraph_utils.py). Dry-run
+# on a9a17e70 alone and on top of #50514: 0 failed, 0 fuzz.
+echo "=== k3-pr53682: cudagraph profiling in a throwaway graph pool ==="
+if grep -q "throwaway_pool" "$VLLM_ROOT/vllm/v1/worker/gpu/cudagraph_utils.py"; then
+    echo "[k3-pr53682] already present; skipping"
+else
+    if ! patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 < /configs/patches/k3-pr53682-graphpool.patch > /tmp/pr53682-dry.log 2>&1; then
+        echo "[k3-pr53682] FATAL: PR #53682 does not apply to this image" >&2
+        cat /tmp/pr53682-dry.log >&2
+        exit 1
+    fi
+    patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < /configs/patches/k3-pr53682-graphpool.patch
+    echo "[k3-pr53682] applied"
+fi
+
+python3 - <<'PY'
+import importlib.util, os, sys
+
+root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
+src = open(os.path.join(root, "vllm/v1/worker/gpu/cudagraph_utils.py")).read()
+if "throwaway_pool" not in src:
+    sys.exit("[k3-pr53682] FATAL: the throwaway graph pool is missing")
+print("[k3-pr53682] verified: profiling uses a throwaway graph pool")
+PY
+
 # ── 1b. our one fix the PR does not carry ─────────────────────────────────────
 # Two of our commits sat on top of the PR snapshot. One is now obsolete: the manual
 # draft-directory/embedding lookup it fixed was deleted by the PR, which shares the

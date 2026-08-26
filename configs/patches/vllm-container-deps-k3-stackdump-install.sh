@@ -53,5 +53,79 @@
 # =============================================================================
 set -euo pipefail
 
-bash /configs/patches/vllm-container-deps-k3-b200-dspark-pp-main.sh
-bash /configs/patches/vllm-container-deps-k3-stackdump-install.sh
+
+echo "=== stackdump: install the periodic all-thread dump ==="
+
+python3 - <<'PY'
+import os
+import site
+import sys
+
+# Install beside vllm. That directory is on sys.path for every interpreter this job
+# starts and is known to exist, which site.getsitepackages() does not guarantee -- it
+# happily reports a local/lib/.../dist-packages path that was never created.
+import importlib.util
+
+candidates = []
+spec = importlib.util.find_spec("vllm")
+if spec is not None and spec.origin:
+    candidates.append(os.path.dirname(os.path.dirname(spec.origin)))
+candidates += [p for p in (site.getsitepackages() or []) if os.path.isdir(p)]
+candidates = [p for p in candidates if os.path.isdir(p)]
+if not candidates:
+    sys.exit("[stackdump] FATAL: no site-packages directory to install into")
+sp = candidates[0]
+
+MODULE = '''# Periodic all-thread stack dump, armed by K3_STACKDUMP_SECONDS.
+# Imported from a .pth rather than named sitecustomize, which Debian already
+# ships in the stdlib directory ahead of site-packages on sys.path.
+import os
+
+
+def install():
+    seconds = os.environ.get("K3_STACKDUMP_SECONDS")
+    if not seconds:
+        return
+    try:
+        seconds = float(seconds)
+    except ValueError:
+        return
+    if seconds <= 0:
+        return
+    import faulthandler
+    import sys
+
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    faulthandler.dump_traceback_later(
+        seconds, repeat=True, file=sys.stderr, exit=False
+    )
+
+
+install()
+'''
+
+mod = os.path.join(sp, "k3_stackdump.py")
+compile(MODULE, mod, "exec")
+open(mod, "w").write(MODULE)
+
+# .pth files are read in sorted order; the zzz prefix keeps this last so it runs
+# after anything the image installs for itself.
+pth = os.path.join(sp, "zzz_k3_stackdump.pth")
+open(pth, "w").write("import k3_stackdump\n")
+
+print("[stackdump] installed: " + mod)
+print("[stackdump] installed: " + pth)
+PY
+
+# Prove the hook actually runs in a fresh interpreter rather than trusting the write.
+# The first version of this script installed a sitecustomize that Debian's own copy
+# silently shadowed; this check is the only reason that cost a queue slot instead of a
+# whole diagnostic run.
+if K3_STACKDUMP_SECONDS=1 python3 -c "import time; time.sleep(2)" 2>&1 | grep -q "Timeout (0:00:01)"; then
+    echo "[stackdump] verified: a fresh interpreter dumps on the timer"
+else
+    echo "[stackdump] FATAL: the .pth did not fire in a fresh interpreter" >&2
+    exit 1
+fi
+
+echo "=== stackdump: done ==="
