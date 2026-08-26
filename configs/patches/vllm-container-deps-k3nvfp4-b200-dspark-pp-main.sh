@@ -65,6 +65,7 @@ if "elif self.start_layer in self.aux_hidden_state_layers:" not in k:
 print("[k3nvfp4-dspark-pp] verified: refusal gone, draft PP pinned, aux-unpack in place")
 PY
 
+
 # ── 2. JET cache, NVFP4 loader support, DCP dummy-batch fix ───────────────────
 bash /configs/patches/vllm-container-deps-k3nvfp4-b200.sh
 

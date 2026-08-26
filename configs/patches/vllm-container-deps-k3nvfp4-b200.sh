@@ -73,6 +73,42 @@ else
     echo "[k3nvfp4-b200] NVFP4 loader support applied"
 fi
 
+VLLM_ROOT=${VLLM_ROOT:-$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')}
+command -v patch >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq patch; }
+
+# ── Mooncake + DCP, vLLM PR #53324 ────────────────────────────────────────────
+# Current nightlies refuse the combination outright:
+#
+#   MooncakeStoreConnector does not support: PCP/DCP > 1 (pcp=1, dcp=8)
+#   with hybrid attention
+#
+# connector.py:115 on a9a17e70. The guard is not in the 728d3ad image, which is why
+# every MXFP4 number on this workstream ran Mooncake with DCP8 and never met it -- and
+# why dropping this PR earlier looked justified and was not. PR #53324 narrows the
+# refusal to PCP alone:
+#
+#   -  f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+#   +  unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+#
+# We run pcp=1, so we pass. Taken as the net diff of wzhao18/vllm:wzhao/k3-dcp-mk-2
+# against main and dry-run on a9a17e70: 0 failed, 0 fuzz. The earlier attempt used the
+# diff as it sat on Wei's own base and did not apply at all.
+#
+# Eight files, none of them model_runner.py, so this is order-independent against the
+# three edits that do land there.
+if grep -q "PCP/DCP > 1" "$VLLM_ROOT/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py"; then
+    echo "=== mooncake-dcp: applying vLLM PR #53324 ==="
+    if ! patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 < /configs/patches/k3-mooncake-dcp-53324.patch > /tmp/mk53324-dry.log 2>&1; then
+        echo "[mooncake-dcp] FATAL: PR #53324 does not apply to this image" >&2
+        cat /tmp/mk53324-dry.log >&2
+        exit 1
+    fi
+    patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < /configs/patches/k3-mooncake-dcp-53324.patch
+    echo "[mooncake-dcp] PR #53324 applied; DCP no longer refused"
+else
+    echo "[mooncake-dcp] no PCP/DCP guard in this image; skipping PR #53324"
+fi
+
 echo "=== k3nvfp4-b200: applying the DCP dummy-batch fix ==="
 
 python3 - <<'PY'
