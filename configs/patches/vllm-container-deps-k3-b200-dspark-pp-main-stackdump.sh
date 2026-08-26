@@ -28,11 +28,23 @@
 # job. faulthandler writes to stderr, which srtslurm already captures into
 # prenyx<node>_agg_w0.out.log and the AIB archiver already pulls down.
 #
-# HOW. sitecustomize is imported by every Python process that starts with site
-# enabled, so one file covers the API server, the engine core and all sixteen
-# workers without touching vLLM. dump_traceback_later(repeat=True) then prints every
-# thread of every rank on a timer. A healthy rank prints its stack too -- that is the
-# point, the two stages are compared against each other.
+# HOW. A .pth file in site-packages, not sitecustomize. The first attempt used
+# sitecustomize and the guard at the bottom caught it dead:
+#
+#   [stackdump] installed: /usr/local/lib/python3.12/dist-packages/sitecustomize.py
+#   [stackdump] FATAL: sitecustomize did not fire in a fresh interpreter
+#
+# Debian and Ubuntu ship their own /usr/lib/python3.12/sitecustomize.py, and the
+# stdlib directory sits ahead of site-packages on sys.path, so `import sitecustomize`
+# finds theirs and ours is never read. site processes *every* .pth in site-packages
+# and execs any line beginning with `import`, which nothing can shadow. The .pth
+# imports a module beside it so the logic stays readable rather than crammed onto one
+# line.
+#
+# One file covers the API server, the engine core and all sixteen workers without
+# touching vLLM. dump_traceback_later(repeat=True) then prints every thread of every
+# rank on a timer. A healthy rank prints its stack too -- that is the point, the two
+# stages are compared against each other.
 #
 # K3_STACKDUMP_SECONDS gates it, so this script is inert unless a config asks. Set it
 # to something shorter than the 1800 s gloo timeout and longer than a normal capture,
@@ -50,22 +62,28 @@ import os
 import site
 import sys
 
-# site-packages, the same directory vllm itself lives in, is on sys.path for every
-# interpreter here, so sitecustomize placed there is picked up by all of them.
-candidates = [p for p in (site.getsitepackages() or []) if p.endswith("dist-packages")]
-if not candidates:
-    candidates = site.getsitepackages() or []
+# Install beside vllm. That directory is on sys.path for every interpreter this job
+# starts and is known to exist, which site.getsitepackages() does not guarantee -- it
+# happily reports a local/lib/.../dist-packages path that was never created.
+import importlib.util
+
+candidates = []
+spec = importlib.util.find_spec("vllm")
+if spec is not None and spec.origin:
+    candidates.append(os.path.dirname(os.path.dirname(spec.origin)))
+candidates += [p for p in (site.getsitepackages() or []) if os.path.isdir(p)]
+candidates = [p for p in candidates if os.path.isdir(p)]
 if not candidates:
     sys.exit("[stackdump] FATAL: no site-packages directory to install into")
-target = os.path.join(candidates[0], "sitecustomize.py")
+sp = candidates[0]
 
-BLOCK = '''
-# --- k3 stackdump ---------------------------------------------------------
-# Dump every thread of this process on a timer when K3_STACKDUMP_SECONDS is set.
-# Output goes to stderr so it lands in the worker log the harness already keeps.
-def _k3_install_stackdump():
-    import os
+MODULE = '''# Periodic all-thread stack dump, armed by K3_STACKDUMP_SECONDS.
+# Imported from a .pth rather than named sitecustomize, which Debian already
+# ships in the stdlib directory ahead of site-packages on sys.path.
+import os
 
+
+def install():
     seconds = os.environ.get("K3_STACKDUMP_SECONDS")
     if not seconds:
         return
@@ -84,32 +102,30 @@ def _k3_install_stackdump():
     )
 
 
-_k3_install_stackdump()
-# --- end k3 stackdump -----------------------------------------------------
+install()
 '''
 
-existing = ""
-if os.path.exists(target):
-    existing = open(target).read()
-    if "k3 stackdump" in existing:
-        print("[stackdump] already installed: " + target)
-        raise SystemExit(0)
-    # Preserve whatever the image shipped; append rather than replace.
-    print("[stackdump] appending to an existing sitecustomize: " + target)
+mod = os.path.join(sp, "k3_stackdump.py")
+compile(MODULE, mod, "exec")
+open(mod, "w").write(MODULE)
 
-src = existing + BLOCK
-compile(src, target, "exec")
-open(target, "w").write(src)
-print("[stackdump] installed: " + target)
+# .pth files are read in sorted order; the zzz prefix keeps this last so it runs
+# after anything the image installs for itself.
+pth = os.path.join(sp, "zzz_k3_stackdump.pth")
+open(pth, "w").write("import k3_stackdump\n")
+
+print("[stackdump] installed: " + mod)
+print("[stackdump] installed: " + pth)
 PY
 
 # Prove the hook actually runs in a fresh interpreter rather than trusting the write.
-# A one-second timer with a short sleep makes the dump appear in this setup log too,
-# which is the cheapest possible end-to-end check.
+# The first version of this script installed a sitecustomize that Debian's own copy
+# silently shadowed; this check is the only reason that cost a queue slot instead of a
+# whole diagnostic run.
 if K3_STACKDUMP_SECONDS=1 python3 -c "import time; time.sleep(2)" 2>&1 | grep -q "Timeout (0:00:01)"; then
     echo "[stackdump] verified: a fresh interpreter dumps on the timer"
 else
-    echo "[stackdump] FATAL: sitecustomize did not fire in a fresh interpreter" >&2
+    echo "[stackdump] FATAL: the .pth did not fire in a fresh interpreter" >&2
     exit 1
 fi
 
