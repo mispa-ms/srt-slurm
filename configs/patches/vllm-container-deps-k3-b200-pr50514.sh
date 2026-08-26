@@ -95,6 +95,74 @@ if "DSpark does not support pipeline parallelism" in u:
 print("[k3-pr50514] verified: aux-over-PP present, draft PP pinned, refusal gone")
 PY
 
+# ── 1b. our one fix the PR does not carry ─────────────────────────────────────
+# Two of our commits sat on top of the PR snapshot. One is now obsolete: the manual
+# draft-directory/embedding lookup it fixed was deleted by the PR, which shares the
+# target embedding through maybe_share_target_embed instead. The other is still live
+# and the PR has nothing like it -- "fastsafetensors" appears zero times in the whole
+# diff -- so applying the PR alone would reintroduce a hang that looks exactly like
+# the one we are trying to fix:
+#
+#   Under PP the drafter is built only on the last stage, but the fastsafetensors
+#   loader collectives over torch.distributed.group.WORLD. The stages that never
+#   build a drafter never join, and every rank hangs until NCCL times out.
+#
+# Our configs set load-format: fastsafetensors, so this is not hypothetical.
+# Content-anchored rather than a diff: the PR rewrote this function and the line
+# numbers our original commit was cut against no longer mean anything.
+echo "=== k3-pr50514: draft loader must not use fastsafetensors under PP ==="
+
+python3 - <<'PY'
+import importlib.util, os, sys
+
+target = os.path.join(
+    os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)),
+    "vllm/v1/worker/gpu/spec_decode/dspark/utils.py",
+)
+src = open(target).read()
+if "[draft-loader]" in src:
+    print("[draft-loader] already applied: " + target)
+    sys.exit(0)
+
+ANCHOR = """    draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+
+    with set_model_tag("dspark_head"):
+"""
+if src.count(ANCHOR) != 1:
+    sys.exit(
+        "[draft-loader] FATAL: expected one draft get_model site, found %d; the load "
+        "path moved and this needs re-deriving" % src.count(ANCHOR)
+    )
+
+ADDITION = """    draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+
+    # [draft-loader] Under PP the drafter is built only on the last stage, but the
+    # fastsafetensors loader collectives over torch.distributed.group.WORLD
+    # (weight_utils.fastsafetensors_weights_iterator). The stages that never build a
+    # drafter never join, and every rank hangs until the collective times out. Fall
+    # back to the default loader for the draft; it is a handful of layers, so the
+    # parallel loader buys nothing here anyway.
+    from vllm.distributed.parallel_state import get_pp_group
+
+    if (
+        get_pp_group().world_size > 1
+        and draft_vllm_config.load_config.load_format == "fastsafetensors"
+    ):
+        logger.info("[draft-loader] PP > 1: draft load_format fastsafetensors -> auto")
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            load_config=replace(draft_vllm_config.load_config, load_format="auto"),
+        )
+
+    with set_model_tag("dspark_head"):
+"""
+
+patched = src.replace(ANCHOR, ADDITION, 1)
+compile(patched, target, "exec")
+open(target, "w").write(patched)
+print("[draft-loader] applied: " + target)
+PY
+
 # ── 2. JET cache, PR #53324 guard, DCP dummy-batch fix ────────────────────────
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8.sh
 
