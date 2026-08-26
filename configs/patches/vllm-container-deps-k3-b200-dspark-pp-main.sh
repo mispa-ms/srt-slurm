@@ -33,9 +33,8 @@
 # =============================================================================
 set -euo pipefail
 
-bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
 
-echo "=== k3-dspark-pp-xin: apply spec-decode-under-PP, as it stands on k3-agent-all ==="
+echo "=== k3-dspark-pp-main: apply spec-decode-under-PP, rebased onto upstream main ==="
 
 PATCH=/configs/patches/k3-dspark-pp-main.patch
 [ -f "$PATCH" ] || PATCH=/configs/k3-dspark-pp-main.patch
@@ -103,4 +102,19 @@ print("[dspark-pp-main] verified: refusal gone, draft PP pinned, mamba kept the 
       "aux-unpack sits ahead of the tap collection")
 PY
 
-echo "=== k3-dspark-pp-xin: done ==="
+# emptycache runs AFTER the patch, not before. Both edit
+# vllm/v1/worker/gpu/model_runner.py, and emptycache inserts lines above the speculator
+# load -- which shifts every hunk this patch expects further down. Applied first, it made
+# the strict --fuzz=0 applier reject the whole patch:
+#
+#   [emptycache] applied: .../model_runner.py
+#   [dspark-pp-main] FATAL: patch does not apply cleanly to this image
+#
+# The xin script chains it first and gets away with it only because the image it targets
+# already carries the change, so its skip-guard fires and nothing is edited. In this
+# order the patch lands on the tree it was derived against, and emptycache -- which
+# matches its anchor as a whole line at any indent -- then finds it moved but intact.
+# Verified in that order against a9a17e70: patch clean, emptycache clean.
+bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
+
+echo "=== k3-dspark-pp-main: done ==="
