@@ -163,6 +163,76 @@ open(target, "w").write(patched)
 print("[draft-loader] applied: " + target)
 PY
 
+# ── 1c. the DSpark x DCP capture assert ───────────────────────────────────────
+# A second local commit the PR does not carry, and this one has a name in the K3
+# channel: Hanjie reported "a cudagraph assertion error in two jobs" from the same
+# rebase attempt. build_for_cudagraph_capture asserts decode-only on
+# reorder_batch_threshold, but a non-causal multi-token decode block -- which is what
+# DFlash/DSpark drafting is -- has a query length of the draft block size, and under
+# DCP the threshold is forced to 1 for any backend without supports_dcp_with_varlen.
+# build() already exempts the case; these two asserts never did, so capture dies
+# before a single request is served. Our own commit put it this way:
+#
+#   MLA: exempt non-causal multi-token decode from the capture-time threshold
+#
+# The nightly still has the assert unguarded at mla_attention.py:2271. Relaxing it
+# cannot affect the causal path -- the guard only skips the checks when
+# ``m.causal is False``.
+#
+# The refusals commit that sat beside this one is NOT reapplied: the two DSpark x DCP
+# refusals it deleted are already gone from upstream, checked by content in both
+# config/speculative.py and kimi_k3/nvidia/mla.py.
+echo "=== k3-pr50514: exempt non-causal multi-token decode from the capture assert ==="
+
+python3 - <<'PY'
+import importlib.util, os, sys
+
+target = os.path.join(
+    os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)),
+    "vllm/model_executor/layers/attention/mla_attention.py",
+)
+src = open(target).read()
+if "[capture-noncausal]" in src:
+    print("[capture-noncausal] already applied: " + target)
+    sys.exit(0)
+
+ANCHOR = '''        m = common_attn_metadata
+        assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
+            "MLA only supports decode-only full CUDAGraph capture. "
+            "Make sure all cudagraph capture sizes <= max_num_seq."
+        )
+
+        assert m.max_query_len <= self.reorder_batch_threshold  # decode only
+'''
+if src.count(ANCHOR) != 1:
+    sys.exit(
+        "[capture-noncausal] FATAL: expected one capture-assert block, found %d; it "
+        "moved and this needs re-deriving" % src.count(ANCHOR)
+    )
+
+ADDITION = '''        m = common_attn_metadata
+        # [capture-noncausal] A non-causal multi-token decode block (DFlash/DSpark
+        # drafting) is a decode by construction: build() takes the whole batch as
+        # decodes and forward_mqa flattens the block to single-token rows. Its query
+        # length is the draft block size, which reorder_batch_threshold does not
+        # bound -- under DCP that threshold is forced to 1 for any backend without
+        # supports_dcp_with_varlen. build() already exempts this case; these two
+        # asserts did not, so capture died before a single request was served.
+        if m.causal is not False:
+            assert m.num_reqs <= (m.num_actual_tokens * self.reorder_batch_threshold), (
+                "MLA only supports decode-only full CUDAGraph capture. "
+                "Make sure all cudagraph capture sizes <= max_num_seq."
+            )
+
+            assert m.max_query_len <= self.reorder_batch_threshold  # decode only
+'''
+
+patched = src.replace(ANCHOR, ADDITION, 1)
+compile(patched, target, "exec")
+open(target, "w").write(patched)
+print("[capture-noncausal] applied: " + target)
+PY
+
 # ── 2. JET cache, PR #53324 guard, DCP dummy-batch fix ────────────────────────
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8.sh
 
