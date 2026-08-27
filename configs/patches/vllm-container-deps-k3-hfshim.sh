@@ -34,7 +34,10 @@ if [[ -f /configs/patches/vllm-container-deps.sh ]]; then
     bash /configs/patches/vllm-container-deps.sh
 fi
 
-REPO_ID="moonshotai/Kimi-K3"
+# K3_REPO_ID lets the NVFP4 checkpoint reuse this shim. The cache entry name is
+# derived from it rather than hardcoded, because getting those two out of step
+# would shim the wrong directory and the model would silently be the other one.
+REPO_ID="${K3_REPO_ID:-moonshotai/Kimi-K3}"
 STAGED_DIR="${K3_STAGED_DIR:-/lustre/share/coreai_comparch_aarwlt/hf_repos/moonshotai/Kimi-K3}"
 # HEAD of moonshotai/Kimi-K3 as of 2026-07-27; only used if the Hub is unreachable.
 FALLBACK_SHA="9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
@@ -53,7 +56,7 @@ if [[ ! -d "$STAGED_DIR" ]]; then
     exit 1
 fi
 
-CACHE_ENTRY="$HF_HOME/hub/models--moonshotai--Kimi-K3"
+CACHE_ENTRY="$HF_HOME/hub/models--$(printf '%s' "$REPO_ID" | tr '/' '-' | sed 's/-/--/')"
 
 if [[ -d "$STAGED_DIR/snapshots" ]]; then
     # The staged copy is already a full HF cache entry — point at it wholesale.
@@ -107,12 +110,14 @@ fi
 
 # Prove the wiring works with no network at all. If this fails the job would have
 # started a 1.4 TB download, so fail here instead where the message is obvious.
-python3 - <<'PY'
+REPO_ID="$REPO_ID" python3 - <<'PY'
+import os
 import sys
 from huggingface_hub import snapshot_download
 
+repo = os.environ["REPO_ID"]
 try:
-    path = snapshot_download("moonshotai/Kimi-K3", local_files_only=True)
+    path = snapshot_download(repo, local_files_only=True)
 except Exception as exc:
     print(f"[k3-hfshim] FATAL: offline resolution failed: {exc}", file=sys.stderr)
     sys.exit(1)

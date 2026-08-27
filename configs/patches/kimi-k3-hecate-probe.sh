@@ -161,7 +161,8 @@ HF_HOME="${HF_HOME:?HF_HOME must be set by the config}"
 : "${K3_STAGED_DIR:?K3_STAGED_DIR must be set by the config (the JET artifact path)}"
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
-FOUND="${HF_HOME}/hub/models--moonshotai--Kimi-K3"
+REPO_ID="${K3_REPO_ID:-moonshotai/Kimi-K3}"
+FOUND="${HF_HOME}/hub/models--$(printf '%s' "$REPO_ID" | tr '/' '-' | sed 's/-/--/')"
 # du the STAGED directory, not the cache entry. The entry is a symlink farm, so
 # plain du reports ~0 and `du -L` double-counts JET's own internal symlinks --
 # it read 2908G against a 1.5T tree on 64802405. The staged dir is the real
