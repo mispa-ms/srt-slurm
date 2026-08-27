@@ -74,14 +74,21 @@ grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
 # the server-wide figure against one node's MemTotal would reject configurations
 # that fit, which is how the first Hecate submission would have been mis-sized
 # in the other direction.
+#
+# The budget is a FRACTION of the node, not a fixed reserve. An earlier form
+# demanded MemTotal >= KV + 200, which is not scale-free: on a 93 GB node it
+# rejects a 1 GB request and then advises a ceiling of "-107 GB". 85% is what
+# the B300 baseline this arm is derived from actually runs (1700 GB on a ~2 TB
+# node), so it is the precedent as well as the sane shape.
 KV_PER_NODE_GB="${K3_KV_OFFLOAD_PER_NODE_GB:-${K3_KV_OFFLOAD_GB:-600}}"
 MEM_TOTAL_GB=$(awk '/^MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
-echo "host MemTotal ${MEM_TOTAL_GB} GB; this node's share of the KV tier is ${KV_PER_NODE_GB} GB"
-if [ "$MEM_TOTAL_GB" -lt "$((KV_PER_NODE_GB + 200))" ]; then
-    echo "FATAL: node has ${MEM_TOTAL_GB} GB; ${KV_PER_NODE_GB} GB of host KV plus"
-    echo "       ~200 GB of headroom does not fit. Lower kv-offloading-size and"
-    echo "       TOTAL_CPU_DRAM_GB (both server-wide) so that the per-node share"
-    echo "       is at most $((MEM_TOTAL_GB - 200)) GB."
+KV_CEILING_GB=$(( MEM_TOTAL_GB * 85 / 100 ))
+echo "host MemTotal ${MEM_TOTAL_GB} GB; this node's share of the KV tier is ${KV_PER_NODE_GB} GB (ceiling ${KV_CEILING_GB} GB = 85%)"
+if [ "$KV_PER_NODE_GB" -gt "$KV_CEILING_GB" ]; then
+    echo "FATAL: this node's share of the host KV tier is ${KV_PER_NODE_GB} GB but the"
+    echo "       node has only ${MEM_TOTAL_GB} GB, so 85% is ${KV_CEILING_GB} GB. Lower"
+    echo "       kv-offloading-size and TOTAL_CPU_DRAM_GB (both server-wide) so that"
+    echo "       the per-node share is at most ${KV_CEILING_GB} GB."
     exit 1
 fi
 
@@ -112,10 +119,14 @@ HF_HOME="${HF_HOME:?HF_HOME must be set by the config}"
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
 FOUND="${HF_HOME}/hub/models--moonshotai--Kimi-K3"
-SZ=$(du -sBG -L "$FOUND" 2>/dev/null | awk '{print $1}')
-echo "  cache entry: $FOUND  ($SZ)"
+# du the STAGED directory, not the cache entry. The entry is a symlink farm, so
+# plain du reports ~0 and `du -L` double-counts JET's own internal symlinks --
+# it read 2908G against a 1.5T tree on 64802405. The staged dir is the real
+# number and the only one worth printing.
+SZ=$(du -sBG "$K3_STAGED_DIR" 2>/dev/null | awk '{print $1}')
+echo "  cache entry: $FOUND"
 echo "  refs/main:   $(cat "$FOUND/refs/main" 2>/dev/null || echo '<none>')"
-echo "  staged dir:  $K3_STAGED_DIR"
+echo "  staged dir:  $K3_STAGED_DIR  ($SZ)"
 
 # A directory can exist and hold nothing but a failed partial download.
 #
@@ -130,7 +141,12 @@ echo "  staged dir:  $K3_STAGED_DIR"
 # zero shards on a perfectly good checkpoint and fail the job for it.
 SHARDS=$(find -L "$FOUND" -name '*.safetensors' 2>/dev/null | wc -l)
 INCOMPLETE=$(find -L "$FOUND" -name '*.incomplete' 2>/dev/null | wc -l)
-EXPECTED=$(find -L "$FOUND" -name '*-of-*.safetensors' 2>/dev/null | head -1 \
+# -print -quit, NOT `| head -1`. Under this script's `set -o pipefail`, head
+# closing the pipe after one line sends find SIGPIPE, the pipeline reports 141,
+# and -e kills the worker -- which is exactly how pipeline 64802405 died
+# ("Critical process 'agg_0_...' exited with code 141") on a checkpoint that was
+# wired correctly. find stops itself with -quit, so nothing gets signalled.
+EXPECTED=$(find -L "$FOUND" -name '*-of-*.safetensors' -print -quit 2>/dev/null \
            | sed -nE 's/.*-of-0*([0-9]+)\.safetensors$/\1/p')
 echo "  safetensors shards: ${SHARDS} (filenames declare ${EXPECTED:-unknown}), .incomplete files: ${INCOMPLETE}"
 
