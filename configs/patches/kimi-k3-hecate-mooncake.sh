@@ -75,6 +75,27 @@ if [ -n "$WANT" ]; then
     echo "  all requested devices are present"
 fi
 
+# ── The client wheel the workers import ──────────────────────
+# The master runs in its own container (kvcacheai/mooncake:0.3.12.post1-cuda13);
+# the vLLM workers additionally need the python client in THEIR image, and the
+# Rubin image does not ship it. Without it every worker dies on
+#     ModuleNotFoundError: No module named 'mooncake'
+# and the master sits at Clients: 0 / Mem Storage: 0 B -- which is what pipeline
+# 64912128 did, after the RDMA half of this script had already succeeded.
+#
+# Version tracks the master container exactly. The aarch64 cu13 wheels are
+# manylinux_2_39, so they need glibc >= 2.39; this image is Ubuntu 24.04.4, so
+# they install natively and none of the older glibc shimming applies.
+# --no-deps so pip cannot drag a different torch/cuda stack in behind it.
+MC_VER="${K3_MOONCAKE_VERSION:-0.3.12.post1}"
+echo "=== installing the mooncake client wheel (${MC_VER}) ==="
+python3 -m pip uninstall -y mooncake-transfer-engine mooncake-transfer-engine-cuda13 || true
+python3 -m pip install --no-deps --quiet "mooncake-transfer-engine-cuda13==${MC_VER}"
+python3 -c "
+import mooncake, mooncake.store  # noqa: F401
+print('  mooncake import OK:', getattr(mooncake, '__version__', '(no __version__)'))
+" || { echo 'FATAL: mooncake installed but does not import'; exit 1; }
+
 echo "=== RDMA userspace ready ==="
 echo "NOTE: read the worker log for 'Transfer engine auto discovery is disabled'"
 echo "      and the master's Clients count before trusting any offload number."
