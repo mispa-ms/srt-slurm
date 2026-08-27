@@ -60,6 +60,15 @@ ibv_devices 2>/dev/null || echo "WARNING: ibv_devices unavailable (no RDMA visib
 echo "=== host DRAM ==="
 grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
 
+# ── What the cluster injects into the job ────────────────────
+# CLUSTER_RUNBOOK.md s2: an env dict can only assign, so "we do not set it" and
+# "it is not set" are different things. oci-aga injects UCX_TLS=tcp and
+# UCX_NET_DEVICES=eth0; whether Hecate does is unknown, and the difference
+# decides whether a config needs environment_unset. Printing it costs nothing
+# and answers it once.
+echo "=== cluster-injected UCX / NCCL environment ==="
+env | grep -E '^(UCX|NCCL|MC_|MOONCAKE)_' | sort | sed 's/^/  /' || echo "  (none set)"
+
 # ── Can this container's toolchain even target this GPU ──────
 # The single most expensive thing we got wrong on Hecate. Pipeline 64809381
 # loaded 192.85 GiB/rank of weights over 176 s and only then died on
