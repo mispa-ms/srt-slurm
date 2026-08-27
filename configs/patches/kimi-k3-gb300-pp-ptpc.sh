@@ -65,6 +65,35 @@ else
     echo "[k3-ptpc] applied"
 fi
 
+echo "=== k3-ptpc: apply the K3 DCP meta-device fix ==="
+
+# vllm#51392 stages online-quantized weights on meta and materializes them
+# during loading. K3's MLA reads its DCP device off kv_b_proj -- one of the
+# layers we quantize -- so the DCP query-gather workspace tried to allocate
+# symmetric memory on meta and died at model init:
+#   RuntimeError: SymmetricMemory does not support device type meta
+# (SLURM 597109, 2026-08-27, 44 minutes in). The workspace belongs on the real
+# device no matter where the weights are staged. Only mla.py is affected: the
+# other three device-from-parameter sites in K3 read conv1d (which this arm
+# excludes) or an RMSNorm (never quantized).
+FIX=/configs/patches/vllm-k3-dcp-device-under-meta.patch
+[ -f "${FIX}" ] || FIX=/configs/vllm-k3-dcp-device-under-meta.patch
+if [ ! -f "${FIX}" ]; then
+    echo "[k3-ptpc] FATAL: DCP meta-device fix not found" >&2
+    exit 1
+fi
+if grep -q "kv_b_proj_device" "${VLLM_ROOT}/vllm/models/kimi_k3/nvidia/mla.py"; then
+    echo "[k3-ptpc] DCP meta fix already applied"
+else
+    if ! patch -p1 -d "${VLLM_ROOT}" --batch --dry-run --forward < "${FIX}" > /tmp/k3-ptpc-fix-dry.log 2>&1; then
+        echo "[k3-ptpc] FATAL: DCP meta-device fix does not apply." >&2
+        cat /tmp/k3-ptpc-fix-dry.log >&2
+        exit 1
+    fi
+    patch -p1 -d "${VLLM_ROOT}" --batch --forward < "${FIX}"
+    echo "[k3-ptpc] DCP meta fix applied"
+fi
+
 # Assert by value. Each check names a specific thing the arm depends on, because
 # the failure mode of a partial apply is a server that starts and quantizes
 # nothing -- indistinguishable from the control at a glance, and a wasted pair.
@@ -110,6 +139,10 @@ if "Fp8PtpcOnlineLinearMethod" not in src(
     fail.append("the PTPC online linear method is missing")
 if "fp8_per_channel" not in src("vllm/config/quantization.py"):
     fail.append("the fp8_per_channel shorthand is missing")
+
+# The DCP workspace must not take its device from a meta-staged projection.
+if "kv_b_proj_device" not in src("vllm/models/kimi_k3/nvidia/mla.py"):
+    fail.append("K3 MLA still reads its DCP device off kv_b_proj unguarded")
 
 if fail:
     sys.exit("[k3-ptpc] FATAL:\n  - " + "\n  - ".join(fail))
