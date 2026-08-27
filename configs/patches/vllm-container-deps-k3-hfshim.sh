@@ -68,12 +68,33 @@ else
         exit 1
     fi
 
-    SHA="$(git ls-remote "https://huggingface.co/$REPO_ID" HEAD 2>/dev/null | awk '{print $1}' | head -1 || true)"
-    if [[ -z "$SHA" ]]; then
-        SHA="$FALLBACK_SHA"
-        echo "[k3-hfshim] Hub unreachable; using pinned sha $SHA"
+    # K3_PIN_SHA names the revision the STAGED WEIGHTS ACTUALLY ARE, and takes
+    # precedence over whatever the Hub calls main today.
+    #
+    # WHY THIS OVERRIDE EXISTS. Without it this block labels the staged
+    # directory with the CURRENT Hub HEAD. moonshotai/Kimi-K3 is actively
+    # updated, so on 2026-08-26 HEAD was a590ce09 while every staged copy we
+    # run -- bia's (verified: refs/main = 9f62e4e9fff...), prenyx's, and every
+    # JET artifact -- is 9f62e4e. The wiring still serves the right bytes, but
+    # the cache entry, the fingerprint and the logs would all report a revision
+    # the weights are not. A cross-cluster comparison then silently carries a
+    # checkpoint delta that nothing in the record names.
+    #
+    # Set it to the revision of the directory in K3_STAGED_DIR. Leave it unset
+    # only when the staged copy really is today's HEAD.
+    if [[ -n "${K3_PIN_SHA:-}" ]]; then
+        SHA="$K3_PIN_SHA"
+        echo "[k3-hfshim] using pinned K3_PIN_SHA -> $SHA (not the Hub's current main)"
     else
-        echo "[k3-hfshim] resolved $REPO_ID main -> $SHA"
+        SHA="$(git ls-remote "https://huggingface.co/$REPO_ID" HEAD 2>/dev/null | awk '{print $1}' | head -1 || true)"
+        if [[ -z "$SHA" ]]; then
+            SHA="$FALLBACK_SHA"
+            echo "[k3-hfshim] Hub unreachable; using pinned sha $SHA"
+        else
+            echo "[k3-hfshim] resolved $REPO_ID main -> $SHA"
+            echo "[k3-hfshim] WARNING: labelling $STAGED_DIR with the Hub's current main."
+            echo "[k3-hfshim]          If the staged copy is an older revision, set K3_PIN_SHA."
+        fi
     fi
 
     mkdir -p "$CACHE_ENTRY/refs" "$CACHE_ENTRY/snapshots"

@@ -85,41 +85,37 @@ if [ "$MEM_TOTAL_GB" -lt "$((KV_PER_NODE_GB + 200))" ]; then
     exit 1
 fi
 
-# ── 3. The checkpoint, or nothing ────────────────────────────
-# srt-slurm has no model_paths alias on this cluster, so hf:moonshotai/Kimi-K3
-# resolves through HF_HOME. If it is not staged there, vLLM starts a 1.4 TB
-# download inside a 5-hour job and the job dies with a timeout that names
-# nothing. Fail here instead, naming every path tried.
-echo "=== Kimi-K3 checkpoint probe ==="
+# ── 3. Wire the HF cache to JET's shared copy ────────────────
+# srt-slurm has no model_paths alias here, so hf:moonshotai/Kimi-K3 resolves
+# through HF_HOME. Left to itself vLLM pulls the repo from the Hub -- which on
+# Hecate takes about 13 minutes, not the hours the runbook warns about, so the
+# cost is not walltime. The cost is CORRECTNESS: the Hub's main moves, and a
+# fresh pull gets whatever it is today (a590ce09 on 2026-08-26) while every
+# other cluster in this comparison runs 9f62e4e. bia's own cache says so:
+#   /lustre/fsw/coreai_comparch_infbench/common/cache/hub/
+#       models--moonshotai--Kimi-K3/refs/main = 9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+#
+# So point at the JET artifact instead of downloading. JET syncs this repo to
+# every cluster we use, hecate_lustre included, and it carries 9f62e4e. The
+# shim materialises HF cache layout over the staged directory; K3_PIN_SHA makes
+# it label the entry with the revision the weights actually are rather than the
+# Hub's current main.
+#
+# The shim fails loudly if K3_STAGED_DIR is absent, and proves the wiring with
+# an offline snapshot_download before returning. It also runs
+# vllm-container-deps.sh, which installs numactl and msgpack -- the only two
+# packages this arm adds. No framework version is touched; in particular there
+# is no FlashInfer pin, which is the point of running stock nightly.
+echo "=== Kimi-K3 checkpoint: wiring HF cache to the staged copy ==="
 HF_HOME="${HF_HOME:?HF_HOME must be set by the config}"
-CANDIDATES=(
-    "${HF_HOME}/hub/models--moonshotai--Kimi-K3"
-    "${HF_HOME}/models--moonshotai--Kimi-K3"
-    "/lustre/fsw/${SLURM_PPP:-}/common/cache/hub/models--moonshotai--Kimi-K3"
-    "/scratch/models/Kimi-K3"
-    "/models/Kimi-K3"
-)
-FOUND=""
-for c in "${CANDIDATES[@]}"; do
-    if [ -d "$c" ]; then
-        SZ=$(du -sBG "$c" 2>/dev/null | awk '{print $1}')
-        echo "  present: $c  ($SZ)"
-        FOUND="$c"
-        break
-    fi
-    echo "  absent : $c"
-done
+: "${K3_STAGED_DIR:?K3_STAGED_DIR must be set by the config (the JET artifact path)}"
+bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
-if [ -z "$FOUND" ]; then
-    echo
-    echo "FATAL: Kimi-K3 is not staged on this cluster."
-    echo "  HF_HOME=${HF_HOME}"
-    echo "  Without it vLLM downloads ~1.4 TB inside the job and the allocation"
-    echo "  expires before the server is ever healthy. Stage the checkpoint (JET"
-    echo "  distribute, or an out-of-band hf download into HF_HOME) and resubmit."
-    echo "  Paths tried are listed above."
-    exit 1
-fi
+FOUND="${HF_HOME}/hub/models--moonshotai--Kimi-K3"
+SZ=$(du -sBG -L "$FOUND" 2>/dev/null | awk '{print $1}')
+echo "  cache entry: $FOUND  ($SZ)"
+echo "  refs/main:   $(cat "$FOUND/refs/main" 2>/dev/null || echo '<none>')"
+echo "  staged dir:  $K3_STAGED_DIR"
 
 # A directory can exist and hold nothing but a failed partial download.
 #
@@ -129,9 +125,12 @@ fi
 # fully staged 1454 GB checkpoint. Shard filenames are self-describing --
 # model-00001-of-00096.safetensors -- so the file tree states its own expected
 # count and no number has to be remembered here.
-SHARDS=$(find "$FOUND" -name '*.safetensors' 2>/dev/null | wc -l)
-INCOMPLETE=$(find "$FOUND" -name '*.incomplete' 2>/dev/null | wc -l)
-EXPECTED=$(find "$FOUND" -name '*-of-*.safetensors' 2>/dev/null | head -1 \
+# find -L, NOT find. The shim wires snapshots/<sha> as a SYMLINK to the staged
+# directory, and plain find does not descend into symlinks -- it would report
+# zero shards on a perfectly good checkpoint and fail the job for it.
+SHARDS=$(find -L "$FOUND" -name '*.safetensors' 2>/dev/null | wc -l)
+INCOMPLETE=$(find -L "$FOUND" -name '*.incomplete' 2>/dev/null | wc -l)
+EXPECTED=$(find -L "$FOUND" -name '*-of-*.safetensors' 2>/dev/null | head -1 \
            | sed -nE 's/.*-of-0*([0-9]+)\.safetensors$/\1/p')
 echo "  safetensors shards: ${SHARDS} (filenames declare ${EXPECTED:-unknown}), .incomplete files: ${INCOMPLETE}"
 
