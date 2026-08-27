@@ -792,6 +792,14 @@ class ProfilingConfig:
     # Extra arguments passed to nsys profile (appended before `-o`; see get_nsys_prefix)
     extra_nsys_args: list[str] | None = None
 
+    # Nsight activity domains for `-t`. On Blackwell "cuda" selects hardware-event
+    # tracing, which kills the worker's async output copy stream at capture teardown;
+    # recipes there should ask for software tracing with "cuda-sw,nvtx". Kernel data is
+    # unchanged either way -- what a cuda-sw trace loses is CUPTI RUNTIME and
+    # SYNCHRONIZATION records, so CPU launch overhead is not recoverable from one.
+    # Default preserves the previous hardcoded value.
+    nsys_trace: str = "cuda,nvtx"
+
     # Phase-specific profiling step configs (not used for nsys-time)
     prefill: ProfilingPhaseConfig | None = None
     decode: ProfilingPhaseConfig | None = None
@@ -962,7 +970,7 @@ class ProfilingConfig:
                 self.nsys_binary,
                 "profile",
                 "-t",
-                "cuda,nvtx",
+                self.nsys_trace,
                 "--cuda-graph-trace=node",
                 "--force-overwrite",
                 "true",
@@ -983,7 +991,7 @@ class ProfilingConfig:
             self.nsys_binary,
             "profile",
             "-t",
-            "cuda,nvtx",
+            self.nsys_trace,
             "--cuda-graph-trace=node",
             "-c",
             "cudaProfilerApi",
