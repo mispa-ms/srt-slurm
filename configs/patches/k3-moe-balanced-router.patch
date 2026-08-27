@@ -1,0 +1,169 @@
+From 19a843c002c3b6508d4735b1454c805cccb66ace Mon Sep 17 00:00:00 2001
+From: Wei Zhao <weizha@oci-aga-slurm-1-vscode-02.cm.cluster>
+Date: Thu, 27 Aug 2026 10:05:13 -0700
+Subject: [PATCH] [MoE] Add deterministic balanced routing diagnostic
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+
+Signed-off-by: Wei Zhao <weizha@nvidia.com>
+---
+ tests/kernels/moe/test_routing_simulator.py   | 34 +++++++++++
+ vllm/envs.py                                  |  6 ++
+ .../layers/fused_moe/runner/moe_runner.py     | 57 ++++++++++++++++++-
+ 3 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/moe/test_routing_simulator.py b/tests/kernels/moe/test_routing_simulator.py
+index 35b1af618cf7..702013565ad7 100644
+--- a/tests/kernels/moe/test_routing_simulator.py
++++ b/tests/kernels/moe/test_routing_simulator.py
+@@ -23,6 +23,9 @@
+     DistributionBasedRouting,
+     RoutingSimulator,
+ )
++from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
++    balanced_router_logits,
++)
+ 
+ 
+ @pytest.fixture
+@@ -208,3 +211,34 @@ def test_instance_compatibility():
+ 
+     assert topk_weights.shape == (10, 2)
+     assert topk_ids.shape == (10, 2)
++
++
++def test_balanced_router_logits_minimize_expert_load_skew(device):
++    """Balanced diagnostic logits give every expert floor or ceil assignments."""
++    num_tokens = 315
++    num_experts = 896
++    top_k = 16
++    logits = torch.empty(num_tokens, num_experts, device=device)
++
++    balanced = balanced_router_logits(logits, top_k=top_k, dp_rank=0)
++    selected = balanced > 0
++    counts = selected.sum(dim=0)
++
++    assert torch.all(selected.sum(dim=1) == top_k)
++    assert counts.max() - counts.min() <= 1
++
++
++def test_balanced_router_logits_offset_data_parallel_ranks(device):
++    """DP-rank offsets balance the aggregate rather than repeating one subset."""
++    num_tokens = 20
++    num_experts = 896
++    top_k = 16
++    logits = torch.empty(num_tokens, num_experts, device=device)
++
++    aggregate = sum(
++        balanced_router_logits(logits, top_k=top_k, dp_rank=rank) > 0
++        for rank in range(16)
++    )
++    counts = aggregate.sum(dim=0)
++
++    assert counts.max() - counts.min() <= 1
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a24debdebd40..b97dc40d49f4 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1751,6 +1751,12 @@ def _resolve_rust_cli_path() -> str | None:
+     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
+         "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
+     ).lower(),
++    # Replace router logits with a deterministic, maximally balanced pattern.
++    # This preserves the configured MoE backend and is only for performance tests.
++    "VLLM_MOE_BALANCED_ROUTER_LOGITS": lambda: os.environ.get(
++        "VLLM_MOE_BALANCED_ROUTER_LOGITS", "0"
++    ).lower()
++    in ("1", "true"),
+     # Regex timeout for use by the vLLM tool parsing plugins.
+     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
+         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 66ad630e680b..dc368284d1b2 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -7,6 +7,7 @@
+ import torch
+ import torch.nn.functional as F
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.parallel import ExpertPlacementStrategy
+ from vllm.distributed import (
+@@ -54,6 +55,47 @@
+ 
+ logger = init_logger(__name__)
+ 
++_BALANCED_ROUTER_LOGITS_CACHE: dict[
++    tuple[str, torch.dtype, int, int, int, int], torch.Tensor
++] = {}
++
++
++def balanced_router_logits(
++    router_logits: torch.Tensor,
++    top_k: int,
++    dp_rank: int,
++) -> torch.Tensor:
++    """Build deterministic logits with maximally balanced expert selection."""
++    num_tokens, num_experts = router_logits.shape
++    if top_k > num_experts:
++        raise ValueError(
++            f"top_k ({top_k}) must not exceed num_experts ({num_experts})"
++        )
++    token_offsets = torch.arange(num_tokens, device=router_logits.device)
++    token_offsets = token_offsets * top_k + dp_rank * num_tokens * top_k
++    expert_ids = torch.arange(num_experts, device=router_logits.device)
++    selected = (expert_ids[None, :] - token_offsets[:, None]).remainder(num_experts)
++    selected = selected < top_k
++    return selected.to(router_logits.dtype).mul(40).sub(20)
++
++
++def _get_balanced_router_logits(
++    num_tokens: int,
++    num_experts: int,
++    top_k: int,
++    dp_rank: int,
++    dtype: torch.dtype,
++    device: torch.device | str,
++) -> torch.Tensor:
++    device = torch.device(device)
++    key = (str(device), dtype, num_tokens, num_experts, top_k, dp_rank)
++    cached = _BALANCED_ROUTER_LOGITS_CACHE.get(key)
++    if cached is None:
++        prototype = torch.empty(num_tokens, num_experts, dtype=dtype, device=device)
++        cached = balanced_router_logits(prototype, top_k, dp_rank)
++        _BALANCED_ROUTER_LOGITS_CACHE[key] = cached
++    return cached
++
+ 
+ def register_layer_for_moe_forward_op(
+     vllm_config: VllmConfig,
+@@ -271,7 +313,6 @@ def __init__(
+         self.shared_expert_gate = shared_expert_gate
+         self.routed_experts = routed_experts
+         self.enable_dbo = enable_dbo
+-
+         # When both gates are present and FSE is enabled, fuse their
+         # weight matrices into [num_experts + num_shared, hidden] so one
+         # F.linear produces combined logits. The topk kernel can then
+@@ -593,6 +634,20 @@ def _apply_quant_method(
+             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+         )
+ 
++        if envs.VLLM_MOE_BALANCED_ROUTER_LOGITS:
++            logger.warning_once(
++                "Replacing MoE router logits with a balanced diagnostic pattern. "
++                "Model outputs are not valid."
++            )
++            router_logits = _get_balanced_router_logits(
++                router_logits.shape[0],
++                router_logits.shape[1],
++                self.moe_config.experts_per_token,
++                self.moe_config.dp_rank,
++                router_logits.dtype,
++                router_logits.device,
++            )
++
+         if self.routed_experts.quant_method.is_monolithic:
+             # Monolithic kernels: pass router_logits to routed_experts
+             fused_out = self.routed_experts.forward_monolithic(
