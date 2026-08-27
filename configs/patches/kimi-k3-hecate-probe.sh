@@ -62,18 +62,26 @@ grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
 
 # ── 2. Host DRAM must cover the offload tier we asked for ────
 # The AgentX number is a coverage curve, y = P/(1-h)/N_gpu, so the host KV tier
-# is not a second-order knob -- it moves h, which moves the headline. That is
-# why this arm keeps native offload rather than dropping it for simplicity. But
-# the size in the YAML is a guess sized DOWN from bia's 1700 GB, and a request
-# the node cannot back gets the job OOM-killed mid-run rather than rejected at
-# start. Check it here, while failing is still cheap.
-KV_OFFLOAD_GB="${K3_KV_OFFLOAD_GB:-600}"
+# is not a second-order knob -- it moves h, which moves the headline. A request
+# the node cannot back is not rejected at start; it is OOM-killed mid-run. Check
+# it here, while failing is still cheap.
+#
+# THE UNIT MATTERS AND IS NOT OBVIOUS. vLLM's kv-offloading-size is documented
+# in config/cache.py:241 as "the total buffer size summed across ALL TP ranks"
+# -- server-wide, not per node. This script runs on each worker node, so the
+# number to check against /proc/meminfo is the server-wide total divided by the
+# node count, which the config passes as K3_KV_OFFLOAD_PER_NODE_GB. Comparing
+# the server-wide figure against one node's MemTotal would reject configurations
+# that fit, which is how the first Hecate submission would have been mis-sized
+# in the other direction.
+KV_PER_NODE_GB="${K3_KV_OFFLOAD_PER_NODE_GB:-${K3_KV_OFFLOAD_GB:-600}}"
 MEM_TOTAL_GB=$(awk '/^MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
-echo "host MemTotal ${MEM_TOTAL_GB} GB, config asks for ${KV_OFFLOAD_GB} GB of host KV"
-if [ "$MEM_TOTAL_GB" -lt "$((KV_OFFLOAD_GB + 200))" ]; then
-    echo "FATAL: node has ${MEM_TOTAL_GB} GB; ${KV_OFFLOAD_GB} GB of host KV plus"
+echo "host MemTotal ${MEM_TOTAL_GB} GB; this node's share of the KV tier is ${KV_PER_NODE_GB} GB"
+if [ "$MEM_TOTAL_GB" -lt "$((KV_PER_NODE_GB + 200))" ]; then
+    echo "FATAL: node has ${MEM_TOTAL_GB} GB; ${KV_PER_NODE_GB} GB of host KV plus"
     echo "       ~200 GB of headroom does not fit. Lower kv-offloading-size and"
-    echo "       TOTAL_CPU_DRAM_GB in the config to at most $((MEM_TOTAL_GB - 200))."
+    echo "       TOTAL_CPU_DRAM_GB (both server-wide) so that the per-node share"
+    echo "       is at most $((MEM_TOTAL_GB - 200)) GB."
     exit 1
 fi
 
@@ -114,13 +122,35 @@ if [ -z "$FOUND" ]; then
 fi
 
 # A directory can exist and hold nothing but a failed partial download.
+#
+# DERIVE THE EXPECTED COUNT, DO NOT HARDCODE IT. An earlier revision of this
+# script asserted `shards >= 100` on the belief that "a complete K3 checkpoint
+# has several hundred". It has 96. That guess failed three healthy jobs on a
+# fully staged 1454 GB checkpoint. Shard filenames are self-describing --
+# model-00001-of-00096.safetensors -- so the file tree states its own expected
+# count and no number has to be remembered here.
 SHARDS=$(find "$FOUND" -name '*.safetensors' 2>/dev/null | wc -l)
 INCOMPLETE=$(find "$FOUND" -name '*.incomplete' 2>/dev/null | wc -l)
-echo "  safetensors shards: ${SHARDS}, .incomplete files: ${INCOMPLETE}"
-if [ "$SHARDS" -lt 100 ]; then
-    echo "FATAL: only ${SHARDS} safetensors shards under ${FOUND}; a complete"
-    echo "       Kimi-K3 MXFP4 checkpoint has several hundred. This is a partial"
-    echo "       or in-progress download, not a staged model."
+EXPECTED=$(find "$FOUND" -name '*-of-*.safetensors' 2>/dev/null | head -1 \
+           | sed -nE 's/.*-of-0*([0-9]+)\.safetensors$/\1/p')
+echo "  safetensors shards: ${SHARDS} (filenames declare ${EXPECTED:-unknown}), .incomplete files: ${INCOMPLETE}"
+
+if [ "$INCOMPLETE" -gt 0 ]; then
+    echo "FATAL: ${INCOMPLETE} .incomplete file(s) under ${FOUND} -- a download is"
+    echo "       in progress or was interrupted. Not a staged model."
+    exit 1
+fi
+if [ -n "$EXPECTED" ]; then
+    if [ "$SHARDS" -lt "$EXPECTED" ]; then
+        echo "FATAL: ${SHARDS} of ${EXPECTED} safetensors shards present under ${FOUND}."
+        echo "       The filenames declare ${EXPECTED}; this checkpoint is truncated."
+        exit 1
+    fi
+elif [ "$SHARDS" -lt 2 ]; then
+    # No -of- pattern to read, so fall back to the weakest defensible claim:
+    # a 2.8T model is never one shard.
+    echo "FATAL: ${SHARDS} safetensors file(s) under ${FOUND} and no -of-N naming"
+    echo "       to check against. This is not a sharded Kimi-K3 checkpoint."
     exit 1
 fi
 
