@@ -23,6 +23,13 @@
 # under balance and compared against the same ratio taken without it (1.270 on the
 # -iterlog pair). Both arms carry the same distortion, so that ratio is readable.
 #
+# THE tests/ HUNK IS STRIPPED, AND THAT IS WHY. The upstream commit also touches
+# tests/kernels/moe/test_routing_simulator.py, which does not exist in the container:
+# vllm is installed into dist-packages as a wheel and ships no tests tree. patch(1)
+# refuses the whole file on the first missing target -- "can't find file to patch at
+# input line 19" -- so a patch verified against a git worktree fails against the
+# image. Dry-run against the installed layout, not the source tree.
+#
 # Verified to apply to 728d3ad with --fuzz=0, all hunks, offsets only. The K3 MoE
 # reaches the patched call site: model.py:624 builds its experts through
 # FusedMoEFactory, and the hook sits in _apply_quant_method just before
