@@ -151,3 +151,83 @@ if eligible:
 PY
 
 echo "=== gates narrowed ==="
+
+# ── A ptxas that knows sm_107 ────────────────────────────────────────────────
+# After the gates above, pipeline 64809381 loaded the model (192.85 GiB/rank,
+# 176 s) and died in memory profiling on
+#
+#     ptxas fatal : Value 'sm_107a' is not defined for option 'gpu-name'
+#     Repro: /usr/local/cuda/bin/ptxas --gpu-name=sm_107a /tmp/x.ptx -o ...
+#
+# This is the CUDA toolchain, not vLLM. The container ships CUDA 13.0.88, whose
+# ptxas has no sm_107 at all. Checked, by pulling the aarch64 wheels and reading
+# the target table out of each binary:
+#
+#     13.0.88   sm_100 100a 100f 103 103a 103f 120 121 ...      NO sm_107
+#     13.3.73   ... adds sm_110 110a 110f ...                   NO sm_107
+#     13.4.46rc1  sm_100 ... 103 ... sm_107 sm_107a sm_107f ... YES
+#
+# 13.4 is exactly the base the framework team's Rubin images are built on --
+# ci/sweep_configs/hecate-testing/sglang/gpt-oss-120b/VR200/AGG/... says
+# "CUDA 13.4 inference-devel base", and that image is the one that produced the
+# only successful sweep_hecate we can find (pipeline 57014089, gpt-oss-120b,
+# 2026-07-06). So install 13.4's ptxas and point Triton at it. TRITON_PTXAS_PATH
+# is the documented knob for exactly this -- vLLM's own troubleshooting guide
+# recommends it when "the ptxas in the triton bundle is not compatible with your
+# device".
+#
+# The variable itself is set in the config's aggregated_environment, NOT here:
+# this script runs as a child bash, so an export would not reach the server.
+# This step only has to make the binary exist at the path the config names.
+#
+# CAVEAT, recorded because it may be the next wall. The same failure logged
+#     'sm_107a' is not a recognized processor for this target (ignoring processor)
+# from LLVM, i.e. Triton's own backend does not know sm_107a either and fell
+# back to a default target before handing the PTX to ptxas. A newer ptxas fixes
+# the hard error; whether the PTX LLVM produced is right for Rubin is a separate
+# question. For the plain elementwise kernels this stack needs, it should be --
+# everything arch-specific here goes through FlashInfer/CUTLASS cubins, which
+# already work on sm_107. If Triton kernels compile but misbehave, that is where
+# to look.
+PTXAS_PKG_VER="${K3_PTXAS_VER:-13.4.46rc1}"
+echo "=== installing ptxas from nvidia-cuda-nvcc==${PTXAS_PKG_VER} ==="
+python3 -m pip install --no-deps --quiet "nvidia-cuda-nvcc==${PTXAS_PKG_VER}"
+
+python3 - <<'PY'
+import pathlib
+import subprocess
+import sys
+import sysconfig
+
+site = pathlib.Path(sysconfig.get_paths()["purelib"])
+ptxas = site / "nvidia/cu13/bin/ptxas"
+if not ptxas.is_file():
+    hits = list(site.glob("nvidia/**/bin/ptxas"))
+    sys.exit(f"FATAL: ptxas not at {ptxas}; found instead: {hits}")
+
+ptxas.chmod(0o755)
+ver = subprocess.run([str(ptxas), "--version"], capture_output=True, text=True)
+print(ver.stdout.strip() or ver.stderr.strip())
+
+# The whole point is sm_107. Prove this binary accepts it rather than assuming
+# the version number implies it.
+probe = pathlib.Path("/tmp/_sm107_probe.ptx")
+probe.write_text(
+    ".version 8.0\n.target sm_90\n.address_size 64\n"
+    ".visible .entry _nop() { ret; }\n"
+)
+for arch in ("sm_107a", "sm_107"):
+    r = subprocess.run(
+        [str(ptxas), f"--gpu-name={arch}", str(probe), "-o", "/tmp/_probe.o"],
+        capture_output=True, text=True,
+    )
+    ok = "accepts" if "is not defined for option" not in r.stderr else "REJECTS"
+    print(f"  {ptxas.name} {ok} --gpu-name={arch}")
+    if ok == "REJECTS":
+        sys.exit(f"FATAL: this ptxas does not know {arch}: {r.stderr.strip()[:200]}")
+
+print(f"ptxas ready at {ptxas}")
+print("  (the config must set TRITON_PTXAS_PATH to exactly this path)")
+PY
+
+echo "=== ptxas ready ==="

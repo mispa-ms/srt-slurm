@@ -60,6 +60,40 @@ ibv_devices 2>/dev/null || echo "WARNING: ibv_devices unavailable (no RDMA visib
 echo "=== host DRAM ==="
 grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
 
+# ── Can this container's toolchain even target this GPU ──────
+# The single most expensive thing we got wrong on Hecate. Pipeline 64809381
+# loaded 192.85 GiB/rank of weights over 176 s and only then died on
+#     ptxas fatal : Value 'sm_107a' is not defined for option 'gpu-name'
+# because the image shipped CUDA 13.0.88, whose ptxas has no sm_107 target at
+# all (13.3.73 has none either; 13.4 is the first that does). Every Triton JIT
+# in the process dies the same way, so nothing downstream can work.
+#
+# One ptxas invocation on a four-line PTX file answers it in milliseconds.
+# Fail here rather than forty minutes into weight loading.
+echo "=== toolchain: can ptxas target this device? ==="
+CAP=$(python3 -c "import torch;print('%d%d' % torch.cuda.get_device_capability(0))" 2>/dev/null || echo "")
+if [ -z "$CAP" ]; then
+    echo "WARNING: could not read device capability from torch; skipping the ptxas check"
+else
+    PTXAS="${TRITON_PTXAS_PATH:-$(command -v ptxas || echo /usr/local/cuda/bin/ptxas)}"
+    echo "  device capability sm_${CAP}, testing $PTXAS"
+    "$PTXAS" --version 2>&1 | tail -1
+    printf '.version 8.0\n.target sm_90\n.address_size 64\n.visible .entry _nop() { ret; }\n' > /tmp/_cap_probe.ptx
+    if ! "$PTXAS" "--gpu-name=sm_${CAP}a" /tmp/_cap_probe.ptx -o /tmp/_cap_probe.o 2>/tmp/_cap_probe.err; then
+        echo "FATAL: $PTXAS cannot target sm_${CAP}a:"
+        sed 's/^/       /' /tmp/_cap_probe.err
+        echo "       This container's CUDA predates the GPU. Every Triton JIT will"
+        echo "       fail the same way, after the model has already been loaded."
+        echo "       Use an image whose CUDA knows sm_${CAP} -- on Hecate that is"
+        echo "       gitlab-master.nvidia.com:5005/dl/dgx/vllm:rubin-py3-devel, a"
+        echo "       nightly (CUDA 13.5 as of 2026-08-26). Or install a 13.4+"
+        echo "       ptxas and point TRITON_PTXAS_PATH at it, which fixes Triton"
+        echo "       but not the CuTe DSL paths."
+        exit 1
+    fi
+    echo "  OK: $PTXAS targets sm_${CAP}a"
+fi
+
 # ── 2. Host DRAM must cover the offload tier we asked for ────
 # The AgentX number is a coverage curve, y = P/(1-h)/N_gpu, so the host KV tier
 # is not a second-order knob -- it moves h, which moves the headline. A request
