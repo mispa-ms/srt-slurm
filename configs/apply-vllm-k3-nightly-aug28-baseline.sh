@@ -13,11 +13,13 @@ readonly K3_AGENT_PATCH_FILE="${VLLM_K3_AGENT_PATCH_FILE:-/configs/patches/vllm-
 readonly K3_TAIL_GATE_PATCH_FILE="${VLLM_K3_TAIL_GATE_PATCH_FILE:-/configs/patches/vllm-k3-latent-tail-env-gate-on-6f7df92a8.patch}"
 readonly K3_DEFERRED_FINALIZE_GATE_PATCH_FILE="${VLLM_K3_DEFERRED_FINALIZE_GATE_PATCH_FILE:-/configs/patches/vllm-k3-deferred-moe-finalize-env-gate-on-6f7df92a8.patch}"
 readonly K3_CHECKPOINT_INDEX_INT64_PATCH_FILE="${VLLM_K3_CHECKPOINT_INDEX_INT64_PATCH_FILE:-/configs/patches/vllm-k3-prefill-checkpoint-index-int64-on-6f7df92a8.patch}"
+readonly PR54167_PATCH_FILE="${VLLM_PR54167_PATCH_FILE:-/configs/patches/vllm-pr54167-low-latency-gemm-init-on-6f7df92a8.patch}"
 readonly PR53324_MARKER_FILE="${VLLM_ROOT}/.pr53324_574d2e4_on_6f7df92a8"
 readonly K3_AGENT_MARKER_FILE="${VLLM_ROOT}/.k3_agent_all_728d3ad_on_6f7df92a8"
 readonly K3_TAIL_GATE_MARKER_FILE="${VLLM_ROOT}/.k3_latent_tail_env_gate_on_6f7df92a8"
 readonly K3_DEFERRED_FINALIZE_GATE_MARKER_FILE="${VLLM_ROOT}/.k3_deferred_moe_finalize_env_gate_on_6f7df92a8"
 readonly K3_CHECKPOINT_INDEX_INT64_MARKER_FILE="${VLLM_ROOT}/.k3_prefill_checkpoint_index_int64_on_6f7df92a8"
+readonly PR54167_MARKER_FILE="${VLLM_ROOT}/.pr54167_f956e1c_on_6f7df92a8"
 
 if [[ ! -r "${VERSION_FILE}" ]] || ! grep -q "6f7df92a8" "${VERSION_FILE}"; then
   echo "Refusing to patch: expected vLLM nightly commit 6f7df92a8." >&2
@@ -80,6 +82,14 @@ apply_patch_once \
   "Kimi-K3 prefill checkpoint 64-bit cache index" \
   "${K3_CHECKPOINT_INDEX_INT64_PATCH_FILE}" \
   "${K3_CHECKPOINT_INDEX_INT64_MARKER_FILE}"
+# vLLM PR #54167 (f956e1c) landed at 08:32Z on Aug 28; this nightly was pushed at
+# 06:13Z and does not carry it. Without it KimiK3LowLatencyLinearMethod never sets
+# _gemm_impl, and the first shape the low-latency plan declines takes down the
+# engine from kda.py. Applied last so it patches the tree the others produced.
+apply_patch_once \
+  "vLLM PR #54167 merged commit f956e1c" \
+  "${PR54167_PATCH_FILE}" \
+  "${PR54167_MARKER_FILE}"
 python3 -m compileall -q \
   "${VLLM_ROOT}/config/speculative.py" \
   "${VLLM_ROOT}/distributed/kv_transfer/kv_connector/v1/mooncake/store" \

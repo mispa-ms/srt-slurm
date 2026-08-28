@@ -1,0 +1,34 @@
+From f956e1c343dc63720b50c01209bd5ada6d8589a2 Mon Sep 17 00:00:00 2001
+Subject: [Kimi-K3][Bugfix] Fix low-latency GEMM fallback initialization
+
+vllm-project/vllm#54167, merged 2026-08-28T08:32:21Z. The Aug 28 nightly
+6f7df92a8 was pushed at 06:13Z, two hours before this landed, so it needs the
+fix applied by hand.
+
+#50572 changed UnquantizedLinearMethod to select and store its GEMM
+implementation as _gemm_impl during __init__. KimiK3LowLatencyLinearMethod is
+_KimiK3LowLatencyApply + UnquantizedLinearMethod, and the mixin's __init__ never
+chained, so _gemm_impl was never set. Any shape the low-latency plan declines
+falls through to the base method and dies:
+
+  kda.py:608 -> linear.py:589 -> low_latency_gemm.py:744 apply -> linear.py:225
+  AttributeError: 'KimiK3LowLatencyLinearMethod' object has no attribute '_gemm_impl'
+
+Both our arms hit it on 6f7df92a8, control included, so it is unrelated to
+online quantization.
+
+Only the source hunk is carried here; the PR's test-file change is dropped
+because the container has no tests tree.
+---
+diff --git a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+index ecab56dbe4ac..52e6aa0475dd 100644
+--- a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
++++ b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+@@ -725,6 +725,7 @@ class _KimiK3LowLatencyApply:
+     """Mixin: try the precomputed plan, else defer to the base method."""
+ 
+     def __init__(self, plan: dict[int, ResolvedCall]) -> None:
++        super().__init__()
+         self._plan = plan
+ 
+     def apply(
