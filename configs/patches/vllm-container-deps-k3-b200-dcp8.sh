@@ -60,15 +60,41 @@ command -v patch >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -
 #
 # Eight files, none of them model_runner.py, so this is order-independent against the
 # three edits that do land there.
+# #53324 is still open upstream, so every image that has the guard needs it, and the
+# guard has outlived two rebases. There are now two derivations of the same PR -- one
+# cut against a9a17e7095, one against the 2026-08-28 nightly, which renamed
+# kv_cache_config.kv_cache_groups to .transfer_groups and rewrote the single-group
+# block-size scaling. Rather than key the choice off an image tag, try each and take
+# the one that dry-runs clean at fuzz 0. Selecting by fit is checkable; selecting by
+# tag is a guess that fails in setup an hour later.
 if grep -q "PCP/DCP > 1" "$VLLM_ROOT/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py"; then
     echo "=== mooncake-dcp: applying vLLM PR #53324 ==="
-    if ! patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 < /configs/patches/k3-mooncake-dcp-53324.patch > /tmp/mk53324-dry.log 2>&1; then
-        echo "[mooncake-dcp] FATAL: PR #53324 does not apply to this image" >&2
-        cat /tmp/mk53324-dry.log >&2
+    MK_PATCH=""
+    # Order matters, and not for taste. The 828 derivation also applies cleanly to
+    # a9a17e7095, so listing it first would silently change what that image runs and
+    # break comparability with the numbers already measured on it. Original first,
+    # 828 as the fallback: each image keeps the derivation it was measured with.
+    for CAND in /configs/patches/k3-mooncake-dcp-53324.patch \
+                /configs/patches/k3-mooncake-53324-828.patch; do
+        [ -f "$CAND" ] || continue
+        if patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 < "$CAND" \
+             > "/tmp/mk53324-$(basename "$CAND").log" 2>&1; then
+            MK_PATCH="$CAND"
+            break
+        fi
+        echo "[mooncake-dcp] $(basename "$CAND") does not fit this image"
+    done
+    if [ -z "$MK_PATCH" ]; then
+        echo "[mooncake-dcp] FATAL: no derivation of PR #53324 applies to this image" >&2
+        cat /tmp/mk53324-*.log >&2
         exit 1
     fi
-    patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < /configs/patches/k3-mooncake-dcp-53324.patch
-    echo "[mooncake-dcp] PR #53324 applied; DCP no longer refused"
+    patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < "$MK_PATCH"
+    echo "[mooncake-dcp] PR #53324 applied from $(basename "$MK_PATCH"); DCP no longer refused"
+    if grep -q "PCP/DCP > 1" "$VLLM_ROOT/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py"; then
+        echo "[mooncake-dcp] FATAL: the DCP refusal survived the patch" >&2
+        exit 1
+    fi
 else
     echo "[mooncake-dcp] no PCP/DCP guard in this image; skipping PR #53324"
 fi
