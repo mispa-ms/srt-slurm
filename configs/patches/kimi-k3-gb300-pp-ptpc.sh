@@ -31,6 +31,16 @@ set -euo pipefail
 
 bash /configs/patches/kimi-k3-gb300-pp.sh
 
+# Name the RDMA devices this node actually has. Mooncake's device_name is
+# rendered from the recipe before the container starts, so this cannot fix a
+# wrong value -- it reports one. oci-aga is rdma_vf_rail0..3; lyris has no
+# Mooncake precedent at all, and an unnamed device list silently falls back to
+# auto-discovery, which finds nothing in this container and leaves the segment
+# unmounted at a 0% external hit.
+echo "=== k3-ptpc: RDMA devices on $(hostname) ==="
+(ibv_devices 2>/dev/null || echo "  ibv_devices: absent") | sed 's/^/  /'
+ls /sys/class/infiniband 2>/dev/null | sed 's/^/  sysfs: /' || echo "  /sys/class/infiniband: absent"
+
 echo "=== k3-ptpc: apply vllm#51392 (online quant over a partial checkpoint) ==="
 
 PATCH=/configs/patches/vllm-pr51392-online-partial-quant.patch
