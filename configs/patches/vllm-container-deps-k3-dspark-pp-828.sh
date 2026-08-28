@@ -97,7 +97,11 @@ for src, tok, what in need:
 
 import vllm.v1.worker.gpu.spec_decode.dspark.utils  # noqa: F401
 import vllm.models.kimi_k3.nvidia.model  # noqa: F401
-from vllm.model_executor.models.interfaces import (  # noqa: F401
+# The predicate lives in eagle3_utils, next to the layer-tap helpers, and that is
+# where model_runner imports it from. An earlier version of this check imported it
+# from interfaces -- where only the ClassVar lives -- and failed a run on its own
+# mistake rather than on the patch.
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (  # noqa: F401
     supports_aux_hidden_states_over_pp,
 )
 
