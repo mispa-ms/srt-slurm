@@ -1,0 +1,15 @@
+diff --git a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+--- a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
++++ b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+@@ -725,6 +725,11 @@
+     """Mixin: try the precomputed plan, else defer to the base method."""
+ 
+     def __init__(self, plan: dict[int, ResolvedCall]) -> None:
++        # The mixin sits in front of UnquantizedLinearMethod, whose __init__
++        # is what sets _gemm_impl. Without this chain the fallback path in
++        # apply() -- taken whenever the plan has no entry for x.shape[0] --
++        # reaches super().apply() on a method that has no _gemm_impl.
++        super().__init__()
+         self._plan = plan
+ 
+     def apply(

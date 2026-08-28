@@ -38,4 +38,36 @@ echo "[k3-aug28] staged checkpoint: ${K3_STAGED_DIR}"
 
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
-exec bash /configs/apply-vllm-k3-nightly-aug28-baseline.sh
+bash /configs/apply-vllm-k3-nightly-aug28-baseline.sh
+
+# One more, and it is upstream's rather than this stack's.
+#
+# enable_kimi_k3_low_latency_gemm swaps a fresh KimiK3LowLatencyLinearMethod
+# onto every unquantized K3 linear whose (N, K) is in the measured table. That
+# class inherits _KimiK3LowLatencyApply before UnquantizedLinearMethod, and the
+# mixin's __init__ never chains, so UnquantizedLinearMethod.__init__ -- the only
+# place _gemm_impl is assigned -- does not run. apply() falls back to
+# super().apply() the moment the plan has no entry for the current token count,
+# which the 16384-token profile_run guarantees:
+#
+#   AttributeError: 'KimiK3LowLatencyLinearMethod' object has no attribute
+#   '_gemm_impl'   (kda.py:608 in_proj_qkvgfab -> linear.py:589)
+#
+# This does not fire on the online-quant arms: with linear=fp8_per_channel the
+# affected layers are no longer UnquantizedLinearMethod, so the swap skips them
+# and the missing __init__ is never reached. Dropping online quantization is
+# what exposes it.
+VLLM_ROOT=$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')
+LL_PATCH=/configs/patches/vllm-k3-lowlatency-linear-init-on-6f7df92a8.patch
+if patch --batch --forward --dry-run -d "${VLLM_ROOT}" -p1 < "${LL_PATCH}" >/dev/null; then
+    patch --batch --forward -d "${VLLM_ROOT}" -p1 < "${LL_PATCH}"
+    echo "[k3-aug28] applied low-latency linear __init__ chain"
+elif patch --batch --reverse --dry-run -d "${VLLM_ROOT}" -p1 < "${LL_PATCH}" >/dev/null; then
+    echo "[k3-aug28] low-latency linear __init__ chain already present"
+else
+    echo "[k3-aug28] FATAL: low-latency linear patch does not apply." >&2
+    exit 1
+fi
+
+python3 -c 'import importlib.util,os;r=os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin));s=open(r+"/vllm/models/kimi_k3/nvidia/low_latency_gemm.py").read();assert "super().__init__()\n        self._plan" in s, "low-latency __init__ chain missing";print("[k3-aug28] verified: _gemm_impl will be set on the swapped-in method")'
+
