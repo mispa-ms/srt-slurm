@@ -1,0 +1,1885 @@
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index b903beac249a..16b17b251c1b 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -36,7 +36,11 @@
+     compute_causal_conv1d_metadata,
+     split_decodes_and_prefills,
+ )
+-from vllm.v1.kv_cache_interface import MambaSpec
++from vllm.v1.kv_cache_interface import (
++    MambaSpec,
++    get_mamba_prefill_checkpoint_info,
++    is_mamba_prefill_checkpoint_enabled,
++)
+ 
+ if TYPE_CHECKING:
+     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+@@ -568,11 +572,11 @@ def build(  # type: ignore[override]
+             has_initial_state = None
+ 
+         checkpoint = None
+-        if (
+-            num_prefills > 0
+-            and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+-        ):
++        checkpoint_enabled = is_mamba_prefill_checkpoint_enabled(
++            self.vllm_config.cache_config.mamba_cache_mode,
++            self.kv_cache_spec.num_prefill_checkpoint_blocks,
++        )
++        if num_prefills > 0 and checkpoint_enabled:
+             # prepare checkpoint metadata
+             assert m.seq_lens_cpu_upper_bound is not None
+             request_rows = list(range(m.num_reqs))
+@@ -583,21 +587,31 @@ def build(  # type: ignore[override]
+             query_lens = [all_query_lens[row] for row in request_rows]
+             seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+             block_size = self.kv_cache_spec.block_size
++            hash_block_size = (
++                self.vllm_config.cache_config.prefix_match_unit or block_size
++            )
++            speculative_config = self.vllm_config.speculative_config
++            drop_eagle_block = (
++                speculative_config is not None and speculative_config.use_eagle()
++            )
+             checkpoint_splits = []
+             checkpoint_cols = []
+             for row, query_len in zip(request_rows, query_lens):
+                 seq_len = seq_lens[row]
+-                offset = seq_len // block_size * block_size - (seq_len - query_len)
+-                # offset should be less than query_len
+-                valid = (
+-                    seq_len % block_size != 0
+-                    and 0 < offset < query_len
+-                    and offset % FLASHKDA_CHUNK_SIZE == 0
++                checkpoint_info = get_mamba_prefill_checkpoint_info(
++                    prefill_end=seq_len,
++                    query_start=seq_len - query_len,
++                    query_end=seq_len,
++                    hash_block_size=hash_block_size,
++                    mamba_block_size=block_size,
++                    drop_eagle_block=drop_eagle_block,
+                 )
++                offset = checkpoint_info.offset
++                valid = offset > 0 and offset % FLASHKDA_CHUNK_SIZE == 0
+                 offset = offset if valid else 0
+                 first_len = offset or query_len
+                 checkpoint_splits.append((first_len, query_len - first_len))
+-                checkpoint_cols.append(seq_len // block_size - 1 if valid else -1)
++                checkpoint_cols.append((seq_len - 1) // block_size - 1 if valid else -1)
+             if any(tail for _, tail in checkpoint_splits):
+                 checkpoint_offsets_tensor = async_tensor_h2d(
+                     [first if tail else 0 for first, tail in checkpoint_splits],
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index a8a6c1ca94da..272f71476fe5 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -543,6 +543,46 @@ def cache_partial_block(
+             )
+         return block_hash_with_group_id
+ 
++    def cache_checkpoint_block(
++        self,
++        request: Request,
++        block: KVCacheBlock,
++        num_tokens: int,
++        kv_cache_group_id: int,
++        block_size: int,
++    ) -> BlockHashWithGroupId | None:
++        """Re-key a backend checkpoint block at its exact prefix boundary."""
++        if block.is_null:
++            return None
++
++        assert block_size >= self.hash_block_size
++        assert block_size % self.hash_block_size == 0
++        assert num_tokens > 0 and num_tokens % self.hash_block_size == 0
++
++        removed_hashes = self._remove_cached_block_hashes(block)
++        self._emit_block_removed_events(removed_hashes)
++        if num_tokens % block_size != 0:
++            return self.cache_partial_block(
++                request=request,
++                block=block,
++                num_tokens=num_tokens,
++                kv_cache_group_id=kv_cache_group_id,
++                block_size=block_size,
++            )
++
++        num_full_blocks = num_tokens // block_size
++        checkpoint_blocks = [self.null_block] * num_full_blocks
++        checkpoint_blocks[-1] = block
++        self.cache_full_blocks(
++            request=request,
++            blocks=checkpoint_blocks,
++            num_cached_blocks=num_full_blocks - 1,
++            num_full_blocks=num_full_blocks,
++            block_size=block_size,
++            kv_cache_group_id=kv_cache_group_id,
++        )
++        return block.block_hash
++
+     def _get_partial_block_hash(
+         self,
+         request: Request,
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 767ea0033483..00df32d0f429 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -14,6 +14,7 @@
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
++    MambaManager,
+     SingleTypeKVCacheManager,
+     get_manager_for_kv_cache_spec,
+ )
+@@ -148,6 +149,11 @@ def __init__(
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
++        # A hybrid model's Mamba group is not itself an Eagle cache group, but
++        # its checkpoint must match the boundary to which FullAttention drops.
++        for manager in self.single_type_managers:
++            if isinstance(manager, MambaManager):
++                manager.drop_eagle_checkpoint_block = bool(self.eagle_group_ids)
+ 
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+@@ -167,6 +173,7 @@ def get_num_blocks_to_allocate(
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
++        mamba_checkpoint_position: int = 0,
+     ) -> int:
+         """
+         Get the number of blocks needed to be allocated for the request.
+@@ -207,6 +214,17 @@ def get_num_blocks_to_allocate(
+                     num_encoder_tokens,
+                     apply_admission_cap=apply_admission_cap,
+                 )
++            elif isinstance(manager, MambaManager):
++                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                    request_id,
++                    num_tokens,
++                    new_computed_blocks[i],
++                    total_computed_tokens,
++                    num_local_computed_tokens,
++                    num_tokens_main_model,
++                    apply_admission_cap=apply_admission_cap,
++                    mamba_checkpoint_position=mamba_checkpoint_position,
++                )
+             else:
+                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                     request_id,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index d1af91b65993..c3526e8cf6c1 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -357,6 +357,7 @@ def allocate_slots(
+         full_sequence_must_fit: bool = False,
+         reserved_blocks: int = 0,
+         has_scheduled_reqs: bool = True,
++        mamba_checkpoint_position: int = 0,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -389,6 +390,8 @@ def allocate_slots(
+                 blocks an already in-flight (prefilling) sequence is relying on.
+             has_scheduled_reqs: Whether any requests are already scheduled to run
+                 this step, controls whether watermark is applied.
++            mamba_checkpoint_position: Scheduler-selected absolute position
++                for an internal Mamba checkpoint, or zero.
+ 
+         Blocks layout:
+         ```
+@@ -519,6 +522,7 @@ def allocate_slots(
+             + num_external_computed_tokens,
+             num_local_computed_tokens=num_local_computed_tokens,
+             num_tokens_main_model=num_tokens_main_model,
++            mamba_checkpoint_position=mamba_checkpoint_position,
+         )
+ 
+         # Keep `reserved_blocks` free for other in-flight sequences, and an
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c06760b80687..9f1ec816ebb3 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -53,7 +53,14 @@
+ )
+ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    MambaPrefillCheckpointInfo,
++    MambaSpec,
++    get_mamba_prefill_checkpoint_info,
++    get_mamba_prefill_checkpoint_position,
++    is_mamba_prefill_checkpoint_enabled,
++)
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+     PrefixCacheStats,
+@@ -324,14 +331,23 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
++        mamba_specs = [
++            group.kv_cache_spec
++            for group in kv_cache_config.kv_cache_groups
++            if isinstance(group.kv_cache_spec, MambaSpec)
++        ]
++        mamba_block_sizes = {spec.block_size for spec in mamba_specs}
++        self.mamba_block_size = (
++            next(iter(mamba_block_sizes))
++            if len(mamba_block_sizes) == 1
++            else self.block_size
++        )
+         self.mamba_has_prefill_checkpoint_blocks = (
+             self.has_mamba_layers
+-            # TODO: support spec decoding
+-            and not self.use_eagle
+-            and all(
+-                not isinstance(group.kv_cache_spec, MambaSpec)
+-                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-                for group in kv_cache_config.kv_cache_groups
++            and bool(mamba_specs)
++            and is_mamba_prefill_checkpoint_enabled(
++                self.cache_config.mamba_cache_mode,
++                min(spec.num_prefill_checkpoint_blocks for spec in mamba_specs),
+             )
+         )
+         # A finer prefix_match_unit is configured: a mamba partial tail entry
+@@ -407,7 +423,9 @@ def _mamba_block_aligned_split(
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        block_size = self.cache_config.block_size
++        # CacheConfig retains the model's initial attention block size even
++        # when hybrid page-size unification enlarges the Mamba block.
++        block_size = self.mamba_block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+@@ -416,9 +434,15 @@ def _mamba_block_aligned_split(
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+-        use_internal_checkpoint = (
+-            self.mamba_has_prefill_checkpoint_blocks and start % block_size == 0
++        checkpoint = Scheduler._get_mamba_prefill_checkpoint_info(
++            self,
++            request,
++            num_new_tokens,
++            num_new_local_computed_tokens,
++            num_external_computed_tokens,
+         )
++        checkpoint_position = checkpoint.position
++        use_internal_checkpoint = checkpoint.offset > 0
+         if use_internal_checkpoint:
+             last_cache_position = 0
+         # Invariant: slot p holds the state after exactly (p + 1) * block_size
+@@ -435,10 +459,31 @@ def _mamba_block_aligned_split(
+             if aligned_end > start or block_size <= max_prefill_tokens:
+                 end = aligned_end
+ 
++            # Keep the final checkpoint strictly inside the final prefill
++            # chunk. Under concurrency, a limited budget can otherwise make
++            # the penultimate chunk land exactly on (or step past) the target
++            # boundary; the final forward then starts too late to export it.
++            if (
++                self.mamba_has_prefill_checkpoint_blocks
++                and start < checkpoint_position <= end
++            ):
++                checkpoint_guard = (checkpoint_position - 1) // block_size * block_size
++                if checkpoint_guard > start:
++                    end = checkpoint_guard
++                elif prefill_end - start <= max_prefill_tokens:
++                    # Defer until the scheduler can fund the whole final
++                    # chunk. Returning zero is the normal aligned-split signal
++                    # for "not enough budget in this step".
++                    end = start
++
+         next_block_boundary = (start // block_size + 1) * block_size
+         tail_boundary = (
+-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+-            if self.mamba_partial_cache_hit
++            get_mamba_prefill_checkpoint_position(
++                request.num_prompt_tokens,
++                self.hash_block_size,
++                drop_eagle_block=self.use_eagle,
++            )
++            if self.mamba_partial_cache_hit and not use_internal_checkpoint
+             else 0
+         )
+         stops = (
+@@ -463,6 +508,32 @@ def _mamba_block_aligned_split(
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)
+ 
++    def _get_mamba_prefill_checkpoint_info(
++        self,
++        request: Request,
++        num_new_tokens: int,
++        num_new_local_computed_tokens: int = 0,
++        num_external_computed_tokens: int = 0,
++    ) -> MambaPrefillCheckpointInfo:
++        """Resolve checkpoint metadata from scheduler request state."""
++        if not self.mamba_has_prefill_checkpoint_blocks:
++            return MambaPrefillCheckpointInfo(0, 0)
++        start = (
++            request.num_computed_tokens
++            + num_new_local_computed_tokens
++            + num_external_computed_tokens
++        )
++        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
++        end = start + num_new_tokens
++        return get_mamba_prefill_checkpoint_info(
++            prefill_end=prefill_end,
++            query_start=start,
++            query_end=end,
++            hash_block_size=self.hash_block_size,
++            mamba_block_size=self.mamba_block_size,
++            drop_eagle_block=self.use_eagle,
++        )
++
+     def _get_local_prefix_cache_hit(
+         self, request: Request
+     ) -> tuple[KVCacheBlocks, int, int, bool]:
+@@ -655,6 +726,11 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        mamba_checkpoint_position=(
++                            self._get_mamba_prefill_checkpoint_info(
++                                request, num_new_tokens
++                            ).export_position
++                        ),
+                     )
+ 
+                     if new_blocks is not None:
+@@ -1065,6 +1141,14 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
++                    mamba_checkpoint_position=(
++                        self._get_mamba_prefill_checkpoint_info(
++                            request,
++                            num_new_tokens,
++                            num_new_local_computed_tokens,
++                            num_external_computed_tokens,
++                        ).export_position
++                    ),
+                 )
+ 
+                 if new_blocks is None:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ceb56a59875f..cf9d941040a3 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -28,6 +28,8 @@
+     SinkFullAttentionSpec,
+     SlidingWindowMLASpec,
+     SlidingWindowSpec,
++    get_mamba_prefill_checkpoint_position,
++    is_mamba_prefill_checkpoint_enabled,
+ )
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.request import Request
+@@ -1278,6 +1280,13 @@ def __init__(
+         self.block_size = kv_cache_spec.block_size
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
++        self.has_prefill_checkpoint_blocks = is_mamba_prefill_checkpoint_enabled(
++            self.mamba_cache_mode,
++            kv_cache_spec.num_prefill_checkpoint_blocks,
++        )
++        # EAGLE prefix hits replay from one hash block before the normal
++        # boundary. The coordinator sets this from its actual Eagle groups.
++        self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1285,9 +1294,9 @@ def __init__(
+             self.last_state_block_idx: dict[str, int] = {}
+             # The set of the requests that have been allocated blocks
+             self._allocated_block_reqs: set[str] = set()
+-            # Number of internal checkpoint blocks required by each request's
++            # Absolute checkpoint position selected by the scheduler for the
+             # current allocation.
+-            self._num_checkpoint_blocks: dict[str, int] = {}
++            self._checkpoint_positions: dict[str, int] = {}
+             # Requests that registered their own last-prompt-boundary partial
+             # tail (producers). On the next step's CoW the boundary state moves
+             # into a private cow_block; we record that block for connector
+@@ -1467,21 +1476,25 @@ def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+         return 0
+ 
+-    def _needs_internal_checkpoint(
++    def _has_internal_checkpoint_slot(
+         self,
+         request_id: str,
+         num_tokens: int,
+-        num_computed_tokens: int,
+     ) -> bool:
+-        assert isinstance(self.kv_cache_spec, MambaSpec)
++        """Whether the scheduler-selected checkpoint slot is available.
++
++        This only validates block-table layout. Checkpoint policy and position
++        are resolved by the scheduler before block allocation.
++        """
+         checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+         blocks = self.req_to_blocks[request_id]
+-        return (
+-            self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-            and num_tokens % self.block_size != 0
+-            and num_computed_tokens % self.block_size == 0
+-            and checkpoint_idx >= 0
+-            and (checkpoint_idx >= len(blocks) or blocks[checkpoint_idx].is_null)
++        return checkpoint_idx >= 0 and (
++            checkpoint_idx >= len(blocks)
++            or blocks[checkpoint_idx].is_null
++            or (
++                request_id in self._allocated_block_reqs
++                and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
++            )
+         )
+ 
+     def get_num_blocks_to_allocate(
+@@ -1493,6 +1506,7 @@ def get_num_blocks_to_allocate(
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
++        mamba_checkpoint_position: int = 0,
+     ) -> int:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         if (
+@@ -1546,17 +1560,20 @@ def get_num_blocks_to_allocate(
+             )
+             if has_partial_hit:
+                 num_new_blocks = max(num_new_blocks, 0) + 1
+-            checkpoint_block = int(
+-                self._needs_internal_checkpoint(
+-                    request_id, num_tokens, total_computed_tokens
++            checkpoint_block = int(mamba_checkpoint_position > 0)
++            if checkpoint_block:
++                assert self.has_prefill_checkpoint_blocks, (
++                    "A Mamba checkpoint position requires prefill checkpoint blocks"
+                 )
+-            )
++                assert self._has_internal_checkpoint_slot(request_id, num_tokens)
+             if not apply_admission_cap:
+-                self._num_checkpoint_blocks[request_id] = checkpoint_block
++                self._checkpoint_positions[request_id] = mamba_checkpoint_position
+             if num_new_blocks > 0:
+-                num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+-                if request_id not in self._allocated_block_reqs:
+-                    num_new_blocks += self.num_speculative_blocks
++                blocks_allocated = request_id in self._allocated_block_reqs
++                if not (checkpoint_block and blocks_allocated):
++                    num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
++                    if not blocks_allocated:
++                        num_new_blocks += self.num_speculative_blocks
+ 
+             num_evictable_computed_blocks = self._get_num_evictable_blocks(
+                 new_computed_blocks
+@@ -1588,12 +1605,17 @@ def allocate_new_blocks(
+             num_required_blocks = (
+                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+             )
+-            checkpoint_block = self._num_checkpoint_blocks.get(request_id, 0)
++            checkpoint_position = self._checkpoint_positions.get(request_id, 0)
++            checkpoint_block = int(checkpoint_position > 0)
+             partial_hit = self._partial_hit_reqs.get(request_id)
+             has_partial_hit = partial_hit is not None
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+-            if num_required_blocks <= len(req_blocks) and not has_partial_hit:
++            if (
++                num_required_blocks <= len(req_blocks)
++                and not has_partial_hit
++                and not checkpoint_block
++            ):
+                 self._allocated_block_reqs.add(request_id)
+                 return []
+             else:
+@@ -1623,7 +1645,7 @@ def allocate_new_blocks(
+                         [self._null_block for _ in range(prev_block_len, null_end)]
+                     )
+ 
+-                if blocks_allocated:
++                if blocks_allocated and not checkpoint_block:
+                     # reuse previous speculative blocks in this step
+                     for block_idx in range(
+                         prev_block_len - self.num_speculative_blocks, prev_block_len
+@@ -1633,11 +1655,11 @@ def allocate_new_blocks(
+                             req_blocks[block_idx] = self._null_block
+                         else:
+                             break
+-                num_new_blocks = num_required_blocks - len(req_blocks)
++                num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
+                 if has_partial_hit:
+                     num_new_blocks = max(num_new_blocks, 0) + 1
+                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+-                if not blocks_allocated:
++                if not blocks_allocated or checkpoint_block:
+                     max_new_blocks += self.num_speculative_blocks
+                 assert num_new_blocks <= max_new_blocks
+                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+@@ -1688,7 +1710,7 @@ def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+             self.last_state_block_idx.pop(request_id, None)
+-            self._num_checkpoint_blocks.pop(request_id, None)
++            self._checkpoint_positions.pop(request_id, None)
+             self._producer_partial_tail_reqs.pop(request_id, None)
+             # A hand-off whose request died in this same scheduling pass must
+             # not reach the connector: its unpin hook (free) has already run.
+@@ -1740,16 +1762,41 @@ def _cache_partial_tail_block(
+         request: Request,
+         num_tokens: int,
+     ) -> BlockHashWithGroupId | None:
++        assert isinstance(self.kv_cache_spec, MambaSpec)
+         hash_block_size = self.block_pool.hash_block_size
++        latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
++            request.num_prompt_tokens,
++            hash_block_size,
++            drop_eagle_block=self.drop_eagle_checkpoint_block,
++        )
++
++        # A backend-exported checkpoint occupies the otherwise-null slot just
++        # before the running state. Re-key that request-owned block at the
++        # finest reusable prefix boundary. Its allocation, eviction, and free
++        # path remain identical to a full-block checkpoint.
++        checkpoint_position = self._checkpoint_positions.get(request.request_id, 0)
++        if checkpoint_position > 0:
++            checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
++            blocks = self.req_to_blocks[request.request_id]
++            assert checkpoint_idx >= 0
++            checkpoint_block = blocks[checkpoint_idx]
++            checkpoint_hash = self.block_pool.cache_checkpoint_block(
++                request=request,
++                block=checkpoint_block,
++                num_tokens=checkpoint_position,
++                kv_cache_group_id=self.kv_cache_group_id,
++                block_size=self.block_size,
++            )
++            if checkpoint_hash is not None:
++                return checkpoint_hash
++
+         if self.block_size == hash_block_size:
+             return None
+         if num_tokens % self.block_size == 0:
+             return None
++
+         if num_tokens % hash_block_size != 0:
+             return None
+-        latest_prompt_hash_boundary = (
+-            request.num_prompt_tokens // hash_block_size
+-        ) * hash_block_size
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 55c9e806a5e7..f6c69479f0b5 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -873,6 +873,76 @@ def is_uniform_with_collection(
+         )
+ 
+ 
++def get_mamba_prefill_checkpoint_position(
++    num_tokens: int,
++    hash_block_size: int,
++    drop_eagle_block: bool,
++) -> int:
++    """Return the reusable Mamba checkpoint boundary for a prefill.
++
++    Prefix-cache hits with EAGLE drop the last hash block. Export the Mamba
++    state at that same replay boundary so the attention and Mamba groups agree.
++    """
++    checkpoint_position = num_tokens // hash_block_size * hash_block_size
++    if drop_eagle_block:
++        checkpoint_position -= hash_block_size
++    return max(checkpoint_position, 0)
++
++
++def is_mamba_prefill_checkpoint_enabled(
++    mamba_cache_mode: str,
++    num_prefill_checkpoint_blocks: int,
++) -> bool:
++    """Whether the Mamba backend may export an internal prefill checkpoint."""
++    return mamba_cache_mode == "align" and num_prefill_checkpoint_blocks > 0
++
++
++@dataclass(frozen=True)
++class MambaPrefillCheckpointInfo:
++    """Checkpoint boundary and its offset in the current model input.
++
++    ``offset`` is zero when this model input must not export a checkpoint.
++    ``position`` is still returned because the scheduler also uses the target
++    boundary to keep the final prefill chunk from starting past it.
++    """
++
++    position: int
++    offset: int
++
++    @property
++    def export_position(self) -> int:
++        """Absolute boundary to export, or zero when export is disabled."""
++        return self.position if self.offset else 0
++
++
++def get_mamba_prefill_checkpoint_info(
++    *,
++    prefill_end: int,
++    query_start: int,
++    query_end: int,
++    hash_block_size: int,
++    mamba_block_size: int,
++    drop_eagle_block: bool,
++) -> MambaPrefillCheckpointInfo:
++    """Resolve the reusable checkpoint for one prefill model input.
++
++    The caller must first verify that prefill checkpoints are enabled.
++    """
++    position = get_mamba_prefill_checkpoint_position(
++        prefill_end,
++        hash_block_size,
++        drop_eagle_block=drop_eagle_block,
++    )
++    offset = position - query_start
++    valid = (
++        query_end >= prefill_end
++        and query_start % mamba_block_size == 0
++        and query_start + mamba_block_size <= position
++        and 0 < offset < query_end - query_start
++    )
++    return MambaPrefillCheckpointInfo(position, offset if valid else 0)
++
++
+ @dataclass(frozen=True)
+ class EncoderOnlyAttentionSpec(AttentionSpec):
+     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+
+From c5e283a0a815e14534e64677f56a606596eb07b4 Mon Sep 17 00:00:00 2001
+From: ZeldaHuang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 00:35:54 +0800
+Subject: [PATCH 02/10] refactor
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ vllm/models/kimi_k3/nvidia/kda_metadata.py   | 28 ++++----
+ vllm/v1/core/block_pool.py                   | 32 ++-------
+ vllm/v1/core/kv_cache_coordinator.py         |  5 --
+ vllm/v1/core/sched/scheduler.py              | 74 +++++---------------
+ vllm/v1/core/single_type_kv_cache_manager.py | 54 ++++++--------
+ 5 files changed, 59 insertions(+), 134 deletions(-)
+
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 16b17b251c1b..14aca717c45b 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -572,10 +572,11 @@ def build(  # type: ignore[override]
+             has_initial_state = None
+ 
+         checkpoint = None
+-        checkpoint_enabled = is_mamba_prefill_checkpoint_enabled(
+-            self.vllm_config.cache_config.mamba_cache_mode,
+-            self.kv_cache_spec.num_prefill_checkpoint_blocks,
+-        )
++        if (
++            num_prefills > 0
++            and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
++            and self.vllm_config.cache_config.mamba_cache_mode == "align"
++        ):
+         if num_prefills > 0 and checkpoint_enabled:
+             # prepare checkpoint metadata
+             assert m.seq_lens_cpu_upper_bound is not None
+@@ -598,16 +599,15 @@ def build(  # type: ignore[override]
+             checkpoint_cols = []
+             for row, query_len in zip(request_rows, query_lens):
+                 seq_len = seq_lens[row]
+-                checkpoint_info = get_mamba_prefill_checkpoint_info(
+-                    prefill_end=seq_len,
+-                    query_start=seq_len - query_len,
+-                    query_end=seq_len,
+-                    hash_block_size=hash_block_size,
+-                    mamba_block_size=block_size,
+-                    drop_eagle_block=drop_eagle_block,
+-                )
+-                offset = checkpoint_info.offset
+-                valid = offset > 0 and offset % FLASHKDA_CHUNK_SIZE == 0
++                offset = seq_len // hash_block_size * hash_block_size - (seq_len - query_len)
++                if drop_eagle_block:
++                    offset -= hash_block_size
++                # offset should be less than query_len
++                valid = (
++                    seq_len % hash_block_size != 0
++                    and 0 < offset < query_len
++                    and offset % FLASHKDA_CHUNK_SIZE == 0
++                )                
+                 offset = offset if valid else 0
+                 first_len = offset or query_len
+                 checkpoint_splits.append((first_len, query_len - first_len))
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 272f71476fe5..dea3079a48ae 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -543,7 +543,7 @@ def cache_partial_block(
+             )
+         return block_hash_with_group_id
+ 
+-    def cache_checkpoint_block(
++    def cache_partial_checkpoint_block(
+         self,
+         request: Request,
+         block: KVCacheBlock,
+@@ -551,37 +551,15 @@ def cache_checkpoint_block(
+         kv_cache_group_id: int,
+         block_size: int,
+     ) -> BlockHashWithGroupId | None:
+-        """Re-key a backend checkpoint block at its exact prefix boundary."""
+-        if block.is_null:
+-            return None
+-
+-        assert block_size >= self.hash_block_size
+-        assert block_size % self.hash_block_size == 0
+-        assert num_tokens > 0 and num_tokens % self.hash_block_size == 0
+-
+         removed_hashes = self._remove_cached_block_hashes(block)
+         self._emit_block_removed_events(removed_hashes)
+-        if num_tokens % block_size != 0:
+-            return self.cache_partial_block(
+-                request=request,
+-                block=block,
+-                num_tokens=num_tokens,
+-                kv_cache_group_id=kv_cache_group_id,
+-                block_size=block_size,
+-            )
+-
+-        num_full_blocks = num_tokens // block_size
+-        checkpoint_blocks = [self.null_block] * num_full_blocks
+-        checkpoint_blocks[-1] = block
+-        self.cache_full_blocks(
++        return self.cache_partial_block(
+             request=request,
+-            blocks=checkpoint_blocks,
+-            num_cached_blocks=num_full_blocks - 1,
+-            num_full_blocks=num_full_blocks,
+-            block_size=block_size,
++            block=block,
++            num_tokens=num_tokens,
+             kv_cache_group_id=kv_cache_group_id,
++            block_size=block_size,
+         )
+-        return block.block_hash
+ 
+     def _get_partial_block_hash(
+         self,
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 00df32d0f429..02308e786990 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -149,11 +149,6 @@ def __init__(
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
+-        # A hybrid model's Mamba group is not itself an Eagle cache group, but
+-        # its checkpoint must match the boundary to which FullAttention drops.
+-        for manager in self.single_type_managers:
+-            if isinstance(manager, MambaManager):
+-                manager.drop_eagle_checkpoint_block = bool(self.eagle_group_ids)
+ 
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 9f1ec816ebb3..d1b792b6a7aa 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -331,23 +331,12 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
+-        mamba_specs = [
+-            group.kv_cache_spec
+-            for group in kv_cache_config.kv_cache_groups
+-            if isinstance(group.kv_cache_spec, MambaSpec)
+-        ]
+-        mamba_block_sizes = {spec.block_size for spec in mamba_specs}
+-        self.mamba_block_size = (
+-            next(iter(mamba_block_sizes))
+-            if len(mamba_block_sizes) == 1
+-            else self.block_size
+-        )
+         self.mamba_has_prefill_checkpoint_blocks = (
+             self.has_mamba_layers
+-            and bool(mamba_specs)
+-            and is_mamba_prefill_checkpoint_enabled(
+-                self.cache_config.mamba_cache_mode,
+-                min(spec.num_prefill_checkpoint_blocks for spec in mamba_specs),
++            and all(
++                not isinstance(group.kv_cache_spec, MambaSpec)
++                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
++                for group in kv_cache_config.kv_cache_groups
+             )
+         )
+         # A finer prefix_match_unit is configured: a mamba partial tail entry
+@@ -423,9 +412,7 @@ def _mamba_block_aligned_split(
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        # CacheConfig retains the model's initial attention block size even
+-        # when hybrid page-size unification enlarges the Mamba block.
+-        block_size = self.mamba_block_size
++        block_size = self.cache_config.block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+@@ -434,15 +421,18 @@ def _mamba_block_aligned_split(
+             last_cache_position = max(last_cache_position - block_size, 0)
+ 
+         end = start + num_new_tokens
+-        checkpoint = Scheduler._get_mamba_prefill_checkpoint_info(
+-            self,
+-            request,
+-            num_new_tokens,
+-            num_new_local_computed_tokens,
+-            num_external_computed_tokens,
++        checkpoint_position = get_mamba_prefill_checkpoint_position(
++            prefill_end,
++            self.hash_block_size,
++            drop_eagle_block=self.use_eagle,
++        )
++        use_internal_checkpoint = (
++            self.mamba_has_prefill_checkpoint_blocks
++            and end >= prefill_end
++            and start % block_size == 0
++            and start + block_size <= checkpoint_position
++            and start < checkpoint_position < end
+         )
+-        checkpoint_position = checkpoint.position
+-        use_internal_checkpoint = checkpoint.offset > 0
+         if use_internal_checkpoint:
+             last_cache_position = 0
+         # Invariant: slot p holds the state after exactly (p + 1) * block_size
+@@ -450,7 +440,7 @@ def _mamba_block_aligned_split(
+         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
+         # to the boundary. A block too wide for one chunk advances sub-block
+         # and re-aligns at the next boundary.
+-        if end < prefill_end and not use_internal_checkpoint:
++        if end < prefill_end:
+             max_prefill_tokens = self.max_num_scheduled_tokens
+             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+             if long_prefill_threshold > 0:
+@@ -459,23 +449,6 @@ def _mamba_block_aligned_split(
+             if aligned_end > start or block_size <= max_prefill_tokens:
+                 end = aligned_end
+ 
+-            # Keep the final checkpoint strictly inside the final prefill
+-            # chunk. Under concurrency, a limited budget can otherwise make
+-            # the penultimate chunk land exactly on (or step past) the target
+-            # boundary; the final forward then starts too late to export it.
+-            if (
+-                self.mamba_has_prefill_checkpoint_blocks
+-                and start < checkpoint_position <= end
+-            ):
+-                checkpoint_guard = (checkpoint_position - 1) // block_size * block_size
+-                if checkpoint_guard > start:
+-                    end = checkpoint_guard
+-                elif prefill_end - start <= max_prefill_tokens:
+-                    # Defer until the scheduler can fund the whole final
+-                    # chunk. Returning zero is the normal aligned-split signal
+-                    # for "not enough budget in this step".
+-                    end = start
+-
+         next_block_boundary = (start // block_size + 1) * block_size
+         tail_boundary = (
+             get_mamba_prefill_checkpoint_position(
+@@ -726,11 +699,6 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
+-                        mamba_checkpoint_position=(
+-                            self._get_mamba_prefill_checkpoint_info(
+-                                request, num_new_tokens
+-                            ).export_position
+-                        ),
+                     )
+ 
+                     if new_blocks is not None:
+@@ -1141,14 +1109,6 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
+-                    mamba_checkpoint_position=(
+-                        self._get_mamba_prefill_checkpoint_info(
+-                            request,
+-                            num_new_tokens,
+-                            num_new_local_computed_tokens,
+-                            num_external_computed_tokens,
+-                        ).export_position
+-                    ),
+                 )
+ 
+                 if new_blocks is None:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index cf9d941040a3..2e5efd3bc6d3 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1284,9 +1284,6 @@ def __init__(
+             self.mamba_cache_mode,
+             kv_cache_spec.num_prefill_checkpoint_blocks,
+         )
+-        # EAGLE prefix hits replay from one hash block before the normal
+-        # boundary. The coordinator sets this from its actual Eagle groups.
+-        self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1476,25 +1473,21 @@ def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+         return 0
+ 
+-    def _has_internal_checkpoint_slot(
++    def _needs_internal_checkpoint(
+         self,
+         request_id: str,
+         num_tokens: int,
++        num_computed_tokens: int,
+     ) -> bool:
+-        """Whether the scheduler-selected checkpoint slot is available.
+-
+-        This only validates block-table layout. Checkpoint policy and position
+-        are resolved by the scheduler before block allocation.
+-        """
++        assert isinstance(self.kv_cache_spec, MambaSpec)
+         checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+         blocks = self.req_to_blocks[request_id]
+-        return checkpoint_idx >= 0 and (
+-            checkpoint_idx >= len(blocks)
+-            or blocks[checkpoint_idx].is_null
+-            or (
+-                request_id in self._allocated_block_reqs
+-                and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
+-            )
++        return (
++            self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
++            and num_tokens % self.block_size != 0
++            and num_computed_tokens % self.block_size == 0
++            and checkpoint_idx >= 0
++            and (checkpoint_idx >= len(blocks) or blocks[checkpoint_idx].is_null)
+         )
+ 
+     def get_num_blocks_to_allocate(
+@@ -1506,7 +1499,6 @@ def get_num_blocks_to_allocate(
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
+-        mamba_checkpoint_position: int = 0,
+     ) -> int:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         if (
+@@ -1560,14 +1552,15 @@ def get_num_blocks_to_allocate(
+             )
+             if has_partial_hit:
+                 num_new_blocks = max(num_new_blocks, 0) + 1
+-            checkpoint_block = int(mamba_checkpoint_position > 0)
+-            if checkpoint_block:
+-                assert self.has_prefill_checkpoint_blocks, (
+-                    "A Mamba checkpoint position requires prefill checkpoint blocks"
++            mamba_checkpoint_position = 0
++            if self._needs_internal_checkpoint(request_id, num_tokens, total_computed_tokens):
++                mamba_checkpoint_position = get_mamba_prefill_checkpoint_position(
++                    num_tokens, self.block_pool.hash_block_size, self.use_eagle
+                 )
+-                assert self._has_internal_checkpoint_slot(request_id, num_tokens)
++                checkpoint_block = mamba_checkpoint_position > 0 and mamba_checkpoint_position < num_tokens
+             if not apply_admission_cap:
+                 self._checkpoint_positions[request_id] = mamba_checkpoint_position
++
+             if num_new_blocks > 0:
+                 blocks_allocated = request_id in self._allocated_block_reqs
+                 if not (checkpoint_block and blocks_allocated):
+@@ -1764,11 +1757,6 @@ def _cache_partial_tail_block(
+     ) -> BlockHashWithGroupId | None:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         hash_block_size = self.block_pool.hash_block_size
+-        latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
+-            request.num_prompt_tokens,
+-            hash_block_size,
+-            drop_eagle_block=self.drop_eagle_checkpoint_block,
+-        )
+ 
+         # A backend-exported checkpoint occupies the otherwise-null slot just
+         # before the running state. Re-key that request-owned block at the
+@@ -1776,19 +1764,18 @@ def _cache_partial_tail_block(
+         # path remain identical to a full-block checkpoint.
+         checkpoint_position = self._checkpoint_positions.get(request.request_id, 0)
+         if checkpoint_position > 0:
++            if checkpoint_position % self.block_size == 0:
++                return None
+             checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+             blocks = self.req_to_blocks[request.request_id]
+-            assert checkpoint_idx >= 0
+             checkpoint_block = blocks[checkpoint_idx]
+-            checkpoint_hash = self.block_pool.cache_checkpoint_block(
++            return self.block_pool.cache_partial_checkpoint_block(
+                 request=request,
+                 block=checkpoint_block,
+                 num_tokens=checkpoint_position,
+                 kv_cache_group_id=self.kv_cache_group_id,
+                 block_size=self.block_size,
+             )
+-            if checkpoint_hash is not None:
+-                return checkpoint_hash
+ 
+         if self.block_size == hash_block_size:
+             return None
+@@ -1797,6 +1784,11 @@ def _cache_partial_tail_block(
+ 
+         if num_tokens % hash_block_size != 0:
+             return None
++
++        latest_prompt_hash_boundary = (
++            request.num_prompt_tokens // hash_block_size
++        ) * hash_block_size
++
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 
+
+From f21d00a6076d260f103c38d717b391cc3f9001f9 Mon Sep 17 00:00:00 2001
+From: ZeldaHuang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 00:39:20 +0800
+Subject: [PATCH 03/10] refactor
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ vllm/v1/core/sched/scheduler.py | 34 +--------------------------------
+ vllm/v1/kv_cache_interface.py   | 28 ---------------------------
+ 2 files changed, 1 insertion(+), 61 deletions(-)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d1b792b6a7aa..1cfc0293ac97 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -55,11 +55,8 @@
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+-    MambaPrefillCheckpointInfo,
+     MambaSpec,
+-    get_mamba_prefill_checkpoint_info,
+     get_mamba_prefill_checkpoint_position,
+-    is_mamba_prefill_checkpoint_enabled,
+ )
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+@@ -451,11 +448,7 @@ def _mamba_block_aligned_split(
+ 
+         next_block_boundary = (start // block_size + 1) * block_size
+         tail_boundary = (
+-            get_mamba_prefill_checkpoint_position(
+-                request.num_prompt_tokens,
+-                self.hash_block_size,
+-                drop_eagle_block=self.use_eagle,
+-            )
++            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+             if self.mamba_partial_cache_hit and not use_internal_checkpoint
+             else 0
+         )
+@@ -481,31 +474,6 @@ def _mamba_block_aligned_split(
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)
+ 
+-    def _get_mamba_prefill_checkpoint_info(
+-        self,
+-        request: Request,
+-        num_new_tokens: int,
+-        num_new_local_computed_tokens: int = 0,
+-        num_external_computed_tokens: int = 0,
+-    ) -> MambaPrefillCheckpointInfo:
+-        """Resolve checkpoint metadata from scheduler request state."""
+-        if not self.mamba_has_prefill_checkpoint_blocks:
+-            return MambaPrefillCheckpointInfo(0, 0)
+-        start = (
+-            request.num_computed_tokens
+-            + num_new_local_computed_tokens
+-            + num_external_computed_tokens
+-        )
+-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+-        end = start + num_new_tokens
+-        return get_mamba_prefill_checkpoint_info(
+-            prefill_end=prefill_end,
+-            query_start=start,
+-            query_end=end,
+-            hash_block_size=self.hash_block_size,
+-            mamba_block_size=self.mamba_block_size,
+-            drop_eagle_block=self.use_eagle,
+-        )
+ 
+     def _get_local_prefix_cache_hit(
+         self, request: Request
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index f6c69479f0b5..4a453e74e006 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -915,34 +915,6 @@ def export_position(self) -> int:
+         return self.position if self.offset else 0
+ 
+ 
+-def get_mamba_prefill_checkpoint_info(
+-    *,
+-    prefill_end: int,
+-    query_start: int,
+-    query_end: int,
+-    hash_block_size: int,
+-    mamba_block_size: int,
+-    drop_eagle_block: bool,
+-) -> MambaPrefillCheckpointInfo:
+-    """Resolve the reusable checkpoint for one prefill model input.
+-
+-    The caller must first verify that prefill checkpoints are enabled.
+-    """
+-    position = get_mamba_prefill_checkpoint_position(
+-        prefill_end,
+-        hash_block_size,
+-        drop_eagle_block=drop_eagle_block,
+-    )
+-    offset = position - query_start
+-    valid = (
+-        query_end >= prefill_end
+-        and query_start % mamba_block_size == 0
+-        and query_start + mamba_block_size <= position
+-        and 0 < offset < query_end - query_start
+-    )
+-    return MambaPrefillCheckpointInfo(position, offset if valid else 0)
+-
+-
+ @dataclass(frozen=True)
+ class EncoderOnlyAttentionSpec(AttentionSpec):
+     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+
+From f496b4383a69cc9a8d7e67592dbb65552e027f55 Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Mon, 24 Aug 2026 17:07:36 +0000
+Subject: [PATCH 04/10] Fix K3 checkpoint refactor lifecycle
+
+Assisted-by: Codex <codex@openai.com>
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ .../test_partial_prefix_cache_hits.py         |  80 ++++++++---
+ tests/v1/core/test_mamba_align_chunk_split.py | 130 ++----------------
+ vllm/models/kimi_k3/nvidia/kda_metadata.py    |  28 ++--
+ vllm/v1/core/block_pool.py                    |   9 ++
+ vllm/v1/core/kv_cache_coordinator.py          |  17 +--
+ vllm/v1/core/kv_cache_manager.py              |   5 -
+ vllm/v1/core/sched/scheduler.py               |  28 +++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  50 +++++--
+ vllm/v1/kv_cache_interface.py                 |  18 ---
+ 9 files changed, 165 insertions(+), 200 deletions(-)
+
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 14aca717c45b..00a90d52589c 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -38,7 +38,7 @@
+ )
+ from vllm.v1.kv_cache_interface import (
+     MambaSpec,
+-    get_mamba_prefill_checkpoint_info,
++    get_mamba_prefill_checkpoint_position,
+     is_mamba_prefill_checkpoint_enabled,
+ )
+ 
+@@ -572,11 +572,10 @@ def build(  # type: ignore[override]
+             has_initial_state = None
+ 
+         checkpoint = None
+-        if (
+-            num_prefills > 0
+-            and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+-        ):
++        checkpoint_enabled = is_mamba_prefill_checkpoint_enabled(
++            self.vllm_config.cache_config.mamba_cache_mode,
++            self.kv_cache_spec.num_prefill_checkpoint_blocks,
++        )
+         if num_prefills > 0 and checkpoint_enabled:
+             # prepare checkpoint metadata
+             assert m.seq_lens_cpu_upper_bound is not None
+@@ -599,15 +598,20 @@ def build(  # type: ignore[override]
+             checkpoint_cols = []
+             for row, query_len in zip(request_rows, query_lens):
+                 seq_len = seq_lens[row]
+-                offset = seq_len // hash_block_size * hash_block_size - (seq_len - query_len)
+-                if drop_eagle_block:
+-                    offset -= hash_block_size
+-                # offset should be less than query_len
++                query_start = seq_len - query_len
++                checkpoint_position = get_mamba_prefill_checkpoint_position(
++                    seq_len,
++                    hash_block_size,
++                    drop_eagle_block=drop_eagle_block,
++                )
++                offset = checkpoint_position - query_start
+                 valid = (
+-                    seq_len % hash_block_size != 0
++                    seq_len % block_size != 0
++                    and query_start % block_size == 0
++                    and query_start + block_size <= checkpoint_position
+                     and 0 < offset < query_len
+                     and offset % FLASHKDA_CHUNK_SIZE == 0
+-                )                
++                )
+                 offset = offset if valid else 0
+                 first_len = offset or query_len
+                 checkpoint_splits.append((first_len, query_len - first_len))
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index dea3079a48ae..48fa0ab5225f 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -551,6 +551,15 @@ def cache_partial_checkpoint_block(
+         kv_cache_group_id: int,
+         block_size: int,
+     ) -> BlockHashWithGroupId | None:
++        """Re-key an exported checkpoint at an interior hash boundary.
++
++        Eagle can move the checkpoint behind the block's existing full-block
++        hash. Remove every old key unconditionally before registering the
++        exported state at its true boundary.
++        """
++        if block.is_null:
++            return None
++        assert num_tokens % block_size != 0
+         removed_hashes = self._remove_cached_block_hashes(block)
+         self._emit_block_removed_events(removed_hashes)
+         return self.cache_partial_block(
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 02308e786990..5b740c8650fd 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -149,6 +149,11 @@ def __init__(
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
++        # A hybrid model's Mamba group is not itself an Eagle cache group, but
++        # its checkpoint must match the boundary to which FullAttention drops.
++        for manager in self.single_type_managers:
++            if isinstance(manager, MambaManager):
++                manager.drop_eagle_checkpoint_block = bool(self.eagle_group_ids)
+ 
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+@@ -168,7 +173,6 @@ def get_num_blocks_to_allocate(
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
+-        mamba_checkpoint_position: int = 0,
+     ) -> int:
+         """
+         Get the number of blocks needed to be allocated for the request.
+@@ -209,17 +213,6 @@ def get_num_blocks_to_allocate(
+                     num_encoder_tokens,
+                     apply_admission_cap=apply_admission_cap,
+                 )
+-            elif isinstance(manager, MambaManager):
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+-                    request_id,
+-                    num_tokens,
+-                    new_computed_blocks[i],
+-                    total_computed_tokens,
+-                    num_local_computed_tokens,
+-                    num_tokens_main_model,
+-                    apply_admission_cap=apply_admission_cap,
+-                    mamba_checkpoint_position=mamba_checkpoint_position,
+-                )
+             else:
+                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                     request_id,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index c3526e8cf6c1..327918f3f070 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -357,7 +357,6 @@ def allocate_slots(
+         full_sequence_must_fit: bool = False,
+         reserved_blocks: int = 0,
+         has_scheduled_reqs: bool = True,
+-        mamba_checkpoint_position: int = 0,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -390,9 +389,6 @@ def allocate_slots(
+                 blocks an already in-flight (prefilling) sequence is relying on.
+             has_scheduled_reqs: Whether any requests are already scheduled to run
+                 this step, controls whether watermark is applied.
+-            mamba_checkpoint_position: Scheduler-selected absolute position
+-                for an internal Mamba checkpoint, or zero.
+-
+         Blocks layout:
+         ```
+         ----------------------------------------------------------------------
+@@ -522,7 +518,6 @@ def allocate_slots(
+             + num_external_computed_tokens,
+             num_local_computed_tokens=num_local_computed_tokens,
+             num_tokens_main_model=num_tokens_main_model,
+-            mamba_checkpoint_position=mamba_checkpoint_position,
+         )
+ 
+         # Keep `reserved_blocks` free for other in-flight sequences, and an
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1cfc0293ac97..c73c790f0fa7 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -57,6 +57,7 @@
+     KVCacheConfig,
+     MambaSpec,
+     get_mamba_prefill_checkpoint_position,
++    is_mamba_prefill_checkpoint_enabled,
+ )
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+@@ -328,12 +329,23 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
++        mamba_specs = [
++            group.kv_cache_spec
++            for group in kv_cache_config.kv_cache_groups
++            if isinstance(group.kv_cache_spec, MambaSpec)
++        ]
++        mamba_block_sizes = {spec.block_size for spec in mamba_specs}
++        self.mamba_block_size = (
++            next(iter(mamba_block_sizes))
++            if len(mamba_block_sizes) == 1
++            else self.block_size
++        )
+         self.mamba_has_prefill_checkpoint_blocks = (
+             self.has_mamba_layers
+-            and all(
+-                not isinstance(group.kv_cache_spec, MambaSpec)
+-                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-                for group in kv_cache_config.kv_cache_groups
++            and bool(mamba_specs)
++            and is_mamba_prefill_checkpoint_enabled(
++                self.cache_config.mamba_cache_mode,
++                min(spec.num_prefill_checkpoint_blocks for spec in mamba_specs),
+             )
+         )
+         # A finer prefix_match_unit is configured: a mamba partial tail entry
+@@ -341,7 +353,7 @@ def __init__(
+         # hash boundary, so the split adds that stop.
+         self.mamba_partial_cache_hit = (
+             self.need_mamba_block_aligned_split
+-            and self.hash_block_size < self.block_size
++            and self.hash_block_size < self.mamba_block_size
+             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
+         )
+ 
+@@ -409,7 +421,9 @@ def _mamba_block_aligned_split(
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        block_size = self.cache_config.block_size
++        # CacheConfig retains the model's initial attention block size even
++        # when hybrid page-size unification enlarges the Mamba block.
++        block_size = self.mamba_block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+@@ -426,6 +440,7 @@ def _mamba_block_aligned_split(
+         use_internal_checkpoint = (
+             self.mamba_has_prefill_checkpoint_blocks
+             and end >= prefill_end
++            and end % block_size != 0
+             and start % block_size == 0
+             and start + block_size <= checkpoint_position
+             and start < checkpoint_position < end
+@@ -474,7 +489,6 @@ def _mamba_block_aligned_split(
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)
+ 
+-
+     def _get_local_prefix_cache_hit(
+         self, request: Request
+     ) -> tuple[KVCacheBlocks, int, int, bool]:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 2e5efd3bc6d3..fccb76146234 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1284,6 +1284,9 @@ def __init__(
+             self.mamba_cache_mode,
+             kv_cache_spec.num_prefill_checkpoint_blocks,
+         )
++        # The Mamba group is not itself an Eagle cache group. The coordinator
++        # sets this when any paired attention group applies the Eagle drop.
++        self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1476,18 +1479,28 @@ def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+     def _needs_internal_checkpoint(
+         self,
+         request_id: str,
+-        num_tokens: int,
+-        num_computed_tokens: int,
++        query_start: int,
++        query_end: int,
++        checkpoint_position: int,
+     ) -> bool:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+-        checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
++        checkpoint_idx = cdiv(query_end, self.block_size) - 2
+         blocks = self.req_to_blocks[request_id]
+         return (
+-            self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-            and num_tokens % self.block_size != 0
+-            and num_computed_tokens % self.block_size == 0
++            self.has_prefill_checkpoint_blocks
++            and query_end % self.block_size != 0
++            and query_start % self.block_size == 0
++            and query_start + self.block_size <= checkpoint_position
++            and query_start < checkpoint_position < query_end
+             and checkpoint_idx >= 0
+-            and (checkpoint_idx >= len(blocks) or blocks[checkpoint_idx].is_null)
++            and (
++                checkpoint_idx >= len(blocks)
++                or blocks[checkpoint_idx].is_null
++                or (
++                    request_id in self._allocated_block_reqs
++                    and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
++                )
++            )
+         )
+ 
+     def get_num_blocks_to_allocate(
+@@ -1552,14 +1565,21 @@ def get_num_blocks_to_allocate(
+             )
+             if has_partial_hit:
+                 num_new_blocks = max(num_new_blocks, 0) + 1
+-            mamba_checkpoint_position = 0
+-            if self._needs_internal_checkpoint(request_id, num_tokens, total_computed_tokens):
+-                mamba_checkpoint_position = get_mamba_prefill_checkpoint_position(
+-                    num_tokens, self.block_pool.hash_block_size, self.use_eagle
+-                )
+-                checkpoint_block = mamba_checkpoint_position > 0 and mamba_checkpoint_position < num_tokens
++            checkpoint_position = get_mamba_prefill_checkpoint_position(
++                num_tokens,
++                self.block_pool.hash_block_size,
++                self.drop_eagle_checkpoint_block,
++            )
++            if not self._needs_internal_checkpoint(
++                request_id,
++                total_computed_tokens,
++                num_tokens,
++                checkpoint_position,
++            ):
++                checkpoint_position = 0
++            checkpoint_block = int(checkpoint_position > 0)
+             if not apply_admission_cap:
+-                self._checkpoint_positions[request_id] = mamba_checkpoint_position
++                self._checkpoint_positions[request_id] = checkpoint_position
+ 
+             if num_new_blocks > 0:
+                 blocks_allocated = request_id in self._allocated_block_reqs
+@@ -1768,7 +1788,9 @@ def _cache_partial_tail_block(
+                 return None
+             checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+             blocks = self.req_to_blocks[request.request_id]
++            assert 0 <= checkpoint_idx < len(blocks)
+             checkpoint_block = blocks[checkpoint_idx]
++            assert not checkpoint_block.is_null
+             return self.block_pool.cache_partial_checkpoint_block(
+                 request=request,
+                 block=checkpoint_block,
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 4a453e74e006..e596a99c9471 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -897,24 +897,6 @@ def is_mamba_prefill_checkpoint_enabled(
+     return mamba_cache_mode == "align" and num_prefill_checkpoint_blocks > 0
+ 
+ 
+-@dataclass(frozen=True)
+-class MambaPrefillCheckpointInfo:
+-    """Checkpoint boundary and its offset in the current model input.
+-
+-    ``offset`` is zero when this model input must not export a checkpoint.
+-    ``position`` is still returned because the scheduler also uses the target
+-    boundary to keep the final prefill chunk from starting past it.
+-    """
+-
+-    position: int
+-    offset: int
+-
+-    @property
+-    def export_position(self) -> int:
+-        """Absolute boundary to export, or zero when export is disabled."""
+-        return self.position if self.offset else 0
+-
+-
+ @dataclass(frozen=True)
+ class EncoderOnlyAttentionSpec(AttentionSpec):
+     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+
+From 6cc8222192ef069a4afd7e08ed0f5a3552b67da1 Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 08:34:44 +0000
+Subject: [PATCH 05/10] Optimize hash-aligned partial checkpoints
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ tests/models/kimi_k3/test_kda_metadata.py     | 35 +++++++++++++++++++
+ .../test_partial_prefix_cache_hits.py         | 28 +++++++++++++++
+ tests/v1/core/test_mamba_align_chunk_split.py | 32 +++++++++++++++++
+ vllm/models/kimi_k3/nvidia/kda_metadata.py    |  7 ++--
+ vllm/v1/core/sched/scheduler.py               |  9 +++--
+ vllm/v1/core/single_type_kv_cache_manager.py  |  6 ++--
+ 6 files changed, 109 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 00a90d52589c..58f867ad2dec 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -590,6 +590,7 @@ def build(  # type: ignore[override]
+             hash_block_size = (
+                 self.vllm_config.cache_config.prefix_match_unit or block_size
+             )
++            checkpoint_alignment = min(hash_block_size, block_size)
+             speculative_config = self.vllm_config.speculative_config
+             drop_eagle_block = (
+                 speculative_config is not None and speculative_config.use_eagle()
+@@ -607,15 +608,15 @@ def build(  # type: ignore[override]
+                 offset = checkpoint_position - query_start
+                 valid = (
+                     seq_len % block_size != 0
+-                    and query_start % block_size == 0
+-                    and query_start + block_size <= checkpoint_position
++                    and query_start % checkpoint_alignment == 0
++                    and query_start + checkpoint_alignment <= checkpoint_position
+                     and 0 < offset < query_len
+                     and offset % FLASHKDA_CHUNK_SIZE == 0
+                 )
+                 offset = offset if valid else 0
+                 first_len = offset or query_len
+                 checkpoint_splits.append((first_len, query_len - first_len))
+-                checkpoint_cols.append((seq_len - 1) // block_size - 1 if valid else -1)
++                checkpoint_cols.append(seq_len // block_size - 1 if valid else -1)
+             if any(tail for _, tail in checkpoint_splits):
+                 checkpoint_offsets_tensor = async_tensor_h2d(
+                     [first if tail else 0 for first, tail in checkpoint_splits],
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c73c790f0fa7..a031bf356729 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -424,6 +424,7 @@ def _mamba_block_aligned_split(
+         # CacheConfig retains the model's initial attention block size even
+         # when hybrid page-size unification enlarges the Mamba block.
+         block_size = self.mamba_block_size
++        checkpoint_alignment = min(self.hash_block_size, block_size)
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+@@ -441,8 +442,8 @@ def _mamba_block_aligned_split(
+             self.mamba_has_prefill_checkpoint_blocks
+             and end >= prefill_end
+             and end % block_size != 0
+-            and start % block_size == 0
+-            and start + block_size <= checkpoint_position
++            and start % checkpoint_alignment == 0
++            and start + checkpoint_alignment <= checkpoint_position
+             and start < checkpoint_position < end
+         )
+         if use_internal_checkpoint:
+@@ -470,7 +471,9 @@ def _mamba_block_aligned_split(
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+-            next_block_boundary if start % block_size != 0 else 0,
++            next_block_boundary
++            if start % block_size != 0 and not use_internal_checkpoint
++            else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+             # Fine-grained hits: the prompt's partial-tail entry can only be
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index fccb76146234..f282667d9a50 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1484,13 +1484,15 @@ def _needs_internal_checkpoint(
+         checkpoint_position: int,
+     ) -> bool:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
++        hash_block_size = self.block_pool.hash_block_size
++        checkpoint_alignment = min(hash_block_size, self.block_size)
+         checkpoint_idx = cdiv(query_end, self.block_size) - 2
+         blocks = self.req_to_blocks[request_id]
+         return (
+             self.has_prefill_checkpoint_blocks
+             and query_end % self.block_size != 0
+-            and query_start % self.block_size == 0
+-            and query_start + self.block_size <= checkpoint_position
++            and query_start % checkpoint_alignment == 0
++            and query_start + checkpoint_alignment <= checkpoint_position
+             and query_start < checkpoint_position < query_end
+             and checkpoint_idx >= 0
+             and (
+
+From ca80e0610f5f314c5d0170c12ca951159b07d43f Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 09:05:51 +0000
+Subject: [PATCH 06/10] Simplify K3 checkpoint scheduler initialization
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ .../test_partial_prefix_cache_hits.py         |  6 ++---
+ tests/v1/core/test_mamba_align_chunk_split.py |  2 +-
+ vllm/v1/core/sched/scheduler.py               | 26 +++++--------------
+ 3 files changed, 10 insertions(+), 24 deletions(-)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a031bf356729..2517acfbf54d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -57,7 +57,6 @@
+     KVCacheConfig,
+     MambaSpec,
+     get_mamba_prefill_checkpoint_position,
+-    is_mamba_prefill_checkpoint_enabled,
+ )
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+@@ -329,23 +328,12 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
+-        mamba_specs = [
+-            group.kv_cache_spec
+-            for group in kv_cache_config.kv_cache_groups
+-            if isinstance(group.kv_cache_spec, MambaSpec)
+-        ]
+-        mamba_block_sizes = {spec.block_size for spec in mamba_specs}
+-        self.mamba_block_size = (
+-            next(iter(mamba_block_sizes))
+-            if len(mamba_block_sizes) == 1
+-            else self.block_size
+-        )
+         self.mamba_has_prefill_checkpoint_blocks = (
+             self.has_mamba_layers
+-            and bool(mamba_specs)
+-            and is_mamba_prefill_checkpoint_enabled(
+-                self.cache_config.mamba_cache_mode,
+-                min(spec.num_prefill_checkpoint_blocks for spec in mamba_specs),
++            and all(
++                not isinstance(group.kv_cache_spec, MambaSpec)
++                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
++                for group in kv_cache_config.kv_cache_groups
+             )
+         )
+         # A finer prefix_match_unit is configured: a mamba partial tail entry
+@@ -353,7 +341,7 @@ def __init__(
+         # hash boundary, so the split adds that stop.
+         self.mamba_partial_cache_hit = (
+             self.need_mamba_block_aligned_split
+-            and self.hash_block_size < self.mamba_block_size
++            and self.hash_block_size < self.block_size
+             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
+         )
+ 
+@@ -421,9 +409,7 @@ def _mamba_block_aligned_split(
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        # CacheConfig retains the model's initial attention block size even
+-        # when hybrid page-size unification enlarges the Mamba block.
+-        block_size = self.mamba_block_size
++        block_size = self.block_size
+         checkpoint_alignment = min(self.hash_block_size, block_size)
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+
+From fe86f0bb48b94cf187d624039e2dc90b468906eb Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 09:15:10 +0000
+Subject: [PATCH 07/10] Refine K3 checkpoint cache handling
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ vllm/v1/core/sched/scheduler.py              | 11 ++++-------
+ vllm/v1/core/single_type_kv_cache_manager.py |  1 -
+ 2 files changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2517acfbf54d..0f87653b3f70 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -328,13 +328,10 @@ def __init__(
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
+-        self.mamba_has_prefill_checkpoint_blocks = (
+-            self.has_mamba_layers
+-            and all(
+-                not isinstance(group.kv_cache_spec, MambaSpec)
+-                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+-                for group in kv_cache_config.kv_cache_groups
+-            )
++        self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
++            not isinstance(group.kv_cache_spec, MambaSpec)
++            or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
++            for group in kv_cache_config.kv_cache_groups
+         )
+         # A finer prefix_match_unit is configured: a mamba partial tail entry
+         # can only be registered by a step ending exactly at the prompt's last
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index f282667d9a50..e6c6bdef9b05 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1777,7 +1777,6 @@ def _cache_partial_tail_block(
+         request: Request,
+         num_tokens: int,
+     ) -> BlockHashWithGroupId | None:
+-        assert isinstance(self.kv_cache_spec, MambaSpec)
+         hash_block_size = self.block_pool.hash_block_size
+ 
+         # A backend-exported checkpoint occupies the otherwise-null slot just
+
+From 04759231ff6df41c189e225483101b87c2132909 Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 09:33:31 +0000
+Subject: [PATCH 08/10] Restore KV cache manager docstring spacing
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ vllm/v1/core/kv_cache_manager.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 327918f3f070..d1af91b65993 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -389,6 +389,7 @@ def allocate_slots(
+                 blocks an already in-flight (prefilling) sequence is relying on.
+             has_scheduled_reqs: Whether any requests are already scheduled to run
+                 this step, controls whether watermark is applied.
++
+         Blocks layout:
+         ```
+         ----------------------------------------------------------------------
+
+From 21457fcb43c3659cf42aab6bbb666b910ada8c4d Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 09:35:38 +0000
+Subject: [PATCH 09/10] Remove unnecessary checkpoint spacing
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ vllm/v1/core/single_type_kv_cache_manager.py | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index e6c6bdef9b05..423330ee0137 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1582,7 +1582,6 @@ def get_num_blocks_to_allocate(
+             checkpoint_block = int(checkpoint_position > 0)
+             if not apply_admission_cap:
+                 self._checkpoint_positions[request_id] = checkpoint_position
+-
+             if num_new_blocks > 0:
+                 blocks_allocated = request_id in self._allocated_block_reqs
+                 if not (checkpoint_block and blocks_allocated):
+@@ -1778,7 +1777,6 @@ def _cache_partial_tail_block(
+         num_tokens: int,
+     ) -> BlockHashWithGroupId | None:
+         hash_block_size = self.block_pool.hash_block_size
+-
+         # A backend-exported checkpoint occupies the otherwise-null slot just
+         # before the running state. Re-key that request-owned block at the
+         # finest reusable prefix boundary. Its allocation, eviction, and free
+@@ -1799,19 +1797,15 @@ def _cache_partial_tail_block(
+                 kv_cache_group_id=self.kv_cache_group_id,
+                 block_size=self.block_size,
+             )
+-
+         if self.block_size == hash_block_size:
+             return None
+         if num_tokens % self.block_size == 0:
+             return None
+-
+         if num_tokens % hash_block_size != 0:
+             return None
+-
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
+-
+         if num_tokens != latest_prompt_hash_boundary:
+             return None
+ 
+
+From f02c7b522bb4f2afa6543e534ae4d8ce22b3d62d Mon Sep 17 00:00:00 2001
+From: Ziming Huang <zelda.huanghuang@gmail.com>
+Date: Tue, 25 Aug 2026 09:48:49 +0000
+Subject: [PATCH 10/10] Reuse Eagle state for Mamba checkpoints
+
+Co-authored-by: Codex <codex@openai.com>
+
+Signed-off-by: Ziming Huang <zelda.huanghuang@gmail.com>
+---
+ .../v1/core/prefix_cache/test_partial_prefix_cache_hits.py  | 2 +-
+ vllm/v1/core/kv_cache_coordinator.py                        | 6 ------
+ vllm/v1/core/single_type_kv_cache_manager.py                | 5 +----
+ 3 files changed, 2 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 5b740c8650fd..767ea0033483 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -14,7 +14,6 @@
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
+-    MambaManager,
+     SingleTypeKVCacheManager,
+     get_manager_for_kv_cache_spec,
+ )
+@@ -149,11 +148,6 @@ def __init__(
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
+-        # A hybrid model's Mamba group is not itself an Eagle cache group, but
+-        # its checkpoint must match the boundary to which FullAttention drops.
+-        for manager in self.single_type_managers:
+-            if isinstance(manager, MambaManager):
+-                manager.drop_eagle_checkpoint_block = bool(self.eagle_group_ids)
+ 
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 423330ee0137..66972185d40e 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1284,9 +1284,6 @@ def __init__(
+             self.mamba_cache_mode,
+             kv_cache_spec.num_prefill_checkpoint_blocks,
+         )
+-        # The Mamba group is not itself an Eagle cache group. The coordinator
+-        # sets this when any paired attention group applies the Eagle drop.
+-        self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1570,7 +1567,7 @@ def get_num_blocks_to_allocate(
+             checkpoint_position = get_mamba_prefill_checkpoint_position(
+                 num_tokens,
+                 self.block_pool.hash_block_size,
+-                self.drop_eagle_checkpoint_block,
++                self.use_eagle,
+             )
+             if not self._needs_internal_checkpoint(
+                 request_id,
