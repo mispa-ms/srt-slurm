@@ -1212,11 +1212,25 @@ ANALYTICS_ENGINE_CONFIG: dict[str, bool] = {
 }
 
 
-# /configs/dynamo-wheels is the lustre-mounted cache for hash-pinned dynamo
-# source builds. The bench/frontend container always mounts srtslurm's
-# `configs/` dir at /configs (see RuntimeContext.container_mounts), so this
-# path is reachable from every node without any extra recipe wiring.
-_DYNAMO_CACHE_ROOT = "/configs/dynamo-wheels"
+# Cache for hash-pinned dynamo source builds. The default lives under /configs,
+# which is srtslurm's `configs/` dir (see RuntimeContext.container_mounts), so
+# it needs no extra recipe wiring and is reachable from every node.
+#
+# It is not necessarily persistent, though. Under AIB every CI job clones
+# srt-slurm into a fresh sweep_workdir_<job>/srt_slurm_repo, so /configs is new
+# on every run and this cache can never hit: each arm rebuilds dynamo from
+# source and re-fetches rustup, the dynamo repo and cargo's git dependencies.
+# That cost three arms and roughly five GPU-hours in one night on a cluster
+# whose outbound HTTPS resets -- one arm hung in `cargo ... Updating git
+# repository` until the idle reaper took it at 120 minutes, GPUs allocated and
+# untouched, vLLM never started.
+#
+# So allow the root to be pointed somewhere that outlives the job. Set
+# SRTCTL_DYNAMO_CACHE_ROOT to a path that is shared and writable from the
+# compute nodes and the first build serves every arm after it.
+_DYNAMO_CACHE_ROOT_DEFAULT = "/configs/dynamo-wheels"
+# Referenced through a shell variable the generated bash assigns once, below.
+_DYNAMO_CACHE_ROOT = '"$DYN_CACHE_ROOT"'
 
 
 def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
@@ -1265,7 +1279,8 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
     cache = f"{_DYNAMO_CACHE_ROOT}/{cache_key}"
     lock = f"{_DYNAMO_CACHE_ROOT}/.{cache_key}.lock"
     return (
-        f"echo 'Installing dynamo from source ({dynamo_hash}, /configs cache)...' && "
+        f'DYN_CACHE_ROOT="${{SRTCTL_DYNAMO_CACHE_ROOT:-{_DYNAMO_CACHE_ROOT_DEFAULT}}}" && '
+        f"echo \"Installing dynamo from source ({dynamo_hash}, cache $DYN_CACHE_ROOT)...\" && "
         f"mkdir -p {_DYNAMO_CACHE_ROOT} && "
         # Subshell + flock-FD pattern: only the first frontend in a cold-cache
         # job builds; later frontends block on the lock then read .complete.
