@@ -40,7 +40,7 @@ bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
 bash /configs/apply-vllm-k3-nightly-aug28-baseline.sh
 
-# One more, and it is upstream's rather than this stack's.
+# One more, and it is upstream's rather than this stack's: vllm#54167.
 #
 # enable_kimi_k3_low_latency_gemm swaps a fresh KimiK3LowLatencyLinearMethod
 # onto every unquantized K3 linear whose (N, K) is in the measured table. That
@@ -56,7 +56,8 @@ bash /configs/apply-vllm-k3-nightly-aug28-baseline.sh
 # This does not fire on the online-quant arms: with linear=fp8_per_channel the
 # affected layers are no longer UnquantizedLinearMethod, so the swap skips them
 # and the missing __init__ is never reached. Dropping online quantization is
-# what exposes it.
+# what exposes it. Upstream merged the same one-line change at 08:32Z on
+# 2026-08-28, two hours after this nightly was cut.
 VLLM_ROOT=$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')
 LL_PATCH=/configs/patches/vllm-k3-lowlatency-linear-init-on-6f7df92a8.patch
 if patch --batch --forward --dry-run -d "${VLLM_ROOT}" -p1 < "${LL_PATCH}" >/dev/null; then
