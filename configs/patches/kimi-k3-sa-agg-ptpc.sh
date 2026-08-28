@@ -51,15 +51,23 @@ bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 VLLM_ROOT=$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')
 echo "[k3-sa] vllm root: ${VLLM_ROOT}"
 
+# The carried patch omits 51392's hunk to config_utils.py, because whether that
+# module exists depends on the base: absent at 75c2eef, present at 5a4c8d99.
+# Either way 51392 needs exactly one function out of it, for a log summary.
 CFGUTILS="${VLLM_ROOT}/vllm/model_executor/layers/quantization/utils/config_utils.py"
 if [ ! -f "${CFGUTILS}" ]; then
-    echo "[k3-sa] creating the config_utils shim (absent at this base)"
+    echo "[k3-sa] config_utils absent at this base; creating it"
     cat > "${CFGUTILS}" <<'SHIM'
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Backport shim: this base predates the module upstream carries.
 vllm#51392 needs only get_layer_name_after_index, for its log summary."""
+SHIM
+fi
+if ! grep -q "def get_layer_name_after_index" "${CFGUTILS}"; then
+    echo "[k3-sa] appending get_layer_name_after_index to config_utils"
+    cat >> "${CFGUTILS}" <<'FUNC'
 
 
 def get_layer_name_after_index(layer_name: str) -> str:
@@ -69,7 +77,9 @@ def get_layer_name_after_index(layer_name: str) -> str:
         if parts[index].isdigit():
             return ".".join(parts[index + 1 :])
     return layer_name
-SHIM
+FUNC
+else
+    echo "[k3-sa] config_utils already carries get_layer_name_after_index"
 fi
 
 apply_patch() {
