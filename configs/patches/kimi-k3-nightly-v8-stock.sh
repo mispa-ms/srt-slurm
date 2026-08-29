@@ -15,9 +15,12 @@
 # has been wrong four times on this track, so it gets measured before we decide
 # whether the submission needs a patch or an image at all.
 #
-# WHAT THIS ARM IS. Deps only -- FlashInfer pinned, Mooncake client pinned, the
-# same as every other arm -- and then nothing. It asserts our markers are ABSENT
-# so a stale layer cannot make a patched image look like a stock one.
+# WHAT THIS ARM IS. Deps, plus exactly one upstream commit and nothing of ours:
+# vllm#54167. Without it _KimiK3LowLatencyApply omits super().__init__() and the
+# model dies with AttributeError: no attribute '_gemm_impl' -- it merged 08-28
+# 08:32 and the image was cut 06:13. Carrying it is what makes this arm answer
+# the question asked rather than that unrelated one. Our own markers are still
+# asserted ABSENT, so a stale layer cannot make a patched image look stock.
 #
 # EXPECTED: dies at server start with the ValueError above. If it does not, the
 # patch may no longer be required and the submission gets simpler.
@@ -28,6 +31,15 @@ readonly PINNED_SHA=6f7df92a8e
 export FI_VER=0.6.16.post3
 export K3_EXPECT_OURS=0
 bash "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-aggv2.sh"
+
+SITE=$(python3 -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent.parent)")
+readonly GEMMFIX=/configs/patches/k3-gemmfix-54167.patch
+echo "=== applying vllm#54167 only ==="
+if patch -p1 -R --dry-run --force --silent -d "$SITE" < "$GEMMFIX" >/dev/null 2>&1; then
+    echo "already applied"
+else
+    patch -p1 --forward -d "$SITE" < "$GEMMFIX"
+fi
 
 python3 - <<PY
 import re
@@ -66,6 +78,10 @@ for rel, mark, who in [
         f"{who} is present: this image is not stock, so the result would not "
         "answer the question"
     )
+
+assert "super().__init__()" in (
+    root / "models/kimi_k3/nvidia/low_latency_gemm.py"
+).read_text(), "vllm#54167 did not apply; the run would die on _gemm_impl instead"
 
 # And the refusal we expect to hit, quoted so the log says what to look for.
 conn = (root / "distributed/kv_transfer/kv_connector/v1/mooncake/store"

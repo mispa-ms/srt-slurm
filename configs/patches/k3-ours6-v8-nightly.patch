@@ -244,6 +244,18 @@ index 748e5219a7..a0b9e4ae13 100644
  
  class KimiK3KDAAttentionBackend(GDNAttentionBackend):
      @staticmethod
+diff --git a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+index ecab56dbe4..52e6aa0475 100644
+--- a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
++++ b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+@@ -725,6 +725,7 @@ class _KimiK3LowLatencyApply:
+     """Mixin: try the precomputed plan, else defer to the base method."""
+ 
+     def __init__(self, plan: dict[int, ResolvedCall]) -> None:
++        super().__init__()
+         self._plan = plan
+ 
+     def apply(
 diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
 index 31c16bd2b6..f40b11e5a6 100644
 --- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py

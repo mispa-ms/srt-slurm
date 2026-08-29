@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# v8: our commits on the 08-28 nightly, 6f7df92a8e.
+# v8: our commits on the 08-28 nightly, 6f7df92a8e, plus vllm#54167.
+#
+# The nightly is unusable on this model without #54167: _KimiK3LowLatencyApply
+# omits super().__init__(), so KimiK3LowLatencyLinearMethod never gets its
+# _gemm_impl and the run dies with AttributeError. It merged 08-28 08:32 and the
+# image was cut 06:13 -- two hours short. Carried here as a seventh commit; drop
+# it the moment a nightly contains it.
 #
 # 538 upstream commits on from v7's base, and the patch SHRANK from eight
 # commits to six. Three were absorbed:
@@ -85,6 +91,8 @@ CHECKS = [
     ("v1/worker/gpu/cp_utils.py", "def cp_local_slot(", "DSpark under DCP"),
     ("v1/attention/backends/mla/tokenspeed_mla.py", "VLLM_TS_MLA_DCP_FLATTEN",
      "TokenspeedMLA DCP flatten flag"),
+    ("models/kimi_k3/nvidia/low_latency_gemm.py", "super().__init__()",
+     "vllm#54167, without which there is no _gemm_impl"),
     ("v1/core/sched/scheduler.py", "kv_load_failure", "hybrid-aware recompute"),
 ]
 missing = [(rel, who) for rel, mark, who in CHECKS
