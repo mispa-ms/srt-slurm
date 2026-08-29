@@ -2,7 +2,7 @@
 """Is the hit length the lookup reports actually loadable from the store?
 
 Run against the *installed* vllm inside the framework container, before any GPU
-time, by kimi-k3-merged-mooncake.sh.
+time, by the kimi-k3-nightly-v*.sh setup scripts.
 
 A Mooncake key is a whole block. The store therefore holds an object only at
 each group's block boundaries -- there is no object at a hash boundary in a
@@ -17,10 +17,21 @@ every hit landing there names a key nobody wrote. Measured on B300 c8 DCP=8:
 2,757,664 OBJECT_NOT_FOUND (-704), all on the one scaled group, the run stuck in
 warmup for four hours because kv_load_failure_policy=recompute retried forever.
 
-vllm#50359 revalidates the reconciled boundary and steps back until the key
-exists. This asserts the property that fix is for, over dcp in {1,2,4,8}: the
-reported hit must be an exact object boundary for EVERY group, not just the one
-upstream checks.
+WHICH CONTRACT THIS ASSERTS, AND WHY IT CHANGED. We first fixed this by
+revalidating the reconciled boundary and stepping the hit back until its key
+existed. vllm#53324 (merged 2026-08-29, in the 08-29 nightly) solves the same
+defect the other way round: it keeps the longer hit and resolves, per group, the
+hash boundary whose key was actually used to store that tail block. That is
+strictly better -- our version threw away a hit upstream can now load -- so the
+step-back is gone and this file no longer asserts "the hit is an object
+boundary". That property is now false ON PURPOSE.
+
+What replaces it is upstream's own resolution: for every group,
+``MooncakeStoreWorker._tail_key_boundaries`` must return a boundary whose key
+the store actually holds. The test calls that method rather than re-deriving it,
+so it exercises the shipped code and not a paraphrase of it; a stand-in object
+supplies the three attributes it reads. When no key can be found upstream raises
+"No tail key found for cache group", which is the loud form of the same -704.
 
 The gates that ran instead of this could not see it -- GSM8K passed at
 0.950/0.954/0.956 with an external hit rate of 0.0%, never executing the
@@ -28,12 +39,16 @@ connector's read path at all.
 """
 
 from math import lcm
+from types import SimpleNamespace
 
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+    MooncakeStoreWorker,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -95,29 +110,51 @@ def check(dcp: int) -> None:
         for end in range(block_size, MAX_LENGTH + 1, block_size):
             exists.add((g_idx, bytes(hashes[end // HASH_BLOCK_SIZE - 1])))
 
+    pool = ExternalCachedBlockPool(HASH_BLOCK_SIZE, exists)
     _masks, hit = coord.find_longest_cache_hit(
         hashes,
         max_length=MAX_LENGTH,
-        cached_block_pool=ExternalCachedBlockPool(HASH_BLOCK_SIZE, exists),
+        cached_block_pool=pool,
     )
 
     if hit == 0:
         return
-    for g_idx, block_size in enumerate(block_sizes):
-        key = bytes(hashes[hit // HASH_BLOCK_SIZE - 1])
-        assert (g_idx, key) in exists, (
-            f"dcp={dcp}: reported hit {hit} is not an object boundary for group "
-            f"{g_idx} (block_size={block_size}); loading it asks Mooncake for a "
-            f"key nobody wrote -> -704"
+
+    # Upstream's own resolver, called on a stand-in carrying the three
+    # attributes it reads. Building a real worker would need a live store.
+    stub = SimpleNamespace(
+        hash_block_size=HASH_BLOCK_SIZE,
+        token_dbs=[SimpleNamespace(block_size=bs) for bs in block_sizes],
+        coord=coord,
+    )
+    boundaries = MooncakeStoreWorker._tail_key_boundaries(stub, hashes, hit, pool)
+
+    assert len(boundaries) == len(block_sizes), (
+        f"dcp={dcp}: {len(boundaries)} tail boundaries for {len(block_sizes)} "
+        f"groups; a group with no resolved key would be loaded at the wrong one"
+    )
+    for boundary, block_size in zip(boundaries, block_sizes):
+        key = bytes(hashes[boundary.num_tokens // HASH_BLOCK_SIZE - 1])
+        assert (boundary.group_id, key) in exists, (
+            f"dcp={dcp}: hit {hit} resolved to tail boundary "
+            f"{boundary.num_tokens} for group {boundary.group_id} "
+            f"(block_size={block_size}), but the store holds no object there; "
+            f"loading it asks Mooncake for a key nobody wrote -> -704"
         )
 
 
 def check_load_mask_not_shortened() -> None:
-    """The recv-side pool answers "present" to anything, so the exact-boundary
-    retry has no truth to check there. If it ran, load_mask would return a mask
-    for a shorter length while its caller keeps using the original token_len,
-    and process_tokens' trailing chunks would fall off the end of the mask --
-    those blocks stay uninitialized in the local KV pool. Silent, unlike -704.
+    """load_mask must return one chunk per block, never fewer.
+
+    This guarded our step-back fix, which could shorten a hit on the recv-side
+    pool -- that pool answers "present" to anything, so there was no truth to
+    step back against. The mask would then cover fewer tokens than its caller's
+    token_len and process_tokens' trailing chunks would fall off the end,
+    leaving those blocks uninitialized: silent, unlike -704.
+
+    The step-back is gone with vllm#53324, so nothing shortens today. Kept as a
+    regression guard: any future revalidation that shortens a hit reintroduces
+    exactly this, and it is the failure mode that does not announce itself.
     """
     groups = _groups(8)
     block_sizes = [g.kv_cache_spec.block_size for g in groups]
