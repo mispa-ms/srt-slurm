@@ -22,16 +22,19 @@ revalidating the reconciled boundary and stepping the hit back until its key
 existed. vllm#53324 (merged 2026-08-29, in the 08-29 nightly) solves the same
 defect the other way round: it keeps the longer hit and resolves, per group, the
 hash boundary whose key was actually used to store that tail block. That is
-strictly better -- our version threw away a hit upstream can now load -- so the
-step-back is gone and this file no longer asserts "the hit is an object
-boundary". That property is now false ON PURPOSE.
+strictly better -- our version threw away a hit upstream can now load -- so on a
+#53324 image "the hit is an object boundary" is false ON PURPOSE, and what must
+hold instead is that ``MooncakeStoreWorker._tail_key_boundaries`` returns, for
+every group, a boundary whose key the store holds. The test calls that method
+rather than re-deriving it, so it exercises shipped code and not a paraphrase.
+When no key can be found upstream raises "No tail key found for cache group",
+which is the loud form of the same -704.
 
-What replaces it is upstream's own resolution: for every group,
-``MooncakeStoreWorker._tail_key_boundaries`` must return a boundary whose key
-the store actually holds. The test calls that method rather than re-deriving it,
-so it exercises the shipped code and not a paraphrase of it; a stand-in object
-supplies the three attributes it reads. When no key can be found upstream raises
-"No tail key found for cache group", which is the loud form of the same -704.
+BOTH contracts are checked here, chosen by what the image implements. The same
+file runs on the 08-28 nightly and on 08-29 and later, and asserting only the
+newer one cost a 24-point ladder: this runs before the engine starts, so an
+AttributeError reads as "server never became healthy" and every arm dies at once.
+The run log names which contract was checked.
 
 The gates that ran instead of this could not see it -- GSM8K passed at
 0.950/0.954/0.956 with an external hit rate of 0.0%, never executing the
@@ -50,12 +53,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     MooncakeStoreWorker,
 )
+
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
 )
+
+# Which contract this image implements. Both are checked by this file, because
+# the same file runs on the 08-28 nightly (pre-#53324) and on 08-29 and later.
+# Rewriting it for the newer contract alone cost a 24-point ladder: the setup
+# script runs it before the engine starts, so an AttributeError here reads as
+# "server never became healthy" and every arm dies at once.
+HAS_TAIL_KEY_RESOLVER = hasattr(MooncakeStoreWorker, "_tail_key_boundaries")
 
 HASH_BLOCK_SIZE = 128
 MAMBA_BLOCK = 1536
@@ -120,8 +131,22 @@ def check(dcp: int) -> None:
     if hit == 0:
         return
 
-    # Upstream's own resolver, called on a stand-in carrying the three
-    # attributes it reads. Building a real worker would need a live store.
+    if not HAS_TAIL_KEY_RESOLVER:
+        # Pre-#53324 image: the hit itself is the load key, so it has to be an
+        # object boundary for every group. This is the contract our step-back
+        # fix maintained, and the one the 08-28 nightly still runs under.
+        for g_idx, block_size in enumerate(block_sizes):
+            key = bytes(hashes[hit // HASH_BLOCK_SIZE - 1])
+            assert (g_idx, key) in exists, (
+                f"dcp={dcp}: reported hit {hit} is not an object boundary for "
+                f"group {g_idx} (block_size={block_size}); loading it asks "
+                f"Mooncake for a key nobody wrote -> -704"
+            )
+        return
+
+    # #53324 and later: the hit may land mid-block on purpose, and the load key
+    # comes from upstream's own resolver. Call it on a stand-in carrying the
+    # three attributes it reads -- building a real worker needs a live store.
     stub = SimpleNamespace(
         hash_block_size=HASH_BLOCK_SIZE,
         token_dbs=[SimpleNamespace(block_size=bs) for bs in block_sizes],
@@ -202,6 +227,8 @@ def main() -> int:
     """Plain driver: the framework image is not guaranteed to ship pytest, and a
     missing test dependency must not take down every arm of a sweep."""
     failures = 0
+    contract = "#53324 tail-key resolver" if HAS_TAIL_KEY_RESOLVER else "pre-#53324 object boundary"
+    print(f"  contract: {contract}")
     for dcp in (1, 2, 4, 8):
         try:
             check(dcp)
