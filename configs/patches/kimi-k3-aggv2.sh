@@ -88,10 +88,15 @@ root = pathlib.Path(vllm.__file__).parent
 # markers themselves once the patch is on.
 import os
 
+# Upstream merged v1/attention/ops/dcp_utils.py and the DCP half of
+# v1/attention/ops/common.py into v1/attention/ops/dcp.py. Both markers moved
+# there; checking the old paths made read_text() raise FileNotFoundError before
+# any arm reached its own patch, which reads as "Server did not become healthy"
+# a screen later. Checked by content, not by path, for that reason.
 UPSTREAM = [
     ('models/kimi_k3/nvidia/mla.py', 'self.dcp_manager: MLADCPManager | None = None', '#50484'),
-    ('v1/attention/ops/dcp_utils.py', 'class MLADCPManager', '#50484'),
-    ('v1/attention/ops/common.py', 'sequence_indices = torch.searchsorted(', '#50484'),
+    ('v1/attention/ops/dcp.py', 'class MLADCPManager', '#50484'),
+    ('v1/attention/ops/dcp.py', 'sequence_indices = torch.searchsorted(', '#50484'),
     ('envs.py', 'VLLM_USE_DIRECT_DCP_A2A', '#50484'),
 ]
 OURS = [
@@ -108,8 +113,18 @@ if not expect_ours:
     print('K3_EXPECT_OURS=0: the caller applies our commits after this script;',
           'checking only what the base image must already have')
 for rel, marker, who in checks:
-    src = (root / rel).read_text()
-    assert marker in src, f'{who}: missing in {rel}: {marker}'
+    path = root / rel
+    # A renamed or deleted file used to raise FileNotFoundError from read_text(),
+    # which surfaces two screens later as "Server did not become healthy" and
+    # tells nobody which marker moved. Upstream merged dcp_utils.py into dcp.py
+    # and four GPU runs went to that. Say what is missing.
+    if not path.exists():
+        raise SystemExit(
+            f'{who}: {rel} does not exist in this image. Upstream moved or '
+            f'deleted it; update the marker list rather than the image. '
+            f'(looking for: {marker})'
+        )
+    assert marker in path.read_text(), f'{who}: missing in {rel}: {marker}'
 
 k3 = (root / 'models/kimi_k3/nvidia/mla.py').read_text()
 assert 'does not support context parallelism.' not in k3, 'the blanket CP assert is still in mla.py'
