@@ -1,0 +1,3275 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 564f13cddf..5cad1ce9bd 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1644,7 +1644,12 @@ class SpeculativeConfig:
+         This is mostly a copy of the target parallel config, except the tp_size.
+         """
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            # The drafter is instantiated only on the last pipeline stage and is
++            # never itself pipelined, so it must not inherit the target's PP
++            # size; doing so would require the draft architecture to implement
++            # SupportsPP. This is a no-op for previously working setups, since
++            # speculative decoding under PP > 1 was rejected outright before.
++            pipeline_parallel_size=1,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index c2f0e66406..792660a713 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -37,6 +37,13 @@ class ExternalCachedBlockPool:
+         # determined and we just want each spec's manager to apply its own mask.
+         self._exists = exists
+         self.hash_block_size = hash_block_size
++        # False on the recv side, where the pool answers "present" to anything.
++        # The exact-boundary retry must not run against such a pool: it would
++        # shorten a hit that the lookup already validated, and load_mask's caller
++        # keeps using the original token_len, so process_tokens' trailing chunks
++        # would fall off the end of the mask and leave those blocks
++        # uninitialized -- silent corruption where -704 was at least loud.
++        self.tracks_existence = exists is not None
+         self.null_block = KVCacheBlock(block_id=0)
+         # Dummy ID 1 for present block for duck-typing.
+         self._present_block = KVCacheBlock(block_id=1)
+@@ -102,6 +109,14 @@ class MooncakeStoreCoordinator:
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+ 
++    @property
++    def cache_hit_alignment_tokens(self) -> int:
++        return (
++            self.hash_block_size
++            if self.enable_partial_hash_hits
++            else self.lcm_block_size
++        )
++
+     def align_lookup_length(self, length: int) -> int:
+         alignment = (
+             self.hash_block_size
+@@ -164,14 +179,56 @@ class MooncakeStoreCoordinator:
+         already reflects the eagle-pruned hit length and a second pop would
+         leave the trailing block unloaded.
+         """
+-        blocks_per_group, hit_length = self._find_hit_blocks(
+-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+-        )
+-        masks = tuple(
+-            [blk is not cached_block_pool.null_block for blk in blocks]
+-            for blocks in blocks_per_group
++        candidate_length = max_length
++        while True:
++            blocks_per_group, hit_length = self._find_hit_blocks(
++                block_hashes,
++                candidate_length,
++                cached_block_pool,
++                apply_eagle=apply_eagle,
++            )
++            masks = tuple(
++                [blk is not cached_block_pool.null_block for blk in blocks]
++                for blocks in blocks_per_group
++            )
++            if hit_length == 0 or self._exact_partial_hit_key_exists(
++                block_hashes, hit_length, cached_block_pool
++            ):
++                return masks, hit_length
++
++            candidate_length = max(0, hit_length - self.cache_hit_alignment_tokens)
++
++    def _exact_partial_hit_key_exists(
++        self,
++        block_hashes: Sequence[BlockHash],
++        hit_length: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> bool:
++        """Whether the reconciled partial FullAttention tail can be loaded."""
++        if not self.enable_partial_hash_hits:
++            return True
++        if not cached_block_pool.tracks_existence:
++            # Recv-side pool: it has no truth to check, and shortening the hit
++            # here would desynchronise the mask from its caller's token_len.
++            return True
++
++        # Attribute access, not tuple unpacking: SpecGroup carries manager_cls
++        # and use_eagle here, so the upstream 3-tuple unpack raises ValueError
++        # on the first lookup. git apply cannot see that -- it is a runtime
++        # arity mismatch, not a textual conflict.
++        group = self.attention_groups[0]
++        if not isinstance(group.spec, FullAttentionSpec):
++            # Nothing to revalidate: the defect needs an attention group coarser
++            # than hash granularity, and a recurrent group is tail-only. Upstream
++            # asserts FullAttentionSpec here, which crashes at the first lookup on
++            # a Mamba-only layout -- reachable, since partial hits are enabled by
++            # a Mamba group alone.
++            return True
++        hash_idx = hit_length // self.hash_block_size - 1
++        return (
++            cached_block_pool.get_cached_block(block_hashes[hash_idx], group.group_ids)
++            is not None
+         )
+-        return masks, hit_length
+ 
+     def load_mask(
+         self,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index c8166b2e6a..19c60c26c8 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -10,8 +10,9 @@ import threading
+ import time
+ import uuid
+ from collections import defaultdict
+-from collections.abc import Iterator
++from collections.abc import Iterator, Sequence
+ from concurrent.futures import Future, ThreadPoolExecutor
++from dataclasses import dataclass
+ from functools import cached_property
+ from typing import TYPE_CHECKING, Any, cast
+ 
+@@ -32,6 +33,11 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
++    MemberTransferPlan,
++    plan_member_transfer,
++    validate_region_members,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+     GET_META_MSG,
+     NixlAgentMetadata,
+@@ -63,9 +69,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
+ from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+ from vllm.distributed.parallel_state import (
+     get_pcp_group,
++    get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+ )
++from vllm.distributed.utils import get_pp_indices
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+@@ -96,6 +104,19 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
+     return len(block_strides) == len(storage_ptrs) == 1
+ 
+ 
++def _ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
++    """Half-open [start, end) intervals share at least one layer."""
++    return a[0] < b[1] and b[0] < a[1]
++
++
++@dataclass
++class _MemberTransferState:
++    """Cached local source handle and the plan that defines its layout."""
++
++    handle: int
++    plan: MemberTransferPlan
++
++
+ class NixlBaseConnectorWorker:
+     """Base implementation of Worker side methods shared by pull and push."""
+ 
+@@ -103,6 +124,9 @@ class NixlBaseConnectorWorker:
+     # (WRITE) connector and a pull (READ) connector never handshake together.
+     # Overridden by NixlPushConnectorWorker.
+     _TRANSFER_MODE: str = "pull"
++    # Member-major routing is supported only by NixlPushConnector for HMA or
++    # packed KV caches under PP.
++    _supports_member_identity = False
+ 
+     def _compute_desc_ids(
+         self,
+@@ -110,6 +134,7 @@ class NixlBaseConnectorWorker:
+         dst_num_blocks: int,
+         block_size_ratio: float | None,
+         physical_blocks_per_logical: int,
++        region_group_ids: tuple[int, ...] | None = None,
+     ) -> np.ndarray:
+         """Compute NIXL descriptor IDs for given block IDs."""
+         num_ssm_regions = 0
+@@ -123,6 +148,52 @@ class NixlBaseConnectorWorker:
+         num_blocks = dst_num_blocks
+         if block_size_ratio is not None:
+             num_blocks = int(num_blocks * block_size_ratio)
++
++        if region_group_ids is not None:
++            # Member-major descriptors, using each member's KV-cache group.
++            # The registered layout keeps the same two halves as the region-major
++            # one -- [attention members | SSM members] -- because a pooled region
++            # can back one of each and they are read with different strides:
++            # attention descriptors are per (ratio-expanded) block, SSM state
++            # blocks are indivisible and fan out into conv sub-projections plus
++            # one temporal region.
++            if num_ssm_regions == 0:
++                # All-attention fast path: every member is one region of
++                # `num_blocks` descriptors, in plan order.
++                out = [
++                    np.asarray(block_ids[g], dtype=np.int64) + k * num_blocks
++                    for k, g in enumerate(region_group_ids)
++                ]
++                return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
++
++            kinds = [
++                _is_attention_spec(self._group_spec_types[g]) for g in region_group_ids
++            ]
++            num_attention_members = sum(kinds)
++            num_fa_descs = num_attention_members * num_blocks
++            logical_blocks = dst_num_blocks // physical_blocks_per_logical
++            regions_per_ssm_layer = self._ssm_regions_per_layer
++
++            out = []
++            fa_ordinal = ssm_ordinal = 0
++            for is_attention, group in zip(kinds, region_group_ids):
++                group_arr = np.asarray(block_ids[group], dtype=np.int64)
++                if is_attention:
++                    out.append(group_arr + fa_ordinal * num_blocks)
++                    fa_ordinal += 1
++                else:
++                    sub = (
++                        np.arange(regions_per_ssm_layer, dtype=np.int64)
++                        + ssm_ordinal * regions_per_ssm_layer
++                    )[:, None]
++                    out.append(
++                        (
++                            sub * logical_blocks + group_arr[None, :] + num_fa_descs
++                        ).flatten()
++                    )
++                    ssm_ordinal += 1
++            return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
++
+         num_fa_descs = self.num_regions * num_blocks
+ 
+         # All-attention fast path: single vectorized broadcast.
+@@ -259,6 +330,267 @@ class NixlBaseConnectorWorker:
+         """
+         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
+ 
++    def _set_region_members(self, region_members: list[list[str]]) -> None:
++        validate_region_members(region_members)
++        self.region_members: list[list[str]] = region_members
++
++    def _member_kind_indices(
++        self, member_plan: MemberTransferPlan
++    ) -> tuple[list[int], list[int]]:
++        """Member positions split by cache kind, in plan order.
++
++        A pooled region can back both an attention layer and an SSM layer, so
++        the two kinds are addressed by different member positions over the same
++        region -- which is the whole reason member identity is needed here.
++
++        Returns:
++            ``(attention_positions, ssm_positions)`` into ``member_plan``.
++        """
++        attention: list[int] = []
++        ssm: list[int] = []
++        for position, group_id in enumerate(member_plan.group_ids):
++            spec_type = self._group_spec_types[group_id]
++            if _is_attention_spec(spec_type):
++                attention.append(position)
++            elif _is_ssm_spec(spec_type):
++                ssm.append(position)
++            else:
++                raise ValueError(
++                    f"Unsupported KV cache spec {spec_type} for member "
++                    f"{member_plan.member_names[position]!r}"
++                )
++        return attention, ssm
++
++    @property
++    def _ssm_regions_per_layer(self) -> int:
++        """NIXL regions an SSM layer occupies: conv sub-projections + temporal."""
++        assert self._conv_decomp is not None
++        return len(self._conv_decomp.local_conv_offsets) + 1
++
++    @cached_property
++    def pp_rank(self) -> int:
++        """This worker's pipeline stage.
++
++        Resolved lazily: ``get_pp_group()`` asserts the group is initialized,
++        which is not true at worker ``__init__`` on every path, so reading it
++        there turns an unrelated config into a crash.
++
++        The fallback derives the stage from the rank layout, which
++        ``initialize_model_parallel`` documents as
++        ``ExternalDP x DP x PP x PCP x TP``. Dividing by TP alone was right only
++        when PCP and DP were both 1 -- under DP>1, which is how K3 runs with EP,
++        it returns a stage index off by a multiple of pp_size, and the value is
++        cached, so every later transfer inherits it.
++        """
++        if self.pp_size == 1:
++            return 0
++        try:
++            return get_pp_group().rank_in_group
++        except AssertionError:
++            parallel = self.vllm_config.parallel_config
++            inner = max(1, parallel.prefill_context_parallel_size) * max(
++                1, parallel.tensor_parallel_size
++            )
++            return (parallel.rank // inner) % self.pp_size
++
++    def _overlapping_remote_pp_stages(self, remote_pp_size: int) -> int:
++        """How many remote PP stages hold layers this worker also holds.
++
++        A PP-sharded consumer is written to only by the producer stages whose
++        layer window overlaps its own, so the completion count cannot simply be
++        the producer's stage count. Both sides partition the same model with
++        ``get_pp_indices``, which is a pure function of (layers, rank, size), so
++        the overlap is arithmetic -- no extra handshake state is needed and the
++        remote need not describe its split.
++
++        Returns ``remote_pp_size`` unchanged when this worker is not PP-sharded,
++        which is the pre-existing behaviour for a TP-only consumer.
++        """
++        return len(self._overlapping_remote_pp_ranks(remote_pp_size))
++
++    def _overlapping_remote_pp_ranks(self, remote_pp_size: int) -> list[int]:
++        """Which remote PP stages hold layers this worker also holds.
++
++        The consumer side counts these to know how many completion notifs to
++        expect; the producer side writes to exactly these and no others, since
++        a stage outside the overlap holds different layers at the same
++        descriptor offsets.
++        """
++        if self.pp_size == 1:
++            return list(range(remote_pp_size))
++        num_layers = self.model_config.get_total_num_hidden_layers()
++        local_start, local_end = get_pp_indices(num_layers, self.pp_rank, self.pp_size)
++        return [
++            stage
++            for stage in range(remote_pp_size)
++            if _ranges_overlap(
++                get_pp_indices(num_layers, stage, remote_pp_size),
++                (local_start, local_end),
++            )
++        ]
++
++    def _tracks_region_members(self) -> bool:
++        """Whether register_kv_caches advertises per-region layer members.
++
++        Must be implied by ``_requires_member_identity``: a worker that routes
++        by member identity but advertises no members hands its peer an empty
++        ``region_members`` and fails the handshake. The two were separate
++        expressions once and drifted, which made every K3 PP arm unstartable.
++
++        Deliberately wider than the routing gate. ``_is_hma_required`` is a
++        property of *this stage's* layers, so a stage holding only
++        full-attention layers reported False and advertised nothing -- while its
++        hybrid peer, which does need member identity, raised "remote peer
++        advertised no member metadata". Same for a packed layout, which routes
++        by member but is not HMA. Advertising members a peer never uses costs a
++        list of names in the handshake; not advertising them is a dead engine.
++        """
++        return self._supports_member_identity and (
++            self._is_hma_required or bool(self._packed_layer_info) or self.pp_size > 1
++        )
++
++    def _requires_member_identity(
++        self, remote_region_members: Sequence[Sequence[str]] = ()
++    ) -> bool:
++        """Whether transfers to this peer must be routed by layer name.
++
++        Region indices identify a region only relative to the layer set that
++        produced them, so they stop being a shared identity as soon as the two
++        sides hold different layer sets. That is a property of the *pair*, not
++        of us: a PP=1 producer writing to a PP-sharded consumer has the same
++        problem as a PP-sharded producer, because the consumer's stage holds a
++        subset of our layers at region indices that mean something else.
++
++        Checking only ``self.pp_size`` -- as this did -- silently left the
++        PP=1 x PP>1 direction on region-index routing, where it fails the
++        descriptor-count check or, past it, transfers the wrong layers.
++
++        With no remote members advertised the answer is the local one: an old
++        peer that cannot describe its members is one we could not member-route
++        to anyway.
++        """
++        if not self._supports_member_identity:
++            return False
++        if not (self._is_hma_required or bool(self._packed_layer_info)):
++            return False
++        if self.pp_size > 1:
++            return True
++        return self._peer_layer_set_differs(remote_region_members)
++
++    def _peer_layer_set_differs(
++        self, remote_region_members: Sequence[Sequence[str]]
++    ) -> bool:
++        """Whether the peer advertised a different set of KV layers than ours.
++
++        Identical sets mean the two sides partitioned the model the same way and
++        region indices line up, which is the long-standing TP-only case; leaving
++        it on region-index routing keeps that path untouched.
++        """
++        if not remote_region_members:
++            return False
++        remote = {name for members in remote_region_members for name in members}
++        local = {name for members in self.region_members for name in members}
++        return bool(local) and remote != local
++
++    def _use_member_identity(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
++        """Whether to route this remote's regions by layer name.
++
++        Raises:
++            RuntimeError: if the local layout requires member routing but the
++                remote peer advertised no member metadata. The compatibility
++                hash normally rejects such a peer, but the e2e HMA config runs
++                with ``enforce_handshake_compat=false``; falling back to
++                region-index routing here would silently transfer stale KV.
++        """
++        if not self._requires_member_identity(nixl_agent_meta.region_members):
++            return False
++        if not nixl_agent_meta.region_members:
++            raise RuntimeError(
++                "Local hybrid/packed KV layout requires member-identity "
++                "routing, but the remote peer advertised no member metadata "
++                "(region_members is empty). The peer is likely running an "
++                "incompatible connector or configuration; refusing to fall "
++                "back to region-index routing."
++            )
++        return True
++
++    def _expand_remote_members(
++        self, nixl_agent_meta: NixlAgentMetadata
++    ) -> tuple[NixlAgentMetadata, MemberTransferPlan]:
++        member_meta, member_plan = plan_member_transfer(
++            nixl_agent_meta,
++            self.region_members,
++            self._layer_name_to_kv_group_index,
++            local_packed_layouts=self._packed_layer_info,
++            local_block_stride=self._packed_block_stride,
++        )
++        if member_plan.is_packed:
++            for layer_name in member_plan.member_names:
++                self._assert_packed_member_supported(layer_name)
++        return member_meta, member_plan
++
++    def _check_member_plan_consistency(
++        self,
++        engine_id: EngineId,
++        remote_pp_rank: int,
++        member_plan: MemberTransferPlan,
++    ) -> None:
++        """Reject a later remote TP rank whose member layout diverges.
++
++        Every remote TP rank of one *stage* shares that stage's cached local
++        source handle, so its plan must match or the cached local descriptor
++        order would be paired with a different remote order. Different stages
++        are expected to differ and are cached separately. Called before any
++        per-rank NIXL resources are created, so a divergent rank fails without
++        leaking state.
++        """
++        existing = self._member_xfer_state.get((engine_id, remote_pp_rank))
++        if existing is not None and existing.plan != member_plan:
++            raise RuntimeError(
++                f"Remote TP ranks of engine {engine_id!r} stage {remote_pp_rank} "
++                "advertised inconsistent member layouts; refusing to reuse the "
++                "cached local member-ordered transfer handle."
++            )
++
++    def _register_member_state(
++        self,
++        engine_id: EngineId,
++        remote_pp_rank: int,
++        member_plan: MemberTransferPlan,
++        remote_block_size: int,
++    ) -> None:
++        """Register this remote stage's member-ordered local source handle once.
++
++        Idempotent per (engine, stage): the first remote TP rank of a stage
++        registers the handle; later ranks of that stage reuse it (consistency
++        already checked by ``_check_member_plan_consistency``). Stages get their
++        own handle because each advertises its own layer window.
++        """
++        if (engine_id, remote_pp_rank) in self._member_xfer_state:
++            return
++        handle = self.register_local_xfer_handler(remote_block_size, member_plan)[0]
++        self._member_xfer_state[(engine_id, remote_pp_rank)] = _MemberTransferState(
++            handle=handle,
++            plan=member_plan,
++        )
++
++    def _assert_packed_member_supported(self, layer_name: str) -> None:
++        """Reject non-MLA members on the packed member-major slicing path.
++
++        Pull and PP=1 push use the whole-region packed path. PP-sharded push
++        routes packed caches by member identity; per-member slicing of a packed
++        block currently assumes REPLICATE (MLA) members, so the restriction
++        lives here rather than in the shared ``_register_packed_kv_cache``.
++        """
++        spec = self._layer_specs.get(layer_name)
++        if isinstance(spec, UniformTypeKVCacheSpecs):
++            spec = spec.kv_cache_specs[layer_name]
++        if not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
++            raise NotImplementedError(
++                "Packed member-major KV transfer currently supports only MLA "
++                f"caches; layer {layer_name!r} is not MLA"
++            )
++
+     def __init__(
+         self,
+         vllm_config: "VllmConfig",
+@@ -451,18 +783,32 @@ class NixlBaseConnectorWorker:
+         # transfers into the matching sub-range of a PP=1 remote's regions.
+         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+         self._remote_region_offset = 0
+-        # PP push slices regions per layer (uniform count); HMA breaks that.
+-        if self.pp_size > 1 and self._is_hma_required:
++        if (
++            self.pp_size > 1
++            and self._is_hma_required
++            and not self._supports_member_identity
++        ):
+             raise NotImplementedError(
+-                "NixlPushConnector does not support pipeline_parallel_size > 1 "
+-                "with hybrid KV cache layouts (HMA) yet."
++                "NixlConnector (pull) does not support pipeline_parallel_size "
++                "> 1 with hybrid KV cache layouts (HMA); use NixlPushConnector "
++                "for PP + HMA."
+             )
+-        # Decode-side PP is unsupported (completions counted per consumer rank).
+-        if vllm_config.kv_transfer_config.kv_role == "kv_consumer" and self.pp_size > 1:
++        # PP push routes HMA (hybrid) layouts by pooled-member identity. That
++        # covers Mamba/SSM hybrids too: an SSM member contributes its conv
++        # sub-projection and temporal descriptors, an attention member its FA
++        # descriptors, and both are addressed by layer name rather than by a
++        # region index that does not survive the P/D layer split.
++        if self.pp_size > 1 and self._has_mamba and not self._supports_member_identity:
+             raise NotImplementedError(
+-                "NixlPushConnector consumer (decode) does not support "
+-                "pipeline_parallel_size > 1."
++                "pipeline_parallel_size > 1 with Mamba/SSM hybrid KV cache "
++                "layouts requires the member-identity path (NixlPushConnector)."
+             )
++        # Decode-side PP used to be refused here, on the grounds that
++        # completions were counted per consumer rank. They are now counted by
++        # overlapping producer stage (see _overlapping_remote_pp_stages and its
++        # use in push_worker), so the refusal is gone. The guard could never
++        # have covered a kv_both decode instance anyway -- both roles carry the
++        # same role string and only dynamo knows which side it is driving.
+         # Keep heartbeat handshakes to a PP-sharded producer notif-only.
+         self._hb_handshake_notif_only = False
+ 
+@@ -475,7 +821,17 @@ class NixlBaseConnectorWorker:
+         # Per-source split handles, keyed by (tp_ratio, remote_block_size).
+         self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
+         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
+-        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
++        # Keyed by (remote_pp_rank, remote_tp_rank). A PP-sharded remote has
++        # one descriptor list per stage: stage p holds only its layer window,
++        # so a single tp-keyed handle would address the wrong memory.
++        self.dst_xfer_side_handles = defaultdict[EngineId, dict[tuple[int, int], int]](
++            dict
++        )
++        # engine -> member-ordered source handle and its immutable layout plan
++        # Keyed by (engine_id, remote_pp_rank). Stages of one engine advertise
++        # different member sets by construction, so they cannot share a plan --
++        # only the TP ranks *within* a stage must agree.
++        self._member_xfer_state: dict[tuple[EngineId, int], _MemberTransferState] = {}
+ 
+         # Map of engine_id -> num_blocks. All ranks in the same deployment will
+         # have the same number of blocks.
+@@ -570,6 +926,21 @@ class NixlBaseConnectorWorker:
+         # stride(0) so it stays correct under layouts that interleave layers
+         # within a block (BLHNC/BHLNC), where stride > block_len.
+         self.block_stride_per_layer = list[int]()
++        # Member metadata is populated for HMA and packed layouts.
++        self.region_members = []
++        # Indexed over kv_cache_groups, NOT transfer_groups (upstream #53779):
++        # these ids reach _compute_desc_ids as region_group_ids and subscript
++        # ``block_ids[g]``, which the scheduler hands over in kv_cache_groups
++        # coordinates. Filtering here would silently ship another group's
++        # blocks.
++        self._layer_name_to_kv_group_index = {
++            layer: group_idx
++            for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups)
++            for layer in group.layer_names
++        }
++        # layer name -> (offset within a packed block, bytes per block).
++        self._packed_block_stride: int = 0
++        self._packed_layer_info: dict[str, tuple[int, int]] = {}
+ 
+         # Per-engine TP mappings. Generated during handshake.
+         self.tp_mappings: dict[EngineId, TPMapping] = {}
+@@ -652,9 +1023,48 @@ class NixlBaseConnectorWorker:
+         best_rtt = float("inf")
+         best_offset: float | None = None
+ 
++        # Only the remote stages whose layer window overlaps ours are worth a
++        # handshake: a stage holding none of our layers has no descriptors we
++        # could address, and planning a member transfer against it raises rather
++        # than yielding an empty plan. Same rule the transfer and the notif
++        # count use, so a stage we skip here is one we never write to or wait on.
++        #
++        # Supported PP pairings, stated positively: the remote holds every
++        # layer (remote_pp_size == 1, so our window is a subset of its), or it
++        # is split exactly as we are (equal sizes, so stage p pairs with stage
++        # p). Anything else leaves a producer stage overlapping a consumer
++        # stage only partially, and plan_member_transfer has no way to express
++        # "write the part this stage owns" -- it requires every locally owned
++        # layer to be advertised and raises otherwise.
++        #
++        # Refuse it here, by name. The planner's raise stays what it is: a
++        # detector for a genuine layout mismatch. It earned that this week --
++        # it is what surfaced a speculative-config set on one side only -- and
++        # relaxing it into a skip would turn that into a silent accuracy loss.
++        # Letting an unsupported topology die on "missing locally owned KV
++        # cache layer 'X'" instead sends the next reader hunting layer names,
++        # which is exactly the afternoon this message exists to prevent.
++        if not notif_agents_only and remote_pp_size not in (1, self.pp_size):
++            raise NotImplementedError(
++                f"Asymmetric pipeline parallelism is not supported: this "
++                f"worker is stage {self.pp_rank} of {self.pp_size} and the "
++                f"peer reports {remote_pp_size} stages. Supported pairings are "
++                f"an unsharded peer or a peer split the same way."
++            )
++
++        # Notif-only registration is exempt. It skips descriptor setup entirely,
++        # so it never plans a member transfer and cannot hit that failure -- the
++        # reason for filtering does not apply, and knowing every stage's agent
++        # name costs nothing. Leaving this path alone also keeps heartbeat
++        # discovery of a PP-sharded producer exactly as it was.
++        remote_pp_ranks = (
++            list(range(remote_pp_size))
++            if notif_agents_only
++            else self._overlapping_remote_pp_ranks(remote_pp_size)
++        )
+         with zmq_ctx(zmq.REQ, path) as sock:
+             for remote_pp_rank, remote_rank in itertools.product(
+-                range(remote_pp_size), p_remote_ranks
++                remote_pp_ranks, p_remote_ranks
+             ):
+                 logger.debug(
+                     "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
+@@ -751,7 +1161,7 @@ class NixlBaseConnectorWorker:
+                     )
+                 else:
+                     remote_agent_name = self.add_remote_agent(
+-                        metadata, remote_rank, remote_tp_size
++                        metadata, remote_rank, remote_tp_size, remote_pp_rank
+                     )
+                 setup_agent_time = time.perf_counter()
+                 logger.debug(
+@@ -982,9 +1392,163 @@ class NixlBaseConnectorWorker:
+ 
+         fut.add_done_callback(request_ready)
+ 
++    def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
++        """Register a cross-layers KV cache tensor with NIXL.
++
++        `use_uniform_kv_cache()` guarantees a single KV cache group whose
++        layers all share the same `AttentionSpec`, so any layer name from
++        `_layer_specs` yields the correct per-layer spec for `page_size_bytes`.
++        """
++        first_layer = next(iter(self._layer_specs))
++        # Forwarding a real layer name rather than a synthetic key
++        self.register_kv_caches({first_layer: kv_cache})
++
++    def _register_packed_kv_cache(
++        self,
++        storage: torch.UntypedStorage,
++        kv_caches: dict[str, torch.Tensor],
++    ) -> None:
++        """Register a packed KV cache as a single NIXL region.
++
++        Each block-stride chunk contains one slice per member. Member offsets
++        let a PP stage address only the layers it owns.
++        """
++        self.transfer_topo = TransferTopology(
++            tp_rank=self.tp_rank,
++            tp_size=self.world_size,
++            block_size=self.block_size,
++            engine_id=self.engine_id,
++            is_mla=self.use_mla,
++            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
++            attn_backends=self.attn_backends,
++            tensor_shape=None,
++            is_mamba=self._has_mamba,
++        )
++        self.compat_hash = compute_nixl_compatibility_hash(
++            self.vllm_config,
++            self.backend_name,
++            self.transfer_topo.cross_layers_blocks,
++            transfer_mode=self._TRANSFER_MODE,
++        )
++
++        total_size = storage.nbytes()
++        assert total_size % self.num_blocks == 0
++        block_stride = total_size // self.num_blocks
++        base_addr = storage.data_ptr()
++        device_id = storage.device.index
++        assert device_id is not None
++
++        self._packed_block_stride = block_stride
++        member_layouts: dict[str, tuple[int, int]] = {}
++        for layer_name, cache in kv_caches.items():
++            assert cache.shape[0] == self.num_blocks
++            assert cache.stride(0) * cache.element_size() == block_stride
++            member_offset = cache.data_ptr() - base_addr
++            page_size = (cache.numel() // cache.shape[0]) * cache.element_size()
++            assert member_offset >= 0 and member_offset + page_size <= block_stride, (
++                f"packed member {layer_name} offset={member_offset} "
++                f"page_size={page_size} escapes block_stride={block_stride}"
++            )
++            member_layouts[layer_name] = (member_offset, page_size)
++        # Registration is spec-agnostic (it only records byte offsets). Pull and
++        # PP=1 push transfer packed caches whole-region. PP-sharded push routes
++        # by member identity, which is MLA-only (enforced in
++        # _expand_remote_members); non-MLA packed PP push is rejected there.
++        self._packed_layer_info = member_layouts
++
++        logger.info(
++            "Registering packed KV cache: total_size=%s, block_stride=%s, "
++            "num_blocks=%s, num_regions=1",
++            total_size,
++            block_stride,
++            self.num_blocks,
++        )
++
++        self.device_id = device_id
++        caches_data = [(base_addr, total_size, self.device_id, "")]
++
++        self.block_len_per_layer = [block_stride]
++        self.num_regions = 1
++        self.num_descs = self.num_blocks
++        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [base_addr]
++
++        # The packed region is REPLICATE only when it really is MLA. This path is
++        # shared with pull and with PP=1 push, where use_uniform_kv_cache() admits
++        # any uniform AttentionSpec -- GQA included -- so hardcoding True would
++        # silently drop the heterogeneous-TP head-slice offset for those.
++        self._region_is_mla = [self.use_mla]
++        self._set_region_members([list(member_layouts)])
++
++        descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
++        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
++        self._registered_descs.append(descs)
++
++        self.dst_num_blocks[self.engine_id] = self.num_blocks
++
++        self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
++            self.register_local_xfer_handler(self.block_size)
++        )
++
++        agent_metadata = NixlAgentMetadata(
++            engine_id=self.engine_id,
++            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
++            device_id=self.device_id,
++            kv_caches_base_addr=(
++                self.kv_caches_base_addr[self.engine_id][self.tp_rank]
++            ),
++            num_blocks=self.num_blocks,
++            block_lens=self.block_len_per_layer,
++            kv_cache_layout=self.kv_cache_layout,
++            block_size=self.block_size,
++            ssm_sizes=self._mamba_ssm_size,
++            attn_backend_name=self.backend_name,
++            physical_blocks_per_logical_kv_block=(
++                self._physical_blocks_per_logical_kv_block
++            ),
++            region_members=self.region_members,
++            packed_block_stride=block_stride,
++            packed_member_layouts=member_layouts,
++        )
++        assert self.compat_hash is not None
++        encoder = msgspec.msgpack.Encoder()
++        self.xfer_handshake_metadata = NixlHandshakePayload(
++            compatibility_hash=self.compat_hash,
++            agent_metadata_bytes=encoder.encode(agent_metadata),
++        )
++
++    def _get_packed_kv_cache_storage(
++        self, kv_caches: dict[str, torch.Tensor]
++    ) -> torch.UntypedStorage | None:
++        """Return the shared storage when the KV cache config is packed."""
++        block_strides = {
++            tensor.block_stride for tensor in self.kv_cache_config.kv_cache_tensors
++        }
++        if not block_strides or block_strides == {0}:
++            return None
++        if 0 in block_strides or len(block_strides) != 1:
++            raise RuntimeError(
++                "Packed KV cache tensors must use one nonzero block stride"
++            )
++
++        storages = [cache.untyped_storage() for cache in kv_caches.values()]
++        storage_ptrs = {storage.data_ptr() for storage in storages}
++        if len(storage_ptrs) != 1:
++            raise RuntimeError("Packed KV cache tensors must share one storage")
++        return storages[0]
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         """Register the KV Cache data in nixl."""
+ 
++        # Packed allocation is an explicit KVCacheConfig contract. Runtime
++        # strides can equal an unpacked page size, and unpacked pages can be
++        # padded, so they cannot reliably identify the allocation layout.
++        if not self._has_mamba:
++            storage = self._get_packed_kv_cache_storage(kv_caches)
++            if storage is not None:
++                self._register_packed_kv_cache(storage, kv_caches)
++                self.device_kv_caches = kv_caches
++                return
++
+         self.transfer_topo = TransferTopology(
+             tp_rank=self.tp_rank,
+             tp_size=self.world_size,
+@@ -1032,6 +1596,8 @@ class NixlBaseConnectorWorker:
+         seen_base_addresses: list[int] = []
+ 
+         packed_storage = _share_storage_and_block_stride(list(xfer_buffers.values()))
++        track_region_members = self._tracks_region_members()
++        region_members: list[list[str]] = []
+ 
+         # K and V are packed into the content dim, so each attention layer is a
+         # single NIXL region whose block transfers as one unit. Mamba layers instead
+@@ -1147,11 +1713,19 @@ class NixlBaseConnectorWorker:
+                         # head-sharded, so the region must be flagged MLA.
+                         idx = seen_base_addresses.index(base_addr)
+                         self._region_is_mla[idx] = True
++                    # Member-identity routing needs every layer that shares the
++                    # region, not just the one that registered it first.
++                    if track_region_members:
++                        idx = seen_base_addresses.index(base_addr)
++                        if layer_name not in region_members[idx]:
++                            region_members[idx].append(layer_name)
+                     continue
+                 seen_base_addresses.append(base_addr)
+                 self.block_len_per_layer.append(block_len)
+                 self.block_stride_per_layer.append(block_stride)
+                 self._region_is_mla.append(is_mla_region)
++                if track_region_members:
++                    region_members.append([layer_name])
+ 
+             # When there's a mismatch between kbs<>bs, we rely on HMA to ensure
+             # caches are either [NB, PS] or [NB*r, PS/r] where r is bs/kbs.
+@@ -1185,7 +1759,9 @@ class NixlBaseConnectorWorker:
+         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
+         self.num_regions = len(seen_base_addresses)
+ 
+-        if self.pp_size > 1:
++        self._set_region_members(region_members)
++
++        if self.pp_size > 1 and not self._is_hma_required:
+             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
+                 self.vllm_config.parallel_config
+             )
+@@ -1245,6 +1821,7 @@ class NixlBaseConnectorWorker:
+             ),
+             dcp_size=self.dcp_size,
+             pcp_size=self.pcp_size,
++            region_members=self.region_members,
+         )
+         # Wrap metadata in payload with hash for defensive decoding
+         assert self.compat_hash is not None
+@@ -1254,7 +1831,11 @@ class NixlBaseConnectorWorker:
+             agent_metadata_bytes=encoder.encode(agent_metadata),
+         )
+ 
+-    def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
++    def _build_mamba_local(
++        self,
++        base_addresses: list[int],
++        member_plan: MemberTransferPlan | None = None,
++    ) -> np.ndarray:
+         """Build desc regions (conv sub-projections + ssm) per layer for
+         local mamba blocks with DS conv layout, as an Nx3 uint64 array.
+ 
+@@ -1296,8 +1877,15 @@ class NixlBaseConnectorWorker:
+         device_id = self.device_id
+         block_arange = np.arange(num_blocks, dtype=np.uint64)
+ 
++        if member_plan is None:
++            regions = list(range(len(base_addresses)))
++        else:
++            _, ssm_positions = self._member_kind_indices(member_plan)
++            regions = [member_plan.local_regions[p] for p in ssm_positions]
++
+         parts: list[np.ndarray] = []
+-        for i, base_addr in enumerate(base_addresses):
++        for i in regions:
++            base_addr = base_addresses[i]
+             # Jump one page_size, but ssm page_size may be bigger when kernel
+             # locks block size to a specific value (physical_per_logical scale).
+             page_stride = self.block_len_per_layer[i] * physical_per_logical
+@@ -1313,6 +1901,7 @@ class NixlBaseConnectorWorker:
+         nixl_agent_meta: NixlAgentMetadata,
+         tp_ratio: int,
+         transfer_info: EngineTransferInfo,
++        member_plan: MemberTransferPlan | None = None,
+     ) -> np.ndarray:
+         """Build remote desc regions (conv sub-projections + ssm) per layer.
+         For hetero-TP, each D rank reads only its sub-projection slice from
+@@ -1338,10 +1927,18 @@ class NixlBaseConnectorWorker:
+         device_id = nixl_agent_meta.device_id
+         block_arange = np.arange(num_blocks, dtype=np.uint64)
+ 
++        if member_plan is None:
++            entries = list(enumerate(nixl_agent_meta.kv_caches_base_addr))
++        else:
++            _, ssm_positions = self._member_kind_indices(member_plan)
++            entries = [
++                (p, nixl_agent_meta.kv_caches_base_addr[p]) for p in ssm_positions
++            ]
++
+         parts: list[np.ndarray] = []
+         # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
+         # block lengths vary across layers (e.g. MLA).
+-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
++        for i, base_addr in entries:
+             page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
+             blk_addrs = base_addr + block_arange * page_stride
+             for off, sz in conv_offsets:
+@@ -1363,15 +1960,51 @@ class NixlBaseConnectorWorker:
+         self,
+         base_addresses: list[int],
+         block_size_ratio: int,
++        member_plan: MemberTransferPlan | None = None,
+     ) -> np.ndarray:
+-        """Build local FA descriptors for all layers as an Nx3 uint64 array."""
++        """Build local FA descriptors as an Nx3 uint64 array, optionally in
++        member order."""
+         assert self.transfer_topo is not None
+         assert base_addresses, "Local KV cache base addresses must not be empty."
+         num_blocks = self.num_blocks * block_size_ratio
+         device_id = self.device_id
+         block_arange = np.arange(num_blocks, dtype=np.uint64)
++        if member_plan is not None and member_plan.is_packed:
++            if block_size_ratio != 1:
++                raise RuntimeError("Packed NIXL KV transfer requires equal block sizes")
++            base_addr = base_addresses[0]
++            stride = member_plan.local_block_stride
++            return np.concatenate(
++                [
++                    self._stack_descs(
++                        base_addr + off + block_arange * stride, page, device_id
++                    )
++                    for off, page in member_plan.local_layouts
++                ]
++            )
++        if self._packed_layer_info and member_plan is None:
++            stride = self.block_len_per_layer[0] // block_size_ratio
++            return self._stack_descs(
++                base_addresses[0] + block_arange * stride, stride, device_id
++            )
++        if member_plan is None:
++            region_iter = list(enumerate(base_addresses))
++        else:
++            # Attention members only. An SSM member over the same pooled region
++            # is described by _build_mamba_local instead, and emitting FA descs
++            # for it here would double-count the region.
++            attention_positions, _ = self._member_kind_indices(member_plan)
++            region_iter = [
++                (
++                    member_plan.local_regions[p],
++                    base_addresses[member_plan.local_regions[p]],
++                )
++                for p in attention_positions
++            ]
+         parts: list[np.ndarray] = []
+-        for i, base_addr in enumerate(base_addresses):
++        for i, base_addr in region_iter:
++            # K/V are packed into the content dim, so the whole block transfers
++            # as one unit: desc length equals the block stride.
+             block_len = self.block_len_per_layer[i] // block_size_ratio
+             block_stride = self.block_stride_per_layer[i] // block_size_ratio
+             addrs = base_addr + block_arange * block_stride
+@@ -1383,12 +2016,32 @@ class NixlBaseConnectorWorker:
+         plan: TPMapping,
+         nixl_agent_meta: NixlAgentMetadata,
+         block_size_ratio: int,
++        member_plan: MemberTransferPlan | None = None,
+     ) -> np.ndarray:
+-        """Build remote FA descriptors for all layers as an Nx3 uint64 array."""
++        """Build remote FA descriptors as an Nx3 uint64 array, optionally in
++        member order."""
+         assert self.transfer_topo is not None
+         assert nixl_agent_meta.kv_caches_base_addr, (
+             "Remote KV cache base addresses must not be empty."
+         )
++        if member_plan is not None and member_plan.is_packed:
++            if block_size_ratio != 1:
++                raise RuntimeError("Packed NIXL KV transfer requires equal block sizes")
++            stride = member_plan.remote_block_stride
++            block_arange = np.arange(nixl_agent_meta.num_blocks, dtype=np.uint64)
++            return np.concatenate(
++                [
++                    self._stack_descs(
++                        base_addr + block_arange * stride,
++                        page,
++                        nixl_agent_meta.device_id,
++                    )
++                    for base_addr, page in zip(
++                        nixl_agent_meta.kv_caches_base_addr,
++                        nixl_agent_meta.block_lens,
++                    )
++                ]
++            )
+         fa_group_idx = next(
+             i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
+         )
+@@ -1398,11 +2051,23 @@ class NixlBaseConnectorWorker:
+         num_blocks = nixl_agent_meta.num_blocks
+         device_id = nixl_agent_meta.device_id
+         block_arange = np.arange(num_blocks, dtype=np.uint64)
++        if member_plan is None:
++            entries = list(enumerate(nixl_agent_meta.kv_caches_base_addr))
++        else:
++            # The remote lists are member-ordered by plan_member_transfer, so
++            # select the attention members out of them; SSM members are handled
++            # by _build_mamba_remote.
++            attention_positions, _ = self._member_kind_indices(member_plan)
++            entries = [
++                (p, nixl_agent_meta.kv_caches_base_addr[p]) for p in attention_positions
++            ]
++
+         parts: list[np.ndarray] = []
+-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+-            replicated = self._is_region_replicated(i)
++        for i, base_addr in entries:
++            local_region = member_plan.local_regions[i] if member_plan else i
++            replicated = self._is_region_replicated(local_region)
+             # Read our whole local region size from remote..
+-            local_block_len = self.block_len_per_layer[i]
++            local_block_len = self.block_len_per_layer[local_region]
+             remote_kv_block_len = local_block_len // block_size_ratio
+             if block_size_ratio > 1:
+                 # ..using remote kv_block_len as transfer unit
+@@ -1424,6 +2089,7 @@ class NixlBaseConnectorWorker:
+     def register_local_xfer_handler(
+         self,
+         block_size: int,
++        member_plan: MemberTransferPlan | None = None,
+     ) -> tuple[int, np.ndarray]:
+         """
+         Function used for register local xfer handler with local block_size or
+@@ -1435,12 +2101,18 @@ class NixlBaseConnectorWorker:
+         When remote block size is less than local block size, we need to use
+         register another local_xfer_handler using remote block len to ensure
+         data copy correctness.
++
++        ``member_plan`` registers one descriptor group per pooled member.
+         """
+         assert self.transfer_topo is not None
+         block_size_ratio = self.block_size // block_size
+         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+ 
+-        blocks_data = self._build_fa_local(local_base_addresses, block_size_ratio)
++        blocks_data = self._build_fa_local(
++            local_base_addresses,
++            block_size_ratio,
++            member_plan,
++        )
+         logger.debug(
+             "Created %s blocks for src engine %s and rank %s on device id %s",
+             len(blocks_data),
+@@ -1449,7 +2121,13 @@ class NixlBaseConnectorWorker:
+             self.device_id,
+         )
+         if self._has_mamba:
+-            assert self.num_descs * block_size_ratio == len(blocks_data)
++            if member_plan is None:
++                assert self.num_descs * block_size_ratio == len(blocks_data)
++            else:
++                attention_positions, _ = self._member_kind_indices(member_plan)
++                assert len(
++                    attention_positions
++                ) * self.num_blocks * block_size_ratio == len(blocks_data)
+             # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
+             # is unnecessary — a single conv desc per block suffices.  Consider
+             # adding a fast path that falls back to the standard 2-region
+@@ -1457,7 +2135,7 @@ class NixlBaseConnectorWorker:
+             # remote has been seen.  Currently we always register 4 regions
+             # because local descs are created before knowing the remote TP.
+             logger.debug("Registering local Mamba descriptors (4 regions/layer)")
+-            mamba = self._build_mamba_local(local_base_addresses)
++            mamba = self._build_mamba_local(local_base_addresses, member_plan)
+             blocks_data = np.concatenate([blocks_data, mamba])
+ 
+         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+@@ -1469,6 +2147,7 @@ class NixlBaseConnectorWorker:
+         nixl_agent_meta: NixlAgentMetadata,
+         remote_tp_rank: int = 0,
+         remote_tp_size: int = 1,
++        remote_pp_rank: int = 0,
+     ) -> str:
+         """
+         Add the remote NIXL agent and prepare the descriptors for reading cache
+@@ -1515,32 +2194,46 @@ class NixlBaseConnectorWorker:
+         """  # noqa: E501
+         engine_id = nixl_agent_meta.engine_id
+         # TODO re-evaluate refreshing for scaling/recovery
+-        if (0, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
++        if (remote_pp_rank, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
+             logger.debug(
+                 "Remote agent with engine_id %s and rank"
+                 "%s already exchanged metadata, skip handshake.",
+                 engine_id,
+                 remote_tp_rank,
+             )
+-            return self._remote_agents[engine_id][(0, remote_tp_rank)]
++            return self._remote_agents[engine_id][(remote_pp_rank, remote_tp_rank)]
+ 
+-        # Number of physical regions registered locally (one per layer/tensor).
+-        num_local_regions = len(self.block_len_per_layer)
+-        if (
+-            self.pp_size > 1
+-            and len(nixl_agent_meta.kv_caches_base_addr) > num_local_regions
+-        ):
+-            # This worker holds a PP layer-slice; the PP=1 remote registered
+-            # the full model. Slice its regions to our layer window so the
+-            # logic below sees congruent local/remote lists.
+-            start = self._remote_region_offset
+-            end = start + num_local_regions
+-            assert len(nixl_agent_meta.kv_caches_base_addr) >= end
+-            nixl_agent_meta.kv_caches_base_addr = nixl_agent_meta.kv_caches_base_addr[
+-                start:end
+-            ]
+-            nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
+-            nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
++        member_plan: MemberTransferPlan | None = None
++        if self._use_member_identity(nixl_agent_meta):
++            nixl_agent_meta, member_plan = self._expand_remote_members(nixl_agent_meta)
++        else:
++            # Number of physical regions registered locally (one per layer/tensor).
++            num_local_regions = len(self.block_len_per_layer)
++            if (
++                self.pp_size > 1
++                and len(nixl_agent_meta.kv_caches_base_addr) > num_local_regions
++            ):
++                # This worker holds a PP layer-slice; the PP=1 remote registered
++                # the full model. Slice its regions to our layer window so the
++                # logic below sees congruent local/remote lists.
++                start = self._remote_region_offset
++                end = start + num_local_regions
++                assert len(nixl_agent_meta.kv_caches_base_addr) >= end
++                nixl_agent_meta.kv_caches_base_addr = (
++                    nixl_agent_meta.kv_caches_base_addr[start:end]
++                )
++                nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
++                # block_strides is newer than this slice (metadata v9) and
++                # must be windowed with the other two, or the lists stop
++                # being congruent and descriptors read the wrong stride.
++                nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[
++                    start:end
++                ]
++
++        # Reject a divergent later TP rank before creating any per-rank NIXL
++        # resources, so the failure can't leak an unpublished remote agent.
++        if member_plan is not None:
++            self._check_member_plan_consistency(engine_id, remote_pp_rank, member_plan)
+ 
+         ### Register remote engine in TransferTopology (idempotent).
+         assert self.transfer_topo is not None
+@@ -1583,7 +2276,9 @@ class NixlBaseConnectorWorker:
+         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
+             nixl_agent_meta.kv_caches_base_addr
+         )
+-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
++        self._validate_remote_agent_handshake(
++            nixl_agent_meta, remote_tp_size, member_plan
++        )
+ 
+         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
+         # this is the ratio between the two sizes.
+@@ -1645,9 +2340,7 @@ class NixlBaseConnectorWorker:
+ 
+         # Register all remote blocks, but only the corresponding kv heads.
+         blocks_data = self._build_fa_remote(
+-            plan,
+-            nixl_agent_meta,
+-            block_size_ratio,
++            plan, nixl_agent_meta, block_size_ratio, member_plan
+         )
+         logger.debug(
+             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
+@@ -1662,24 +2355,31 @@ class NixlBaseConnectorWorker:
+                 engine_id,
+                 remote_tp_rank,
+             )
+-            mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
++            mamba = self._build_mamba_remote(
++                nixl_agent_meta, tp_ratio, transfer_info, member_plan
++            )
+             blocks_data = np.concatenate([blocks_data, mamba])
+ 
+         # Register with NIXL.
+         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+-        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
++        self.dst_xfer_side_handles[engine_id][(remote_pp_rank, remote_tp_rank)] = (
+             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+         )
+ 
++        if member_plan is not None:
++            self._register_member_state(
++                engine_id, remote_pp_rank, member_plan, nixl_agent_meta.block_size
++            )
++
+         return remote_agent_name
+ 
+     def _validate_remote_agent_handshake(
+-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
++        self,
++        nixl_agent_meta: NixlAgentMetadata,
++        remote_tp_size: int,
++        member_plan: MemberTransferPlan | None = None,
+     ):
+-        """
+-        Validate the remote agent handshake metadata ensuring the
+-        invariants hold true.
+-        """
++        """Validate the remote agent handshake metadata."""
+         remote_engine_id = nixl_agent_meta.engine_id
+ 
+         assert self.transfer_topo is not None
+@@ -1690,6 +2390,19 @@ class NixlBaseConnectorWorker:
+         block_size_ratio = self.transfer_topo.block_size_ratio(
+             nixl_agent_meta.block_size
+         )
++        if (
++            member_plan is not None
++            and tp_ratio < 0
++            and (self._has_mamba or not self.use_mla)
++        ):
++            # Member routing always uses the unsplit local handle
++            # (push_worker._xfer_blocks), so the per-rank SSM chunking that
++            # _build_local_splits_from_plan would have produced is skipped while
++            # _build_mamba_remote still reads at the per-rank size.
++            raise NotImplementedError(
++                "Member-identity push does not support decode TP greater than "
++                "prefill TP yet"
++            )
+         # num_kv_heads > tp_size with P_TP > D_TP not supported for non-mamba.
+         # Mamba models can have replicated FA KV with tp_ratio < 0.
+         # MLA models do not need to handle kv replication.
+@@ -1791,17 +2504,39 @@ class NixlBaseConnectorWorker:
+             # match up to the kernel block size ratio even under
+             # heterogeneous TP (remote kernel blocks may be smaller).
+             # SSM geometry is validated via ssm_sizes/conv offsets instead.
+-            assert self.block_len_per_layer == [
++            #
++            # Under member routing the remote lengths arrive member-ordered
++            # (plan_member_transfer rewrites them), and members outnumber
++            # regions under HMA pooling, so the local side must be expanded the
++            # same way before comparing.
++            local_block_lens = (
++                [
++                    self.block_len_per_layer[region]
++                    for region in member_plan.local_regions
++                ]
++                if member_plan is not None
++                else self.block_len_per_layer
++            )
++            assert local_block_lens == [
+                 block_len * block_size_ratio for block_len in nixl_agent_meta.block_lens
+             ], (
+                 "Hybrid MLA kernel-granularity block lengths must match "
+                 f"between P and D (block_size_ratio={block_size_ratio}): "
+-                f"local={self.block_len_per_layer}, "
++                f"local={local_block_lens}, "
+                 f"remote={nixl_agent_meta.block_lens}."
+             )
+         elif not self._has_mamba:
+-            assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
+-                "Number of KV layers must match between prefill and decode"
++            if member_plan is not None and member_plan.is_packed:
++                local_lens = [page_size for _, page_size in member_plan.local_layouts]
++            elif member_plan is not None:
++                local_lens = [
++                    self.block_len_per_layer[region]
++                    for region in member_plan.local_regions
++                ]
++            else:
++                local_lens = self.block_len_per_layer
++            assert len(local_lens) == len(nixl_agent_meta.block_lens), (
++                "Number of KV layers/members must match between prefill and decode"
+             )
+             model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
+                 remote_engine_id
+@@ -1809,8 +2544,9 @@ class NixlBaseConnectorWorker:
+             total_kv_heads = self.transfer_topo.total_num_kv_heads
+             local_heads = self.transfer_topo.local_physical_heads
+             remote_heads = max(1, total_kv_heads // remote_tp_size)
+-            for i, local_len in enumerate(self.block_len_per_layer):
+-                replicated = model_replicated or self._is_region_replicated(i)
++            for i, local_len in enumerate(local_lens):
++                region_idx = member_plan.local_regions[i] if member_plan else i
++                replicated = model_replicated or self._is_region_replicated(region_idx)
+                 remote_len = nixl_agent_meta.block_lens[i]
+                 if replicated:
+                     assert local_len // block_size_ratio == remote_len, (
+@@ -1841,8 +2577,12 @@ class NixlBaseConnectorWorker:
+ 
+         # TP workers that handhshake with same remote have same #blocks.
+         assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+-        # Same number of regions/~layers.
+-        assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
++        expected_regions = (
++            len(member_plan.local_regions)
++            if member_plan is not None
++            else len(self.block_len_per_layer)
++        )
++        assert len(nixl_agent_meta.kv_caches_base_addr) == expected_regions
+ 
+     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
+         """copy recved kv from host buffer to device."""
+@@ -2539,6 +3279,11 @@ class NixlBaseConnectorWorker:
+         # Notif-only engines (push-mode D side) have no descriptor state.
+         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+             self.nixl_wrapper.release_dlist_handle(handle)
++        # One handle per (engine, stage), so release every stage of this engine.
++        for key in [k for k in self._member_xfer_state if k[0] == engine_id]:
++            self.nixl_wrapper.release_dlist_handle(
++                self._member_xfer_state.pop(key).handle
++            )
+         for agent_name in self._remote_agents.pop(engine_id).values():
+             self.nixl_wrapper.remove_remote_agent(agent_name)
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
+new file mode 100644
+index 0000000000..7e0dd8541c
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
+@@ -0,0 +1,145 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pure layout planning for member-ordered NIXL transfers."""
++
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, replace
++
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
++    NixlAgentMetadata,
++)
++
++MemberLayout = tuple[int, int]
++
++
++class KVLayoutMismatchError(RuntimeError):
++    """The two engines hold different sets of KV layers.
++
++    Static: the layer sets are fixed at startup, so every subsequent request
++    fails identically. Callers should say so once and stop, rather than
++    retrying per request -- which turns a config error into an hour of silence.
++    """
++
++
++@dataclass(frozen=True)
++class MemberTransferPlan:
++    """Local descriptor layout for a member-ordered transfer."""
++
++    member_names: tuple[str, ...]
++    local_regions: tuple[int, ...]
++    group_ids: tuple[int, ...]
++    local_layouts: tuple[MemberLayout, ...] = ()
++    local_block_stride: int = 0
++    remote_block_stride: int = 0
++
++    @property
++    def is_packed(self) -> bool:
++        return self.remote_block_stride > 0
++
++
++def validate_region_members(region_members: Sequence[Sequence[str]]) -> None:
++    """Ensure every layer name belongs to exactly one region."""
++    members = [member for region in region_members for member in region]
++    if len(members) != len(set(members)):
++        raise RuntimeError("A KV cache layer spans multiple NIXL regions")
++
++
++def plan_member_transfer(
++    remote_metadata: NixlAgentMetadata,
++    local_region_members: Sequence[Sequence[str]],
++    layer_to_group: Mapping[str, int],
++    local_packed_layouts: Mapping[str, MemberLayout] | None = None,
++    local_block_stride: int = 0,
++) -> tuple[NixlAgentMetadata, MemberTransferPlan]:
++    """Build canonical member metadata and a plan without mutating inputs."""
++    num_regions = len(remote_metadata.region_members)
++    if (
++        len(remote_metadata.kv_caches_base_addr) != num_regions
++        or len(remote_metadata.block_lens) != num_regions
++    ):
++        raise RuntimeError("NIXL region metadata has inconsistent lengths")
++
++    local_packed_layouts = local_packed_layouts or {}
++    remote_packed = remote_metadata.packed_block_stride > 0
++    local_packed = local_block_stride > 0
++    if remote_packed != bool(remote_metadata.packed_member_layouts):
++        raise RuntimeError("Packed NIXL metadata is incomplete")
++    if local_packed != bool(local_packed_layouts):
++        raise RuntimeError("Local packed NIXL layout is incomplete")
++    if remote_packed != local_packed:
++        raise RuntimeError("Packed and non-packed NIXL KV layouts cannot be mixed")
++    if remote_packed and num_regions != 1:
++        raise RuntimeError("Packed NIXL metadata must describe one region")
++
++    remote_region_of: dict[str, int] = {}
++    for region_idx, remote_members in enumerate(remote_metadata.region_members):
++        for layer_name in remote_members:
++            if layer_name in remote_region_of:
++                raise RuntimeError(
++                    f"Remote advertised KV cache layer {layer_name!r} in "
++                    "multiple NIXL regions"
++                )
++            remote_region_of[layer_name] = region_idx
++
++    member_names: list[str] = []
++    local_regions: list[int] = []
++    group_ids: list[int] = []
++    remote_base_addresses: list[int] = []
++    remote_block_lens: list[int] = []
++    local_layouts: list[MemberLayout] = []
++
++    for local_region, local_members in enumerate(local_region_members):
++        for layer_name in local_members:
++            remote_region = remote_region_of.get(layer_name)
++            if remote_region is None:
++                raise KVLayoutMismatchError(
++                    "Remote NIXL metadata is missing locally owned KV cache "
++                    f"layer {layer_name!r}; the transfer would leave it stale. "
++                    "The two engines were built with different KV layer sets -- "
++                    "most often a speculative-config set on one side only, whose "
++                    "draft model registers KV this peer never advertises."
++                )
++            group_id = layer_to_group.get(layer_name)
++            if group_id is None:
++                raise RuntimeError(
++                    f"KV cache layer {layer_name!r} is not in a local cache group"
++                )
++
++            remote_base = remote_metadata.kv_caches_base_addr[remote_region]
++            remote_len = remote_metadata.block_lens[remote_region]
++            if remote_packed:
++                remote_layout = remote_metadata.packed_member_layouts.get(layer_name)
++                local_layout = local_packed_layouts.get(layer_name)
++                if remote_layout is None or local_layout is None:
++                    raise RuntimeError(
++                        f"Packed KV cache layer {layer_name!r} has no layout"
++                    )
++                remote_offset, remote_len = remote_layout
++                remote_base += remote_offset
++                local_layouts.append(local_layout)
++
++            member_names.append(layer_name)
++            local_regions.append(local_region)
++            group_ids.append(group_id)
++            remote_base_addresses.append(remote_base)
++            remote_block_lens.append(remote_len)
++
++    if not member_names:
++        raise RuntimeError("Remote NIXL metadata has no members owned by this worker")
++
++    prepared_metadata = replace(
++        remote_metadata,
++        kv_caches_base_addr=remote_base_addresses,
++        block_lens=remote_block_lens,
++        region_members=[],
++        packed_block_stride=0,
++        packed_member_layouts={},
++    )
++    return prepared_metadata, MemberTransferPlan(
++        member_names=tuple(member_names),
++        local_regions=tuple(local_regions),
++        group_ids=tuple(group_ids),
++        local_layouts=tuple(local_layouts),
++        local_block_stride=local_block_stride,
++        remote_block_stride=remote_metadata.packed_block_stride,
++    )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+index 0fca03c93b..b1b5f779a6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Metadata dataclasses and helpers for the NIXL connector."""
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any
+ 
+ from vllm.config import VllmConfig
+@@ -45,8 +45,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+ #   7: Include NIXL transfer mode (push vs pull) in the compatibility hash
+ #   8: Add dcp_size and pcp_size to NixlAgentMetadata
+ #   9: Add block_strides
++#  10: Add per-region member names for PP push.
++#  11: Add packed-member offsets for PP push.
+ #
+-NIXL_CONNECTOR_VERSION: int = 9
++NIXL_CONNECTOR_VERSION: int = 11
+ 
+ 
+ @dataclass
+@@ -65,6 +67,11 @@ class NixlAgentMetadata:
+     physical_blocks_per_logical_kv_block: int
+     dcp_size: int = 1
+     pcp_size: int = 1
++    # Layer names sharing each advertised region, in region order.
++    region_members: list[list[str]] = field(default_factory=list)
++    # Single-region packed layout; zero/empty for contiguous regions.
++    packed_block_stride: int = 0
++    packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+ 
+ 
+ @dataclass
+@@ -233,6 +240,9 @@ class ReqMeta:
+     remote_block_size: int | None = None
+     # Remote producer pipeline-parallel size (push mode, D side).
+     pp_size: int = 1
++    # Consumer pipeline-parallel size (push mode, P side, off PUSH_REG). P
++    # writes only to the decode stages whose layer window overlaps its own.
++    decode_pp_size: int = 1
+ 
+ 
+ class NixlConnectorMetadata(KVConnectorMetadata):
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+index a09fd684e3..5fced8959d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+@@ -38,6 +38,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
+         kv_cache_config: "KVCacheConfig",
+     ):
+         super().__init__(vllm_config, engine_id, kv_cache_config)
++        # Pull knows nothing about pipeline stages, in either direction. Its
++        # handshake never exchanges pp_size, so its transfer handles are looked
++        # up at stage 0 unconditionally -- a PP-sharded producer would be read
++        # only at its first stage -- and `consumers_per_producer` counts TP
++        # alone, so a PP-sharded consumer lets the producer free blocks after
++        # one stage's notif while the others are still reading. Neither fails
++        # loudly; both move or drop the wrong bytes.
++        #
++        # The PP work on this branch is push-only. Refusing here is what the
++        # docs already claim, and a startup error beats a silent bad transfer.
++        if self.pp_size > 1:
++            raise NotImplementedError(
++                "NixlConnector (pull) does not support "
++                f"pipeline_parallel_size > 1 (got {self.pp_size}); its "
++                "handshake carries no stage information, so transfers would "
++                "address stage 0 and completions would be undercounted. Use "
++                "NixlPushConnector for pipeline parallelism."
++            )
+ 
+     def start_load_kv(self, metadata: NixlConnectorMetadata):
+         """
+@@ -202,9 +220,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
+                     remote_block_size
+                 ]
+ 
+-            # Destination handle: remote_engine_id -> remote_rank -> handle.
++            # Destination handle: engine -> (remote_pp_rank, remote_rank) -> handle.
++            # Pull does not handshake a PP-sharded producer -- it advertises no
++            # pp_size and _background_nixl_handshake passes none -- so every
++            # agent it knows sits at stage 0.
+             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
+-                spec.remote_rank
++                (0, spec.remote_rank)
+             ]
+ 
+             self._read_blocks(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
+index 095d90e7b1..32edd206f5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py
+@@ -180,6 +180,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
+             "decode_host": self.side_channel_host,
+             "decode_port": self.side_channel_port,
+             "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
++            # P needs D's stage count to handshake every decode stage and to
++            # write only the ones holding its layers. The producer's own
++            # pp_size already travels the other way as remote_pp_size; without
++            # this the pair was asymmetric and P only ever saw decode stage 0.
++            "decode_pp_size": (self.vllm_config.parallel_config.pipeline_parallel_size),
+             "local_block_ids": local_block_ids,
+             "remote_engine_id": params["remote_engine_id"],
+             "remote_host": params["remote_host"],
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+index 78fe49bb57..a58a56fc9f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+@@ -44,6 +44,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+     NixlBaseConnectorWorker,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.member_transfer import (
++    KVLayoutMismatchError,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+     PUSH_REG_NOTIF_PREFIX,
+     NixlConnectorMetadata,
+@@ -79,6 +82,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+ 
+     # Distinguishes push from pull in the NIXL compatibility hash.
+     _TRANSFER_MODE: str = "push"
++    _supports_member_identity = True
+ 
+     def __init__(
+         self,
+@@ -91,6 +95,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+         # Heartbeat handshakes to a PP-sharded producer must be notif-only,
+         # like the PUSH_REG path.
+         self._hb_handshake_notif_only = True
++        self._layout_mismatch_reported = False
+ 
+         # Push-specific state.
+         # P-side: outgoing WRITE handles awaiting completion, keyed by
+@@ -436,6 +441,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             registration_data["decode_host"],
+             registration_data["decode_port"],
+             registration_data["decode_tp_size"],
++            registration_data.get("decode_pp_size", 1),
+         )
+         if fut is not None:
+ 
+@@ -450,6 +456,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+                     self._log_failure(
+                         failure_type="push_handshake_failed", req_id=rid, error=e
+                     )
++                    self._report_layout_mismatch(e)
+                     return
+                 self._deferred_push_inbox.put((rid, blocks, rd))
+                 self._push_writer_wake.set()
+@@ -470,6 +477,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             local_block_ids=logical_local,
+             local_physical_block_ids=physical_local,
+             tp_size=self.world_size,
++            decode_pp_size=registration_data.get("decode_pp_size", 1),
+             remote=RemoteMeta(
+                 block_ids=logical_remote,
+                 host="",
+@@ -501,6 +509,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             return (list(block_ids),)
+         return block_ids
+ 
++    def _report_layout_mismatch(self, error: BaseException) -> None:
++        """Say once, loudly, that the peers' KV layer sets do not match.
++
++        A layout mismatch is fixed at startup, so the per-request warning the
++        generic failure path emits repeats for every request while the run
++        makes no progress -- 512 times, in the arm that prompted this, before an
++        idle reaper killed the job an hour later with nothing in the CI log to
++        say why. This does not abort the engine; it makes the cause findable in
++        the first screen of the worker log.
++        """
++        cause: BaseException | None = error
++        while cause is not None and not isinstance(cause, KVLayoutMismatchError):
++            cause = cause.__cause__ or cause.__context__
++        if cause is None or self._layout_mismatch_reported:
++            return
++        self._layout_mismatch_reported = True
++        logger.error(
++            "NIXL KV layout mismatch with the peer; every transfer will fail "
++            "the same way and the engine will not recover: %s",
++            cause,
++        )
++
+     def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
+         """Issue WRITE transfers to one or more remote TP ranks."""
+         assert meta.remote is not None and self.transfer_topo is not None
+@@ -508,6 +538,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+         plan = self.tp_mappings[engine_id]
+         remote_info = self.transfer_topo.get_engine_info(engine_id)
+         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
++        # Which decode stages this producer writes to. A PP-sharded consumer
++        # splits the model too, and a producer stage only owns the layers in its
++        # own window, so it writes to the decode stages whose window overlaps --
++        # writing to the others would address memory holding different layers.
++        # Both sides partition with get_pp_indices, so this is arithmetic.
++        decode_pp_size = max(1, meta.decode_pp_size)
++        write_stages = self._overlapping_remote_pp_ranks(decode_pp_size)
+ 
+         # Expand D's logical IDs using the ratio learned during the
+         # NIXL handshake. ``meta`` is freshly built by
+@@ -529,9 +566,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+         replicate_attn = self.use_mla and tp_ratio < 0
+         if replicate_attn and not self._has_mamba:
+             assert len(plan.all_source_ranks) == 1
+-            write_ranks = sorted(self.dst_xfer_side_handles[engine_id])
++            tp_targets = sorted(
++                {tp for (_, tp) in self.dst_xfer_side_handles[engine_id]}
++            )
+         else:
+-            write_ranks = list(plan.all_source_ranks)
++            tp_targets = list(plan.all_source_ranks)
++        # Carry the TP *index* alongside the rank: the local split handles are
++        # one per TP target, so indexing them by position in this list would
++        # run off the end as soon as there is more than one decode stage.
++        write_ranks = [
++            (stage, tp_index, tp)
++            for stage in write_stages
++            for tp_index, tp in enumerate(tp_targets)
++        ]
+ 
+         def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
+             return [
+@@ -544,15 +591,19 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+ 
+         read_specs = [
+             ReadSpec(
+-                remote_rank=rank,
+-                local_block_ids=group_ids(local_block_ids, rank),
+-                remote_block_ids=group_ids(remote_block_ids, rank),
++                remote_rank=tp,
++                local_block_ids=group_ids(local_block_ids, tp),
++                remote_block_ids=group_ids(remote_block_ids, tp),
+             )
+-            for rank in write_ranks
++            for (_stage, _tp_index, tp) in write_ranks
+         ]
+ 
+         handles: list[int] = []
+-        for i, spec in enumerate(read_specs):
++        for (remote_pp_rank, tp_index, _tp), spec in zip(write_ranks, read_specs):
++            member_state = self._member_xfer_state.get((engine_id, remote_pp_rank))
++            member_groups = (
++                member_state.plan.group_ids if member_state is not None else None
++            )
+             remote_block_size = remote_info.remote_block_size
+             logger.debug(
+                 "Remote agent %s available, calling _xfer_blocks"
+@@ -562,19 +613,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+                 remote_block_size,
+                 req_id,
+             )
+-            if tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1):
++            if member_state is not None:
++                local_xfer_side_handle = member_state.handle
++            elif tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1):
+                 # Multiple targets: write each rank its chunk of local memory.
+                 # Hybrid MLA+SSM also lands here: its split handles replicate
+                 # the attention descriptors and chunk only the SSM state.
+                 split_key = (tp_ratio, remote_block_size)
+-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
++                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][
++                    tp_index
++                ]
+             else:
+                 local_xfer_side_handle = self.src_xfer_handles_by_block_size[
+                     remote_block_size
+                 ]
+ 
+             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
+-                spec.remote_rank
++                (remote_pp_rank, spec.remote_rank)
+             ]
+ 
+             handle = self._xfer_blocks(
+@@ -584,6 +639,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+                 remote_request_id=meta.remote.request_id,
+                 local_xfer_side_handle=local_xfer_side_handle,
+                 remote_xfer_side_handle=remote_xfer_side_handle,
++                region_group_ids=member_groups,
+             )
+             if handle is not None:
+                 handles.append(handle)
+@@ -603,6 +659,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+         remote_request_id: str,
+         local_xfer_side_handle: int,
+         remote_xfer_side_handle: int,
++        region_group_ids: tuple[int, ...] | None = None,
+     ) -> int | None:
+         """Post a WRITE point-to-point xfer request.
+ 
+@@ -660,12 +717,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+             block_size_ratio=None,
+             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
++            region_group_ids=region_group_ids,
+         )
+         local_block_descs_ids = self._compute_desc_ids(
+             block_ids=local_block_ids,
+             dst_num_blocks=self.dst_num_blocks[self.engine_id],
+             block_size_ratio=block_size_ratio,
+             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
++            region_group_ids=region_group_ids,
+         )
+ 
+         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+@@ -729,11 +788,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             # Not tracked as a P-side send/process for this notif.
+             if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
+                 if (meta := self._recving_metadata.get(req_id)) is not None:
+-                    # Consumer waits for one notif per producer rank writing
+-                    # here: pp_size stages * producers-per-consumer (>1 when
+-                    # producer TP > consumer TP; tp_size is the producer TP).
++                    # We are acting as the consumer. One notif per producer
++                    # rank that writes here: the producer stages holding layers
++                    # we also hold, times the producer TP ranks mapped to us
++                    # (>1 when producer TP > consumer TP; tp_size is producer
++                    # TP, world_size is ours and is TP-only).
++                    #
++                    # The stage term is not simply meta.pp_size. A PP-sharded
++                    # consumer is written to only by the producer stages whose
++                    # layer window overlaps its own -- with equal splits on both
++                    # sides that is exactly one, and expecting meta.pp_size
++                    # would wait forever for notifs no one sends.
+                     producers_per_consumer = max(1, int(tp_size) // self.world_size)
+-                    expected_notifs = meta.pp_size * producers_per_consumer
++                    expected_notifs = (
++                        self._overlapping_remote_pp_stages(meta.pp_size)
++                        * producers_per_consumer
++                    )
+                     self.consumer_notification_counts_by_req[req_id] += 1
+                     notifs = self.consumer_notification_counts_by_req[req_id]
+                     if notifs < expected_notifs:
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index fd81bb502f..965e48d7c0 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -1545,6 +1545,16 @@ class LocalArgmaxMixin:
+ class EagleModelMixin:
+     aux_hidden_state_layers: tuple[int, ...] = ()
+ 
++    # Whether this model forwards auxiliary hidden states across pipeline
++    # stages. EAGLE3-style drafting runs on the last PP rank but taps layers
++    # that may live on earlier stages, so those tensors have to ride along with
++    # the IntermediateTensors payload. Models opt in by implementing the
++    # `aux_hidden_states_over_pp` protocol below and setting this to True.
++    supports_aux_hidden_states_over_pp: ClassVar[bool] = False
++
++    # Key prefix for aux tensors carried in the IntermediateTensors payload.
++    AUX_HIDDEN_STATE_KEY: ClassVar[str] = "aux_hidden_states_"
++
+     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+         self.aux_hidden_state_layers = layers
+ 
+@@ -1560,6 +1570,74 @@ class EagleModelMixin:
+             aux_hidden_states.append(value)
+         return aux_hidden_states
+ 
++    def num_upstream_aux_hidden_states(self) -> int:
++        """How many aux tensors arrive from earlier pipeline stages.
++
++        Tap ids count *layers computed*, so a tap `a` is produced by the stage
++        whose window satisfies `start_layer < a <= end_layer`. Everything with
++        `a <= start_layer` was therefore produced upstream. Both sides derive
++        the count from the same rule, so send and recv agree with no
++        negotiation.
++        """
++        from vllm.distributed.parallel_state import get_pp_group
++
++        if get_pp_group().is_first_rank:
++            return 0
++        start_layer = getattr(self, "start_layer", 0)
++        return sum(1 for a in self.aux_hidden_state_layers if a <= start_layer)
++
++    def unpack_aux_hidden_states(
++        self, intermediate_tensors: "IntermediateTensors | None"
++    ) -> list[torch.Tensor]:
++        """Recover the aux tensors produced by earlier pipeline stages."""
++        if intermediate_tensors is None:
++            return []
++        out: list[torch.Tensor] = []
++        # IntermediateTensors has no __contains__, so consult the dict directly.
++        payload = intermediate_tensors.tensors
++        expected = self.num_upstream_aux_hidden_states()
++        for i in range(expected):
++            key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
++            # Both sides size themselves from num_upstream_aux_hidden_states, so
++            # a missing key means send and recv disagree. Returning the short
++            # list instead would hand the drafter fewer taps than it was built
++            # for, with no error anywhere.
++            assert key in payload, (
++                f"Expected {expected} upstream aux hidden states but {key} is "
++                f"missing; got {sorted(payload)}"
++            )
++            out.append(payload[key])
++        return out
++
++    def pack_aux_hidden_states(
++        self,
++        tensors: dict[str, torch.Tensor],
++        aux_hidden_states: list[torch.Tensor],
++    ) -> dict[str, torch.Tensor]:
++        """Add this stage's aux tensors (its own plus inherited) to the payload."""
++        for i, aux in enumerate(aux_hidden_states):
++            tensors[f"{self.AUX_HIDDEN_STATE_KEY}{i}"] = aux
++        return tensors
++
++    def make_empty_aux_hidden_states(
++        self,
++        tensors: dict[str, torch.Tensor],
++        batch_size: int,
++        hidden_size: int,
++        dtype: torch.dtype,
++        device: torch.device,
++    ) -> dict[str, torch.Tensor]:
++        """Pre-allocate recv buffers for the aux tensors arriving from upstream.
++
++        Must agree with `pack_aux_hidden_states` on the receiving stage, since
++        the PP transport sizes its buffers from this.
++        """
++        for i in range(self.num_upstream_aux_hidden_states()):
++            tensors[f"{self.AUX_HIDDEN_STATE_KEY}{i}"] = torch.zeros(
++                (batch_size, hidden_size), dtype=dtype, device=device
++            )
++        return tensors
++
+ 
+ @runtime_checkable
+ class SupportsEagle(SupportsEagleBase, Protocol):
+diff --git a/vllm/models/kimi_k3/nvidia/dspark_mla.py b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+index 5008015abd..55c95e2f57 100644
+--- a/vllm/models/kimi_k3/nvidia/dspark_mla.py
++++ b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+@@ -421,9 +421,22 @@ class K3DSparkForCausalLM(nn.Module):
+         assert vllm_config.speculative_config is not None
+         self.draft_model_config = vllm_config.speculative_config.draft_model_config
+         self.config = self.draft_model_config.hf_config
+-        target_layer_num = vllm_config.model_config.get_num_layers(
+-            vllm_config.parallel_config
+-        )
++        # The draft's layers are numbered from the end of the target's, and that
++        # number has to mean the same thing on every rank of every engine: KV
++        # layer names are the identity NIXL member routing transfers by, and a
++        # PP-sharded prefiller talking to a PP=1 decoder is two different ranks
++        # naming the same draft layer.
++        #
++        # get_num_layers is PP-*local* (end - start). At PP=2 over 93 layers,
++        # stage 1 reports 46, so its draft registers model.layers.46..50 while a
++        # PP=1 peer registers 93..97 -- and 46..50 also collide with that
++        # stage's own target layers 47..92. Symmetric PP hid it, because both
++        # sides computed the same wrong number.
++        #
++        # Upstream is the same shape in cohere_eagle and deepseek_eagle3. It was
++        # unreachable while spec decode under PP was refused outright; adopting
++        # #50514 is what made it reachable, so it is ours to get right.
++        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
+         self.model = K3DSparkModel(
+             vllm_config=vllm_config,
+             start_layer_id=target_layer_num,
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 748e5219a7..a0b9e4ae13 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -364,6 +364,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         assert isinstance(self.kv_cache_spec, MambaSpec)
++        self._check_block_table_width(m.block_table_tensor.shape[1])
+         # Equivalent PyTorch "align" path:
+         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
+         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
+@@ -728,6 +729,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             checkpoint=checkpoint,
+         )
+ 
++    def _check_block_table_width(self, width: int) -> None:
++        """Fail at startup if the block table cannot hold the slot we index.
++
++        ``_get_aligned_state_indices_kernel`` reads column
++        ``(seq_lens - 1) // spec.block_size`` and its mask bounds only the row,
++        so a table narrower than ``max_num_blocks_per_req`` reads off the end of
++        the row and yields an arbitrary block id. That surfaces far away, either
++        as an index-out-of-bounds assert in whichever consumer touches the state
++        cache first or, when the stray id happens to be in range, as silently
++        wrong recurrent state. Neither names this as the cause, so check it once
++        where the contract is stated.
++        """
++        if getattr(self, "_block_table_width_checked", False):
++            return
++        self._block_table_width_checked = True
++        required = self.kv_cache_spec.max_num_blocks_per_req(
++            self.vllm_config, self.vllm_config.model_config.max_model_len
++        )
++        if width < required:
++            raise ValueError(
++                f"KDA block table is {width} columns but the state slot is "
++                f"indexed over {required} (max_model_len="
++                f"{self.vllm_config.model_config.max_model_len}, block_size="
++                f"{self.kv_cache_spec.block_size}). Mamba state is replicated "
++                f"across DCP ranks, so its block table must not be scaled by "
++                f"decode_context_parallel_size="
++                f"{self.vllm_config.parallel_config.decode_context_parallel_size}."
++            )
++
+ 
+ class KimiK3KDAAttentionBackend(GDNAttentionBackend):
+     @staticmethod
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index dbf998fc27..e08f9d28d0 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -1122,6 +1122,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+         "fused_qkv_a_g_proj": ["q_a_proj", "kv_a_proj_with_mqa", "g_proj"],
+     }
++    # Aux taps are carried across pipeline stages in the IntermediateTensors
++    # payload, so EAGLE3-style drafting works under PP for this model.
++    supports_aux_hidden_states_over_pp = True
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -1219,14 +1222,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                 cdiv(self.start_layer, self.attn_res_block_size),
+                 self.config.hidden_size,
+             )
+-        return IntermediateTensors(
+-            {
+-                "hidden_states": torch.zeros(
+-                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+-                ),
+-                "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
+-            }
++        tensors = {
++            "hidden_states": torch.zeros(
++                (batch_size, self.config.hidden_size), dtype=dtype, device=device
++            ),
++            "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
++        }
++        # Recv buffers for aux taps produced by earlier stages. Must match what
++        # pack_aux_hidden_states puts on the wire, since the PP transport sizes
++        # its buffers from this.
++        self.make_empty_aux_hidden_states(
++            tensors, batch_size, self.config.hidden_size, dtype, device
+         )
++        return IntermediateTensors(tensors)
+ 
+     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+         super()._set_aux_hidden_state_layers(layers)
+@@ -1342,7 +1350,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+ 
+         # sharded aux hidden states when sp is enabled
+         aux_hidden_states: list[torch.Tensor] = []
+-        if self.start_layer in self.aux_hidden_state_layers:
++        if not get_pp_group().is_first_rank:
++            # A tap at exactly start_layer was computed by the previous stage
++            # and arrives with the intermediate tensors; recomputing it here
++            # would duplicate it.
++            aux_hidden_states = self.unpack_aux_hidden_states(intermediate_tensors)
++        elif self.start_layer in self.aux_hidden_state_layers:
+             if self.use_attn_res or residual is None:
+                 aux_hidden_states.append(hidden_states)
+             else:
+@@ -1392,9 +1405,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             )
+             if prefix_sum is not None:
+                 hidden_states = hidden_states + prefix_sum
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
+-            )
++            tensors = {"hidden_states": hidden_states, "residual": residual}
++            # Forward the aux taps (this stage's plus any inherited from
++            # upstream) instead of dropping them, which is what made
++            # EAGLE3-style drafting impossible under pipeline parallelism.
++            self.pack_aux_hidden_states(tensors, aux_hidden_states)
++            return IntermediateTensors(tensors)
+ 
+         if self.use_attn_res:
+             assert prefix_sum is not None
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 1fbda7537a..2c9b371ce5 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -159,6 +159,10 @@ class BlockPool:
+         metrics_collector: Optional metrics collector for tracking block residency.
+     """
+ 
++    # How often a hash moved to a new block without its token count. The
++    # destination is then the state `cache_full_blocks` asserts against.
++    _moved_without_token_count = 0
++
+     def __init__(
+         self,
+         num_gpu_blocks: int,
+@@ -191,6 +195,16 @@ class BlockPool:
+         self.null_block.is_null = True
+ 
+         self.enable_kv_cache_events = enable_kv_cache_events
++        self._masked_but_null = 0
++        self._masked_but_null_per_group: dict[int, int] = {}
++        self._evicted_total = 0
++        self._evicted_per_group: dict[int, int] = {}
++        self._recache_total = 0
++        self._recache_dropped: dict[int, int] = {}
++        self._partial_total = 0
++        self._partial_dropped: dict[int, int] = {}
++        self._inserted_total = 0
++        self._inserted_per_group: dict[int, int] = {}
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
+         self.metrics_collector = metrics_collector
+@@ -273,6 +287,34 @@ class BlockPool:
+             # like sliding window attention, or Mamba models with prefix-caching
+             # in align mode. We skip null blocks here.
+             if blk.is_null or (block_mask is not None and not block_mask[i]):
++                # Count the case the mask cannot express: it asked for this
++                # block to be kept, and by the time caching runs the block is
++                # already null. remove_skipped_blocks frees the previous Mamba
++                # state block inside the same allocate_slots call, 59 lines
++                # earlier (kv_cache_manager.py:507 against :566), and is_null is
++                # tested before the mask, so the retention policy and the free
++                # policy never meet. A non-zero count here is the whole
++                # explanation for a Mamba prefix hit that was marked, windowed,
++                # and still absent from the pool.
++                if blk.is_null and block_mask is not None and block_mask[i]:
++                    self._masked_but_null += 1
++                    self._masked_but_null_per_group[kv_cache_group_id] = (
++                        self._masked_but_null_per_group.get(kv_cache_group_id, 0) + 1
++                    )
++                    if self._masked_but_null in (1, 100, 1000, 10000):
++                        # Per group, because the insertion counter already names
++                        # which one is short -- one Mamba group behind its five
++                        # siblings, and get_cached_block needs all six. This skip
++                        # is the only step between "the mask asked to keep it"
++                        # and the insert, so a deficit that matches here is the
++                        # answer; one that does not moves the question earlier.
++                        logger.info(
++                            "cache_full_blocks skipped a block the mask asked "
++                            "to keep because it was already null (%d such, "
++                            "per group %s)",
++                            self._masked_but_null,
++                            dict(sorted(self._masked_but_null_per_group.items())),
++                        )
+                 continue
+             block_hash = new_block_hashes[i]
+             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
+@@ -288,6 +330,29 @@ class BlockPool:
+                     blk.block_hash_num_tokens is not None
+                     and blk.block_hash_num_tokens < num_hash_tokens
+                 )
++                # A block arriving here with a hash is supposed to be the same
++                # cache block being promoted from partial to full. The
++                # speculative recycle loop in MambaManager breaks that: it moves
++                # a physical block to a later index and nulls the slot it came
++                # from, so caching reaches it again at a new position while it
++                # still carries the hash of the state it held before. The assert
++                # above only checks that the token count grew, which moving
++                # forward always satisfies, so the old entry is dropped in
++                # silence -- no eviction involved, which is why a counter on
++                # _maybe_evict_cached_block stayed at zero.
++                self._recache_dropped[kv_cache_group_id] = (
++                    self._recache_dropped.get(kv_cache_group_id, 0) + 1
++                )
++                self._recache_total += 1
++                if self._recache_total in (1, 10, 100, 1000, 10000, 100000):
++                    logger.info(
++                        "Re-cached a block that still held a hash: %d so far, "
++                        "per group %s; this one %s -> %s tokens",
++                        self._recache_total,
++                        dict(sorted(self._recache_dropped.items())),
++                        blk.block_hash_num_tokens,
++                        num_hash_tokens,
++                    )
+                 removed_hashes = self._remove_cached_block_hashes(blk)
+                 self._emit_block_removed_events(removed_hashes)
+             self._insert_block_hash(
+@@ -503,6 +568,26 @@ class BlockPool:
+             and block.block_hash_num_tokens is not None
+             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+         ):
++            # The other site that drops a live entry, and the one the mask
++            # cannot gate: _cache_partial_tail_block calls this from outside
++            # cache_full_blocks' loop, so it fires whatever retention is set to.
++            # That fits what the hit rates say -- dense removes the mask and
++            # should make the gated site (cache_full_blocks) fire *more*, yet
++            # dense raises the hit rate from 22.7% to 49.1%. A deletion channel
++            # that does not grow with dense is the better candidate.
++            self._partial_dropped[kv_cache_group_id] = (
++                self._partial_dropped.get(kv_cache_group_id, 0) + 1
++            )
++            self._partial_total += 1
++            if self._partial_total in (1, 10, 100, 1000, 10000, 100000):
++                logger.info(
++                    "Partial-tail cache dropped a live entry: %d so far, per "
++                    "group %s; this one %s -> %s tokens",
++                    self._partial_total,
++                    dict(sorted(self._partial_dropped.items())),
++                    block.block_hash_num_tokens,
++                    num_hash_blocks * self.hash_block_size,
++                )
+             removed_hashes = self._remove_cached_block_hashes(block)
+             self._emit_block_removed_events(removed_hashes)
+         self._insert_block_hash(
+@@ -610,6 +695,35 @@ class BlockPool:
+         block: KVCacheBlock,
+         num_tokens: int | None,
+     ) -> None:
++        """Registration itself, which has never been observed.
++
++        Every path that removes a cached hash has now been counted on the arm
++        that reproduces the collapse -- eviction, the re-cache in
++        cache_full_blocks, the partial-tail path, and the global reset -- and all
++        four are zero while the hit rate sits at 22.7%. If nothing removes the
++        entry, the remaining possibility is that it was never inserted. What was
++        measured before was only that the conditions which would *prevent*
++        insertion are clear: the block is marked, inside the window, live, and
++        the step ends on a block boundary.
++
++        So count insertions per group and name the token counts of the first few.
++        A Mamba group that never appears here is the answer; one that appears
++        with the expected boundary means the entry is lost somewhere outside all
++        five removal sites, and the pool's own structures are next.
++        """
++        _gid = int.from_bytes(bytes(block_hash_with_group_id)[-4:], "big")
++        self._inserted_per_group[_gid] = self._inserted_per_group.get(_gid, 0) + 1
++        self._inserted_total += 1
++        if self._inserted_total in (1, 100, 10000, 1000000):
++            logger.info(
++                "Prefix-cache insertions: %d total, per group %s; this one "
++                "group %d at %s tokens",
++                self._inserted_total,
++                dict(sorted(self._inserted_per_group.items())),
++                _gid,
++                num_tokens,
++            )
++
+         if block.block_hash == block_hash_with_group_id:
+             return
+ 
+@@ -640,6 +754,23 @@ class BlockPool:
+         assert dst_block.block_hash is None
+         assert dst_block.block_id not in self.cached_block_hashes_by_block
+         num_tokens = src_block.block_hash_num_tokens
++        if num_tokens is None:
++            # The destination then takes a hash with no token count, and the
++            # next `cache_full_blocks` to reach it asserts on exactly that.
++            # Static reading could not produce this state: the only setter
++            # always receives a count, and every reset clears both fields. So
++            # say what the source looked like when it happened.
++            BlockPool._moved_without_token_count += 1
++            if BlockPool._moved_without_token_count in (1, 10, 100, 1000):
++                logger.info(
++                    "move_block_hashes #%d: source %d has no token count "
++                    "(primary hash %s, %d secondary) -> dest %d",
++                    BlockPool._moved_without_token_count,
++                    src_block.block_id,
++                    "set" if src_block.block_hash is not None else "none",
++                    len(self.cached_block_hashes_by_block.get(src_block.block_id, ())),
++                    dst_block.block_id,
++                )
+         for block_hash in self._remove_cached_block_hashes(src_block):
+             # `num_tokens` only applies to the first (primary) insertion.
+             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+@@ -687,6 +818,33 @@ class BlockPool:
+         Returns:
+             True if the block is evicted, False otherwise.
+         """
++        # Per-group eviction counts. The collapse traces show a Mamba state
++        # block registered under the key the reader asks for, live and
++        # block-aligned at write time, and absent from the pool when a later
++        # request looks it up. Nothing in the mask, the window, the key or the
++        # chunk alignment explains that, which leaves reuse: align mode frees
++        # each state block as its request advances, and a freed cached block
++        # keeps its hash only until the pool recycles it. Counting evictions per
++        # group says whether that is what happens, and comparing the same number
++        # without speculation says why no-spec keeps its hits.
++        # A key is the block hash with the group id appended as four big-endian
++        # bytes (make_block_hash_with_group_id), so the group is the tail.
++        _keys = list(self.cached_block_hashes_by_block.get(block.block_id, ()))
++        if block.block_hash is not None:
++            _keys.append(block.block_hash)
++        for _key in _keys:
++            _gid = int.from_bytes(bytes(_key)[-4:], "big", signed=False)
++            self._evicted_per_group[_gid] = self._evicted_per_group.get(_gid, 0) + 1
++        if _keys:
++            self._evicted_total += 1
++            if self._evicted_total in (1, 1000, 10000, 100000, 1000000):
++                logger.info(
++                    "Prefix-cache blocks recycled out of the pool: %d total, "
++                    "per group %s",
++                    self._evicted_total,
++                    dict(sorted(self._evicted_per_group.items())),
++                )
++
+         # Clean up metrics tracking first to prevent leaks
+         if self.metrics_collector:
+             self.metrics_collector.on_block_evicted(block)
+@@ -788,6 +946,10 @@ class BlockPool:
+         self.cached_block_hashes_by_block.clear()
+ 
+         # Remove all hashes from all blocks.
++        # A global wipe empties every group at once, which is the shape of
++        # '0 of 85 boundaries in the pool'. Never confirmed to fire here; one
++        # line rules it in or out.
++        logger.info("reset_prefix_cache: wiping the whole prefix cache")
+         for block in self.blocks:
+             block.reset_hash()
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 0e9d2b791a..f6b4f53097 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -28,6 +28,9 @@ from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+ 
++# Enough reconciliations to name the capping group without filling a log.
++_MAX_HIT_RECONCILE_LOGS = 20
++
+ 
+ def _validate_prefix_cache_retention_interval(
+     retention_interval: int | None,
+@@ -104,6 +107,9 @@ class KVCacheCoordinator(ABC):
+         )
+ 
+         # KV cache group indices that get the EAGLE last-block drop.
++        self._hit_reconcile_logs = 0
++        self._hit_reconcile_misses = 0
++        self._hit_reconcile_collapses = 0
+         self.eagle_group_ids: set[int] = {
+             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
+         }
+@@ -150,6 +156,20 @@ class KVCacheCoordinator(ABC):
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
+ 
++        # Which kv-cache-group id holds which spec. Every group-level reading so
++        # far has inferred this from block sizes; print it once so it is read.
++        logger.info(
++            "KV cache groups: %s",
++            {
++                i: (
++                    type(g.kv_cache_spec).__name__,
++                    g.kv_cache_spec.block_size,
++                    len(g.layer_names),
++                )
++                for i, g in enumerate(kv_cache_config.kv_cache_groups)
++            },
++        )
++
+         # A positive retention interval must be a multiple of the base hit granularity
+         # (``scheduler_block_size``) to land on real cache-hit boundaries.
+         # 0 = keep only the latest replay boundary; None = dense;
+@@ -783,6 +803,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
+         hit_length = max_cache_hit_length
+         longest_hit_length = 0
++        _trace: list[tuple] = []
+         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
+         hit_length_by_group: list[int] = [0] * num_groups
+ 
+@@ -855,6 +876,44 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 elif _new_hit_length < curr_hit_length:
+                     # length shrunk; invalidate previous eagle verifications
+                     eagle_verified.clear()
++                if self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS:
++                    # A group that returns 0 has two very different causes:
++                    # its blocks are not in the pool at all, or they are and
++                    # the ceiling it was handed cannot reach them. The pair
++                    # (max_len, hit) cannot tell those apart, and the retention
++                    # mask cannot settle it either -- the mask marks which
++                    # blocks *may* be cached, while cache_full_blocks decides
++                    # which ones are. Re-ask the same finder without the eagle
++                    # drop and without the ceiling; ``unbounded`` is then the
++                    # group's own reach, so unbounded > 0 with hit == 0 means
++                    # the blocks are there and the ceiling is the cause.
++                    unbounded = None
++                    if _new_hit_length == 0 and curr_hit_length > 0:
++                        _, unbounded = manager_cls.find_longest_cache_hit(
++                            block_hashes=block_hashes,
++                            max_length=max_cache_hit_length,
++                            kv_cache_group_ids=group_ids,
++                            block_pool=self.block_pool,
++                            kv_cache_spec=spec,
++                            drop_eagle_block=False,
++                            alignment_tokens=self._cache_hit_alignment_tokens,
++                            dcp_world_size=(
++                                self.dcp_world_size
++                                if isinstance(spec, FullAttentionSpec)
++                                else 1
++                            ),
++                        )
++                    _trace.append(
++                        (
++                            idx,
++                            type(spec).__name__,
++                            self.single_type_managers[first_group_id].block_size,
++                            _max_length,
++                            _new_hit_length,
++                            drop_eagle_block,
++                            unbounded,
++                        )
++                    )
+                 curr_hit_length = _new_hit_length
+                 for group_id, blocks in zip(group_ids, hit_blocks):
+                     hit_blocks_by_group[group_id] = blocks
+@@ -887,6 +946,152 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         cache_hit_blocks = tuple(
+             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
+         )
++        # Spend the budget on collapses: a lookup where some group matched a
++        # real prefix and the reconciliation still ended at nothing. The
++        # previous filter (hit_length > 0) answered which group caps a hit and
++        # is now settled; it cannot see this case at all, and the two are
++        # mutually exclusive, so the question needs its own run.
++        #
++        # ``longest_hit_length > 0`` is what separates a collapse from a
++        # genuinely cold lookup. A request's own num_computed_tokens is 0 in
++        # both waves of the replay, so it cannot tell them apart -- but a wave-1
++        # lookup has nothing cached anywhere and every group returns 0, which
++        # drives longest to 0 as well. Count both other outcomes so silence in
++        # the log stays readable as "did not occur" rather than "not sampled".
++        if hit_length == 0:
++            if longest_hit_length > 0:
++                self._hit_reconcile_collapses += 1
++                if self._hit_reconcile_collapses in (100, 1000, 10000):
++                    # The rate matters as much as the shape: the traces below
++                    # are capped at 20, so without a running count a collapse
++                    # that explains half the requests and one that explains
++                    # 1% look identical in the log.
++                    logger.info(
++                        "Prefix hit collapsed to 0 despite a partial match "
++                        "(%d such so far; %d fully cold lookups)",
++                        self._hit_reconcile_collapses,
++                        self._hit_reconcile_misses,
++                    )
++            else:
++                self._hit_reconcile_misses += 1
++                if self._hit_reconcile_misses in (1, 100, 1000):
++                    logger.info(
++                        "Prefix lookup found nothing in any group (%d such so far)",
++                        self._hit_reconcile_misses,
++                    )
++        if (
++            hit_length == 0
++            and longest_hit_length > 0
++            and self._hit_reconcile_logs < _MAX_HIT_RECONCILE_LOGS
++            and _trace
++        ):
++            self._hit_reconcile_logs += 1
++            # What is actually stored, rather than what the mask was asked to
++            # keep. Two earlier fixes were designed against a model of the store
++            # and both were wrong: adding a boundary at `tail - drop_unit` is
++            # erased by the mask's floor to `alignment_tokens`, and making the
++            # lookup fall back to a lower boundary cannot help because
++            # MambaManager's finder already scans every hash unit down to zero --
++            # a 0 means nothing is stored below the ceiling, not that something
++            # was out of reach.
++            #
++            # So probe the pool directly at the positions a Mamba state could
++            # exist: the chunk boundaries the scheduler actually ends on
++            # (max_num_batched_tokens floored to the Mamba block) and the
++            # prompt's last hash boundary. Whichever of those are absent is the
++            # store-side defect, stated rather than modelled.
++            for gid, group in enumerate(self.attention_groups):
++                if not isinstance(group.spec, MambaSpec):
++                    continue
++                mgr = self.single_type_managers[group.group_ids[0]]
++                bs = mgr.block_size
++                # Per kv-cache-group, not all-or-nothing. get_cached_block
++                # returns a block only when *every* id in group_ids has the
++                # hash, so a probe that passes the whole list cannot say which
++                # one is missing -- and the insertion counts show they do not
++                # move together (1239/1239/1238/1238/1238/1162 at 10k total).
++                # Splitting it turns "nothing is stored" into "these groups have
++                # it and that one does not", which is the difference between a
++                # store that never ran and a store that ran unevenly.
++                probes = []
++                per_group: dict[int, int] = {gid_: 0 for gid_ in group.group_ids}
++                pos = bs
++                while pos <= max_cache_hit_length:
++                    idx = pos // self.hash_block_size - 1
++                    if 0 <= idx < len(block_hashes):
++                        for gid_ in group.group_ids:
++                            if self.block_pool.get_cached_block(
++                                block_hashes[idx], [gid_]
++                            ):
++                                per_group[gid_] += 1
++                        found = self.block_pool.get_cached_block(
++                            block_hashes[idx], group.group_ids
++                        )
++                        if found:
++                            probes.append(pos)
++                    pos += bs
++                # The reader's key at the same position the writer logs, so
++                # the two can be compared directly rather than inferred equal.
++                # 122,880 is fine index 959; the writer prints the first eight
++                # bytes of the hash it registered for block 79.
++                probe_idx = 122880 // self.hash_block_size - 1
++                reader_key = (
++                    bytes(block_hashes[probe_idx])[:8].hex()
++                    if 0 <= probe_idx < len(block_hashes)
++                    else "out-of-range"
++                )
++                logger.info(
++                    "Mamba store probe, per kv-cache-group: %s (of %d block "
++                    "boundaries); all-groups-together %d; reader key at "
++                    "122,880 is %s, ask %d tokens",
++                    dict(sorted(per_group.items())),
++                    max_cache_hit_length // bs,
++                    len(probes),
++                    reader_key,
++                    # No prompt tag on this side: find_longest_cache_hit is
++                    # given hashes, not the request, so the raw token ids are
++                    # not reachable here. The writer's tag is what pairs them,
++                    # and the reader is identified by its ask length instead.
++                    max_cache_hit_length,
++                )
++                # ``gid`` indexes attention_groups, which merge kv cache groups,
++                # so it is not the id the insertion counter reports -- that one
++                # comes off the block hash key. Print the kv ids too, or the two
++                # logs name different groups by the same number. They also say
++                # whether get_cached_block was asked for more than one group: it
++                # returns None unless *every* id hits, so a multi-id group turns
++                # one absent entry into a probe that reads as empty.
++                logger.info(
++                    "Mamba store probe (attn group %d, kv groups %s, block=%d): "
++                    "%d of %d block boundaries are in the pool%s",
++                    gid,
++                    list(group.group_ids),
++                    bs,
++                    len(probes),
++                    max_cache_hit_length // bs,
++                    (" -> " + str(probes[-6:])) if probes else " (none)",
++                )
++            # ``align`` and ``partial`` decide the granularity a hit can land
++            # on, and they are the difference a length alone cannot show:
++            # 122880 is both 960 x 128 and 10 x 12288, so the observed hit is
++            # consistent with either the fine hash block or the coarse
++            # scheduler block. Printing the two settles it without another arm.
++            logger.info(
++                "Prefix hit collapsed to %d; best single group had %d of a %d "
++                "token ask "
++                "(eagle groups: %s, align=%d, partial_hash=%s, hash_block=%d, "
++                "sched_block=%d); per group "
++                "(idx, spec, block_size, max_len, hit, drop_eagle, unbounded): %s",
++                hit_length,
++                longest_hit_length,
++                max_cache_hit_length,
++                sorted(self.eagle_group_ids),
++                self._cache_hit_alignment_tokens,
++                self.enable_partial_hash_hits,
++                self.hash_block_size,
++                self.scheduler_block_size,
++                _trace,
++            )
+         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
+ 
+     def find_longest_cache_hit_per_group(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ecea90a25c..ddc811eec0 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2950,14 +2950,37 @@ class Scheduler(SchedulerInterface):
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            # TODO (davidb): add support for hybrid memory allocator
+-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
++            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+             )
+ 
++            if len(req_block_id_groups) != 1:
++                # Mooncake reports load failures as physical block IDs without
++                # identifying the hybrid KV group. Attention and Mamba groups
++                # can use different logical block sizes, so there is no safe
++                # common token boundary at which to truncate them. Conservatively
++                # recompute the complete prefix for every matching hybrid request.
++                # This is a rare eviction-race path and preserves correctness.
++                req_hybrid_block_ids = {
++                    block_id
++                    for group_block_ids in req_block_id_groups
++                    for block_id in group_block_ids
++                }
++                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
++                    continue
++
++                request.num_computed_tokens = 0
++                total_affected_tokens += max(req_num_computed_tokens, 0)
++                if evict_blocks:
++                    blocks_to_evict.update(req_hybrid_block_ids)
++                affected_req_ids.add(req_id)
++                continue
++
++            (req_block_ids,) = req_block_id_groups
++
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 8ee67cf2fb..5e7335dd73 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,7 @@ from collections import defaultdict
+ from collections.abc import Callable, Sequence
+ from typing import ClassVar
+ 
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -32,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.request import Request
+ 
++logger = init_logger(__name__)
++
+ 
+ def retention_grid_block(
+     block_idx: int, retention_interval: int | None, block_size: int
+@@ -56,6 +59,7 @@ class SingleTypeKVCacheManager(ABC):
+     """
+ 
+     supports_fine_grained_hash_lookup: ClassVar[bool] = False
++    _cow_slot_mismatches: ClassVar[int] = 0
+ 
+     def __init__(
+         self,
+@@ -437,7 +441,23 @@ class SingleTypeKVCacheManager(ABC):
+         """
+         req_blocks = self.req_to_blocks[request_id]
+         assert block_idx < len(req_blocks)
+-        assert req_blocks[block_idx] is source_block
++        if req_blocks[block_idx] is not source_block:
++            # Intermittent on DCP8 partial hits: the slot has already moved on.
++            # Asserting here killed three otherwise-healthy runs; dropping what
++            # the slot holds and proceeding fired zero times on the same config.
++            held = req_blocks[block_idx]
++            if not held.is_null:
++                self.block_pool.free_blocks([held])
++            SingleTypeKVCacheManager._cow_slot_mismatches += 1
++            if SingleTypeKVCacheManager._cow_slot_mismatches in (1, 10, 100, 1000):
++                logger.info(
++                    "CoW slot mismatch #%d: group=%d req=%s idx=%d of %d",
++                    SingleTypeKVCacheManager._cow_slot_mismatches,
++                    self.kv_cache_group_id,
++                    request_id[:12],
++                    block_idx,
++                    len(req_blocks),
++                )
+         assert not source_block.is_null and source_block.ref_cnt > 0
+         req_blocks[block_idx] = cow_block
+         self._pending_cow_copies.append((source_block, cow_block))
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 0a78c5e9c6..3ab41a51a9 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -19,7 +19,9 @@ from vllm.v1.core.kv_cache_coordinator import (
+ )
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     FullAttentionSpec,
++    KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
+ )
+@@ -107,11 +109,8 @@ class SimpleCPUOffloadScheduler:
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+         # FA group's own block_size; divides scheduler_block_size (the LCM)
+         # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        self.fa_block_size: int = self._group_block_size(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec
+         )
+         assert self.block_size % self.fa_block_size == 0
+ 
+@@ -217,6 +216,26 @@ class SimpleCPUOffloadScheduler:
+             kv_cache_tensors=cpu_tensors,
+         )
+ 
++    def _group_block_size(self, spec: KVCacheSpec) -> int:
++        """Tokens one block of this group covers across the DCP ranks.
++
++        Mirrors ``resolve_kv_cache_block_sizes`` and the ``dcp_world_size`` that
++        ``HybridKVCacheCoordinator.find_longest_cache_hit`` passes down: DCP
++        shards the sequence for attention groups, so an attention block spans
++        ``block_size * dcp`` tokens while a Mamba group keeps its full per-rank
++        state and spans ``block_size``. Scaling every group is a no-op at
++        dcp=1, which is why it went unnoticed; on a hybrid model at dcp=4 it
++        makes this manager take a quarter of the Mamba blocks it should.
++
++        The predicate is ``AttentionSpec``, not ``FullAttentionSpec``, because
++        that is what ``resolve_kv_cache_block_sizes`` uses. They differ for
++        sliding-window and chunked-local groups, which DCP shards just the
++        same.
++        """
++        if isinstance(spec, AttentionSpec):
++            return spec.block_size * self.cp_world_size
++        return spec.block_size
++
+     @staticmethod
+     def _estimate_lazy_target_blocks(
+         kv_cache_config: "KVCacheConfig",
+@@ -268,6 +287,28 @@ class SimpleCPUOffloadScheduler:
+             remaining_hashes, max_hit_len
+         )
+ 
++        # update_state_after_alloc() indexes whole scheduler blocks per group,
++        # and a partial hash hit can be finer than that: under DCP a hybrid
++        # model reports multiples of the hash block, not of the scheduler
++        # block. Decline such a hit rather than round it down.
++        #
++        # Rounding down looks like it should work and does not. A Mamba group's
++        # hit list is tail-only -- ``[null] * block_idx + [cached]``, one real
++        # state at the end -- so the leading slice update_state_after_alloc
++        # takes keeps only nulls and drops the single block that carries the
++        # state, while the scheduler is told those tokens are computed. The
++        # recurrent state is then silently wrong. There is no shorter prefix to
++        # fall back to either: the state exists at the length it was written
++        # at and nowhere else.
++        if hit_length % self.block_size:
++            logger.warning_once(
++                "CPU offload declined a %d-token prefix hit: this manager "
++                "indexes whole scheduler blocks (%d tokens) and cannot "
++                "represent a partial hash hit.",
++                hit_length,
++                self.block_size,
++            )
++            return 0, False
+         if hit_length > 0:
+             pin_blocks = [
+                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
+@@ -351,9 +392,7 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+                 f"group {g} block_size={g_block_size}"
+@@ -372,9 +411,7 @@ class SimpleCPUOffloadScheduler:
+                 continue
+ 
+             # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+ 
+             # Back-trace: ext blocks sit at the tail of the computed range.
+@@ -591,9 +628,7 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-                )
++                g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+                 ready_blocks_g = aligned_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
+diff --git a/vllm/v1/worker/gpu/cp_utils.py b/vllm/v1/worker/gpu/cp_utils.py
+index 77010990b8..c1b62290a6 100644
+--- a/vllm/v1/worker/gpu/cp_utils.py
++++ b/vllm/v1/worker/gpu/cp_utils.py
+@@ -71,7 +71,15 @@ def cp_local_slot(
+     CP_INTERLEAVE: tl.constexpr,
+     PAD_ID: tl.constexpr,
+ ):
+-    """Return rank-local KV slots, or PAD_ID for positions not owned by this rank."""
++    """KV slot for `positions` on this CP rank, or PAD_ID if not owned here.
++
++    DCP distributes a sequence round-robin over the CP ranks in chunks of
++    CP_INTERLEAVE, so a token's rank-local offset is not its global offset.
++    At CP_SIZE == 1 this reduces to the non-CP expression exactly.
++
++    `block_numbers` must have been loaded with the matching block index,
++    `positions // (block_size * CP_SIZE)`.
++    """
+     block_offsets = positions % (block_size * CP_SIZE)
+     if CP_SIZE == 1:
+         return block_numbers * block_size + block_offsets
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6bce5061b5..7126508956 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -144,6 +144,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+ )
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
++    supports_aux_hidden_states_over_pp,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+     RejectionSampler,
+@@ -263,11 +264,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
+-                    raise ValueError(
+-                        f"{self.speculative_config.method} with pipeline parallel "
+-                        "is not supported."
+-                    )
+ 
+         # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+@@ -387,6 +383,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.use_aux_hidden_state_outputs:
+                 assert self.speculative_config is not None
+                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
++                if self.use_pp and not supports_aux_hidden_states_over_pp(self.model):
++                    # The drafter runs on the last PP rank but taps layers that
++                    # may live on earlier stages, so the target must forward
++                    # those tensors along with its IntermediateTensors.
++                    raise ValueError(
++                        f"{self.speculative_config.method} with pipeline parallel "
++                        f"is not supported by {type(self.model).__name__}: it does "
++                        "not forward auxiliary hidden states across pipeline stages."
++                    )
++                pp_size = self.parallel_config.pipeline_parallel_size
++                if pp_size > 2:
++                    # The aux forwarding itself is size-agnostic: every stage
++                    # derives what it owes downstream from the same rule, and
++                    # the accounting is unit-tested up to pp=8. What has not
++                    # been exercised on hardware is a *middle* stage, which
++                    # pp>2 introduces and which must both adopt upstream taps
++                    # and contribute its own to the same payload. Given that
++                    # the failure mode of this feature is silently degraded
++                    # acceptance rather than a crash, refuse rather than let it
++                    # run unvalidated. Lifting this needs an end-to-end
++                    # acceptance-rate comparison at pp>2, not just a boot test.
++                    raise NotImplementedError(
++                        f"{self.speculative_config.method} with pipeline parallel "
++                        f"is currently supported only up to pipeline_parallel_size=2, "
++                        f"got {pp_size}."
++                    )
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 with use_workspace_lane(self._draft_workspace_lane):
+                     self.speculator.load_model(self.model)
+@@ -994,6 +1016,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # Land the proposals on the same step as the matching sampled
++                # tokens, so the next _prepare_inputs splices real draft ids
++                # into input_ids instead of placeholders.
++                draft_update = outputs.pop("draft_update", None)
++                if draft_update is not None:
++                    draft_tokens, draft_idx_mapping = draft_update
++                    self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
+                 self.postprocess_sampled(**outputs)
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+@@ -1603,6 +1632,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.input_buffers,
+                 max_query_len=batch_desc.max_query_len,
+             )
++            # Same DCP handling as create_dummy_attn_state: make_dummy leaves
++            # dcp_local_seq_lens unset, but the MLA metadata builder swaps it
++            # in for seq_lens whenever DCP is enabled.
++            if self.use_dcp:
++                prepare_dcp_local_seq_lens(
++                    self.input_buffers.dcp_local_seq_lens,
++                    input_batch.seq_lens,
++                    dummy_num_reqs,
++                    self.dcp_size,
++                    self.dcp_rank,
++                    self.cp_interleave,
++                )
++                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
++                    :dummy_num_reqs
++                ]
+             if not skip_attn_for_dummy_run:
+                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                 if context_len:
+@@ -1822,6 +1866,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+             all_decode_next = self.pp_handler.receive(input_batch)
++            # Pair the last rank's post-propose draft send.
++            if self.num_speculative_steps > 0:
++                self.pp_handler.receive_drafts(input_batch)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -1948,6 +1995,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
++            # The other PP ranks have no drafter, so hand them the proposals
++            # they must feed the target on the next step.
++            if self.pp_handler is not None:
++                self.pp_handler.broadcast_drafts(
++                    self.req_states.draft_tokens[input_batch.idx_mapping],
++                    input_batch,
++                )
+ 
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe4..86aad4cfb0 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -30,9 +30,13 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Draft proposals for the step this slot feeds, when spec decoding is on.
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+ 
+ 
+-def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
++def compute_need_sampled_mask(
++    input_batch: InputBatch, max_draft_tokens: int = 0
++) -> np.ndarray | None:
+     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+     with outputs that might be needed in a subsequent (decode) step.
+     Returns None if no sampled outputs are needed in the requests' next step."""
+@@ -44,7 +48,24 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+     # Exclude requests that we know are finished.
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
++    # The scheduler advances num_computed_tokens by the full scheduled width
++    # (bonus + drafts) up front and only rolls the rejected part back in
++    # update_from_output, which under PP runs after the next batch has already
++    # been scheduled. Comparing the inflated count against max_seq_len would
++    # mark a request as finishing up to num_draft tokens early, after which the
++    # last rank stops broadcasting and the other ranks' last_sampled_tokens
++    # freeze, silently repeating a stale token.
++    #
++    # Discount a fixed upper bound rather than this step's draft count. The
++    # inflation came from the *previous* step's drafts, and the two need not
++    # match: a request that was given four drafts and is given none now gets a
++    # discount of zero and finishes early -- the corruption above -- while the
++    # reverse over-discounts harmlessly. Only one direction is safe, so take
++    # the bound that is always at least the inflation. A redundant broadcast
++    # costs one small collective; a skipped one corrupts. The clamp below
++    # absorbs the over-subtraction.
++    finish_computed = old_computed - max_draft_tokens
++    not_finishing = np.maximum(finish_computed, prefill_len) + 1 < max_seq_len
+     need_sampled_mask = produces_sample & not_finishing
+     return need_sampled_mask if need_sampled_mask.any() else None
+ 
+@@ -65,6 +86,7 @@ class PPHandler:
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
++        self.num_speculative_steps = num_speculative_steps
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+@@ -90,7 +112,9 @@ class PPHandler:
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
++    def get_prev_sampled_outputs(
++        self,
++    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+         """
+@@ -116,18 +140,82 @@ class PPHandler:
+             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+ 
+         self.main_stream.wait_event(slot.event)
+-        return dict(
++        outputs = dict(
+             sampled_tokens=slot.sampled_tokens,
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
+         )
++        if slot.draft_tokens is not None:
++            # Scatter with the unfiltered mapping. A row whose request has since
++            # been freed writes to a slot nobody reads, and add_requests zeroes
++            # the row before any reuse, whereas the -1 sentinels in the filtered
++            # `idx_mapping` would alias the last row.
++            outputs["draft_update"] = (slot.draft_tokens, slot.idx_mapping)
++        return outputs
++
++    def broadcast_drafts(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Publish this step's proposals to the other PP ranks.
++
++        Only the last rank runs the drafter, but the first rank owns
++        embed_tokens and therefore builds the input embeddings for the whole
++        pipeline. Without this the non-last ranks embed the scheduler's
++        PLACEHOLDER_TOKEN_ID (-1) in the draft slots, and the last rank ends up
++        verifying real proposals against logits computed from placeholders.
++        """
++        assert self.is_last_rank
++        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
++            return
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            send = draft_tokens.contiguous()
++            torch.distributed.broadcast(
++                send, src=self.last_rank, group=self.broadcast_group
++            )
++            send.record_stream(self.broadcast_stream)
++
++    def receive_drafts(self, input_batch: InputBatch) -> None:
++        """Counterpart of `broadcast_drafts`.
++
++        Attaches to the slot `receive` just pushed so the proposals are
++        consumed at the same step as the sampled tokens they belong with. Both
++        sides gate on the same mask, so the wire order always matches.
++        """
++        assert not self.is_last_rank
++        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
++            return
++        num_reqs = input_batch.num_reqs
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            draft_tokens = torch.empty(
++                num_reqs,
++                self.num_speculative_steps,
++                dtype=torch.int64,
++                device=self.device,
++            )
++            torch.distributed.broadcast(
++                draft_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            # Strictly later on broadcast_stream than the event `receive`
++            # recorded, so it also covers the sampled tensors. Replacing the
++            # slot's event keeps the consumer's single wait_event correct;
++            # waiting on the older event would not order this broadcast.
++            event = self.broadcast_stream.record_event()
++            draft_tokens.record_stream(self.main_stream)
++        slot = self.queue[-1]
++        if slot is not None:
++            slot.draft_tokens = draft_tokens
++            slot.event = event
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+         requests in the batch."""
+         assert not self.is_last_rank
+-        need_sampled_mask = compute_need_sampled_mask(input_batch)
++        need_sampled_mask = compute_need_sampled_mask(
++            input_batch, self.num_speculative_steps
++        )
+         if need_sampled_mask is None:
+             # Leave this step's reserved slot as None.
+             return False
+@@ -175,7 +263,7 @@ class PPHandler:
+         input_batch: InputBatch,
+     ) -> None:
+         assert self.is_last_rank
+-        if compute_need_sampled_mask(input_batch) is None:
++        if compute_need_sampled_mask(input_batch, self.num_speculative_steps) is None:
+             # No request needs sampled outputs for a subsequent decode step.
+             return
+ 
+@@ -186,8 +274,24 @@ class PPHandler:
+ 
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            # receive() unconditionally allocates max_sample_len columns, but
++            # the non-spec sampler path (num_draft_tokens == 0) returns width 1,
++            # so an unpadded broadcast leaves the peer waiting on a larger count
++            # than the root sends. NCCL does not diagnose the mismatch: the root
++            # completes and the receiver hangs until the watchdog fires. Pad so
++            # both sides agree. post_update reads each row with
++            # sampled_tokens.stride(0) and stops at num_sampled, so the pad
++            # columns are never observed.
++            send_tokens = sampled_token_ids
++            width = send_tokens.shape[-1]
++            if width < self.max_sample_len:
++                padded = send_tokens.new_zeros(
++                    send_tokens.shape[0], self.max_sample_len
++                )
++                padded[:, :width] = send_tokens
++                send_tokens = padded
+             torch.distributed.broadcast(
+-                sampled_token_ids.contiguous(),
++                send_tokens.contiguous(),
+                 src=self.last_rank,
+                 group=self.broadcast_group,
+             )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index c68b549745..93dbb5aa14 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -42,6 +42,10 @@ def _prepare_dflash_inputs_to_capture(
+     attn_metadata = None
+     if not skip_attn:
+         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
++        # The draft has two independent metadata paths -- this one for capture
++        # and DFlashSpeculator._build_draft_attn_metadata for serving. Only the
++        # serving one was DCP-aware, so build() dereferenced a None
++        # dcp_local_seq_lens during capture.
+         dcp_local_seq_lens = None
+         if block_tables.cp_size > 1:
+             prepare_dcp_local_seq_lens(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 177060747a..ed0a8513b2 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -1,12 +1,24 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import glob
++import json
++import os
++
++import torch
+ import torch.nn as nn
++from safetensors import safe_open
+ 
+ from vllm.config import ModelConfig, VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.logger import init_logger
++from vllm.model_executor.model_loader import get_model
++from vllm.model_executor.models.utils import PPMissingLayer
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
++    _should_share,
++    get_target_lm_head,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -71,14 +83,25 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     # config is retained for DSpark's target-layer metadata, so we must override it.
+     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+ 
++    # Under PP the drafter is built only on the last stage, but the
++    # fastsafetensors loader collectives over torch.distributed.group.WORLD
++    # (weight_utils.fastsafetensors_weights_iterator). The stages that never
++    # build a drafter never join, and every rank hangs until the NCCL collective
++    # times out. Fall back to the default loader for the draft; it is a handful
++    # of layers, so the parallel loader buys nothing here anyway.
++    if get_pp_group().world_size > 1 and draft_vllm_config.load_config.load_format == (
++        "fastsafetensors"
++    ):
++        draft_vllm_config = replace(
++            draft_vllm_config,
++            load_config=replace(draft_vllm_config.load_config, load_format="auto"),
++        )
++
+     with set_model_tag("dspark_head"):
+         draft_model = get_model(
+             vllm_config=draft_vllm_config, model_config=draft_model_config
+         )
+ 
+-    if get_pp_group().world_size != 1:
+-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+-
+     target_language_model = (
+         target_model.get_language_model()
+         if hasattr(target_model, "get_language_model")
+@@ -90,6 +113,13 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+ 
+     target_embed = getattr(target_inner, "embed_tokens", None)
+     draft_embed = getattr(draft_inner, "embed_tokens", None)
++    # Under PP the target's vocab embedding lives on the first stage, so on the
++    # last stage -- where the drafter runs -- there is only a PPMissingLayer to
++    # alias. PPMissingLayer.forward returns its input unchanged, which would
++    # feed raw int64 token ids into the draft backbone's norm. Load the real
++    # table from the target checkpoint instead.
++    if isinstance(target_embed, PPMissingLayer):
++        target_embed = _load_target_embed_tokens_for_pp(vllm_config)
+     if (
+         target_embed is not None
+         and draft_model_config.get_vocab_size() <= target_vocab_size
+@@ -117,3 +147,81 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+         draft_model.lm_head = target_lm_head
+ 
+     return draft_model
++
++
++def _load_target_embed_tokens_for_pp(vllm_config: VllmConfig) -> nn.Module:
++    """Build and load the target's vocab embedding on a non-first PP stage.
++
++    Mirrors the target's own construction (a VocabParallelEmbedding sharded over
++    the TP group) and loads the weight from the target checkpoint, which is
++    present in full on every node's model directory. Costs
++    vocab_size * hidden_size * dtype_size / tp_size bytes, e.g. 0.28 GiB per GPU
++    for a 163840 x 7168 bf16 table at TP8.
++    """
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        VocabParallelEmbedding,
++    )
++    from vllm.platforms import current_platform
++
++    model_config = vllm_config.model_config
++    text_config = model_config.hf_text_config
++    model_dir = model_config.model
++    if not os.path.isdir(model_dir):
++        # model_config.model is an HF repo id whenever the model was not given
++        # as a local path; resolve it to the already-populated cache snapshot.
++        # local_files_only: the weights are staged ahead of the job, and a
++        # multi-hundred-GB download inside a benchmark is never the right answer.
++        from huggingface_hub import snapshot_download
++
++        model_dir = snapshot_download(
++            model_dir,
++            revision=model_config.revision,
++            local_files_only=True,
++        )
++
++    # Locate the embedding tensor: prefer the shard index, else scan the shards.
++    key = None
++    shard_path = None
++    index_path = os.path.join(model_dir, "model.safetensors.index.json")
++    if os.path.isfile(index_path):
++        with open(index_path) as f:
++            weight_map = json.load(f)["weight_map"]
++        for name, shard in weight_map.items():
++            if name.endswith("embed_tokens.weight"):
++                key = name
++                shard_path = os.path.join(model_dir, shard)
++                break
++    else:
++        for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
++            with safe_open(path, framework="pt") as f:
++                # safe_open is not a dict and is not directly iterable.
++                for name in f.keys():  # noqa: SIM118
++                    if name.endswith("embed_tokens.weight"):
++                        key = name
++                        shard_path = path
++                        break
++            if key is not None:
++                break
++    if key is None:
++        raise RuntimeError(
++            "DSpark under pipeline parallelism needs the target's embed_tokens "
++            f"on the last stage, but no *embed_tokens.weight was found in "
++            f"{model_dir}"
++        )
++
++    with torch.device(current_platform.current_device()):
++        embed = VocabParallelEmbedding(
++            text_config.vocab_size,
++            text_config.hidden_size,
++            params_dtype=model_config.dtype,
++            prefix="dspark_pp.embed_tokens",
++        )
++    with safe_open(shard_path, framework="pt") as f:
++        embed.weight_loader(embed.weight, f.get_tensor(key))
++    logger.info(
++        "Loaded draft embed_tokens %s from %s (key %s) for PP",
++        tuple(embed.weight.shape),
++        os.path.basename(shard_path),
++        key,
++    )
++    return embed
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index a37a4c83b3..f659e76a0f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -32,6 +32,23 @@ def set_eagle3_aux_hidden_state_layers(
+     eagle3_model.set_aux_hidden_state_layers(aux_layers)
+ 
+ 
++def supports_aux_hidden_states_over_pp(model: nn.Module) -> bool:
++    """Whether `model` carries its aux hidden states across pipeline stages.
++
++    EAGLE3-style drafting runs on the last PP rank but taps layers that may sit
++    on earlier stages, so the target has to forward those tensors with its
++    IntermediateTensors. Models that do opt in via
++    `EagleModelMixin.supports_aux_hidden_states_over_pp`.
++    """
++    parent_ref = model
++    if hasattr(model, "get_language_model"):
++        parent_ref = model.get_language_model()
++    elif hasattr(model, "language_model"):
++        parent_ref = model.language_model
++    inner = getattr(parent_ref, "model", None)
++    return bool(getattr(inner, "supports_aux_hidden_states_over_pp", False))
++
++
+ def get_eagle3_aux_layers_from_config(
+     spec_config: SpeculativeConfig,
+ ) -> tuple[int, ...] | None:
