@@ -4,7 +4,7 @@
 # BASE. vllm/vllm-openai:nightly-6f7df92a8e6cdc74a725b8f10b4d0b48ba2b37ef
 # (upstream 6f7df92a, 2026-08-28 04:36 UTC).
 #
-# THREE PATCHES, IN THIS ORDER, AND ALL THREE ARE REQUIRED.
+# FOUR PATCHES, IN THIS ORDER, AND ALL FOUR ARE REQUIRED.
 #
 #  1. vllm#54167 -- 'KimiK3LowLatencyLinearMethod' object has no attribute
 #     '_gemm_impl'. #50572 made UnquantizedLinearMethod store its GEMM choice in
@@ -21,7 +21,16 @@
 #     whichever PP stage crosses the threshold first. The 08-19 images we ran
 #     before are unaffected only because the kernel does not exist there.
 #
-#  3. k3-engine-0828.patch -- our own stack, rebased from the 08-19 nightly.
+#  3. The revert of vllm#52388 (upstream PR #53774, still open). #52388's
+#     fused multi-group Mamba kernel caches raw block-table pointers taken
+#     during the temporary CUDA-graph memory-profile capture; the later real
+#     capture then dereferences addresses freed with that allocation.
+#     Upstream hit the illegal address on three H200 hosts. Here it lands
+#     first as 'expected 3 block tables, got 4' out of
+#     compile_or_warm_up_model. The 08-19 images never saw it because
+#     model_states/mamba_hybrid.py arrived with a9a17e7095 on 08-25.
+#
+#  4. k3-engine-0828.patch -- our own stack, rebased from the 08-19 nightly.
 #
 # WHY OUR PATCH IS NOT THE 0819 ONE RENAMED. patch(1) puts 31 hunks on the floor
 # against this base; a git three-way merge leaves 5 files conflicting, and three
@@ -78,6 +87,7 @@ fi
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 bash /configs/patches/vllm-container-deps-k3-pr54167-828.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-828.sh
+bash /configs/patches/vllm-container-deps-k3-revert52388-828.sh
 
 echo "=== k3-pp: apply k3-engine-0819 ==="
 
