@@ -207,6 +207,16 @@ if "_cow_slot_mismatches" not in stkcm:
 if "resolve_dcp_kv_block_size" not in src("vllm/v1/core/kv_cache_utils.py"):
     fail.append("#53324 mooncake-under-DCP is not in this image; our own "
                 "connector/worker changes were dropped in favour of it")
+# Dropping our mooncake worker.py in favour of #53324 was right; dropping the
+# whole connector.py with it was not, and cost pipeline 65185599 at engine
+# init. The base PP-aware setter rejects pp_rank > 0 to protect connectors that
+# read peer handshake metadata; this one meets its peers in the store and
+# throws the value away, so without the override every PP2 arm dies with
+# "MooncakeStoreConnector received pp_rank > 0 handshake metadata".
+if "set_xfer_handshake_metadata_pp_aware" not in src(
+        "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py"):
+    fail.append("the MooncakeStore PP handshake override is missing; every "
+                "prefill-PP arm will die at engine core init")
 if "to(tl.int64)" not in src("vllm/models/kimi_k3/nvidia/kda.py"):
     fail.append("the checkpoint-index int64 cast is missing; the store wraps "
                 "negative past state_idx 4854 and faults ~20 min in")

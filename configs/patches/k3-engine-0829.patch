@@ -16,6 +16,38 @@ index 564f13cddf..5cad1ce9bd 100644
              tensor_parallel_size=speculative_draft_tensor_parallel_size,
              distributed_executor_backend=target_parallel_config.distributed_executor_backend,
              max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index b6128b28db..984e59b81d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -24,6 +24,7 @@ from vllm.distributed.kv_events import (
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorBase_V1,
++    KVConnectorHandshakeMetadata,
+     KVConnectorMetadata,
+     KVConnectorRole,
+     KVConnectorWorkerMetadata,
+@@ -154,6 +155,19 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         else:
+             self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
+ 
++    def set_xfer_handshake_metadata_pp_aware(
++        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
++    ) -> None:
++        """Discard peer handshake metadata, PP shards included.
++
++        Producers and consumers meet in MooncakeDistributedStore, not through
++        each other's transfer agents, so this connector never reads handshake
++        metadata -- the base class's setter for it is a no-op here. The base
++        PP-aware setter still rejects ``pp_rank > 0`` to protect connectors that
++        do read it, which stops PP-disaggregated serving from starting over a
++        value this one throws away.
++        """
++
+     def shutdown(self):
+         """Release connector resources on teardown.
+ 
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
 index c2f0e66406..792660a713 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
