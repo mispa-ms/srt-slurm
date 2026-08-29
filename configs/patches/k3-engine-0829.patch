@@ -146,10 +146,10 @@ index c2f0e66406..792660a713 100644
      def load_mask(
          self,
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
-index bc5fdcd5d8..6a0969e4b9 100644
+index bc5fdcd5d8..2ac3344851 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
-@@ -52,6 +52,12 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
+@@ -52,6 +52,15 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
  class MooncakeStoreScheduler:
      """Scheduler-side component for MooncakeStoreConnector."""
  
@@ -158,11 +158,14 @@ index bc5fdcd5d8..6a0969e4b9 100644
 +    # is what the log wants, and the throttle must not reset per instance.
 +    _unaddressable_saves = 0
 +    _unaddressable_by_origin: dict[str, int] = {}
++    # Saves kept on their own block-table mirror because the request did not
++    # change this step. Counted so "no drops" and "never reached" stay distinct.
++    _kept_mirror_saves = 0
 +
      def __init__(
          self,
          vllm_config: VllmConfig,
-@@ -421,9 +427,51 @@ class MooncakeStoreScheduler:
+@@ -421,9 +430,74 @@ class MooncakeStoreScheduler:
          )
          for req_meta in save_metas:
              block_ids = block_state.block_ids.get(req_meta.req_id)
@@ -192,6 +195,29 @@ index bc5fdcd5d8..6a0969e4b9 100644
 +                    "boundary-offload" if req_meta.boundary_state_offloads
 +                    else "load-spec"
 +                )
++                if req_meta.req_id in self._unfinished_requests and req_meta.block_ids:
++                    # The snapshot exists to refresh tables for requests that
++                    # changed this step. This one was neither scheduled new nor
++                    # cached, so nothing about it changed, and finished and
++                    # preempted ids are popped from _unfinished_requests at the
++                    # top of build_connector_meta -- surviving there means the
++                    # blocks are still allocated and the meta's own mirror,
++                    # taken in update_state_after_alloc, is current.
++                    #
++                    # Dropping these instead cost every put: the 08-29 mooncake
++                    # arm wrote nothing where the 08-19 baseline wrote 10.3 GB,
++                    # and all 1,000+ drops were this branch.
++                    MooncakeStoreScheduler._kept_mirror_saves += 1
++                    if MooncakeStoreScheduler._kept_mirror_saves in (1, 100, 10000):
++                        logger.info(
++                            "Keeping store job #%d for %s (%s) on its own block "
++                            "table: unchanged this step, so the snapshot has "
++                            "nothing to refresh it with.",
++                            MooncakeStoreScheduler._kept_mirror_saves,
++                            req_meta.req_id,
++                            origin,
++                        )
++                    continue
 +                MooncakeStoreScheduler._unaddressable_saves += 1
 +                MooncakeStoreScheduler._unaddressable_by_origin[origin] = (
 +                    MooncakeStoreScheduler._unaddressable_by_origin.get(origin, 0) + 1
