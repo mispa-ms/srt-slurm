@@ -146,10 +146,10 @@ index c2f0e66406..792660a713 100644
      def load_mask(
          self,
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
-index bc5fdcd5d8..1dfe292de1 100644
+index bc5fdcd5d8..6a0969e4b9 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
-@@ -52,6 +52,11 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
+@@ -52,6 +52,12 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
  class MooncakeStoreScheduler:
      """Scheduler-side component for MooncakeStoreConnector."""
  
@@ -157,11 +157,12 @@ index bc5fdcd5d8..1dfe292de1 100644
 +    # for a request this side marked savable. Class-level: one count per engine
 +    # is what the log wants, and the throttle must not reset per instance.
 +    _unaddressable_saves = 0
++    _unaddressable_by_origin: dict[str, int] = {}
 +
      def __init__(
          self,
          vllm_config: VllmConfig,
-@@ -421,9 +426,34 @@ class MooncakeStoreScheduler:
+@@ -421,9 +427,51 @@ class MooncakeStoreScheduler:
          )
          for req_meta in save_metas:
              block_ids = block_state.block_ids.get(req_meta.req_id)
@@ -181,18 +182,35 @@ index bc5fdcd5d8..1dfe292de1 100644
 +                # A store we cannot address is a store we cannot make. Drop it
 +                # and keep serving: the cost is one cache entry that never gets
 +                # written, against an assert that takes the engine down mid-run.
++                # Name the gap. A boundary offload carries its own entries, so
++                # a non-empty list identifies the branch that added this meta
++                # unconditionally; anything else came in through the load-spec
++                # loop, which only runs for requests neither new nor cached
++                # this step. The two need different repairs, and counting them
++                # separately is what tells us which one the run is hitting.
++                origin = (
++                    "boundary-offload" if req_meta.boundary_state_offloads
++                    else "load-spec"
++                )
 +                MooncakeStoreScheduler._unaddressable_saves += 1
++                MooncakeStoreScheduler._unaddressable_by_origin[origin] = (
++                    MooncakeStoreScheduler._unaddressable_by_origin.get(origin, 0) + 1
++                )
 +                if MooncakeStoreScheduler._unaddressable_saves in (
 +                    1,
++                    10,
 +                    100,
++                    1000,
 +                    10000,
 +                ):
 +                    logger.warning(
-+                        "Dropping store job #%d for %s: no current block table. "
-+                        "The request is savable here but was not snapshotted by "
-+                        "the scheduler this step.",
++                        "Dropping store job #%d for %s (%s): no current block "
++                        "table. Savable here but not snapshotted by the "
++                        "scheduler this step. By origin: %s",
 +                        MooncakeStoreScheduler._unaddressable_saves,
 +                        req_meta.req_id,
++                        origin,
++                        MooncakeStoreScheduler._unaddressable_by_origin,
 +                    )
 +                req_meta.can_save = False
 +                continue
