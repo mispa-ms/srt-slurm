@@ -1361,10 +1361,10 @@ index c8166b2e6a..19c60c26c8 100644
  
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
 new file mode 100644
-index 0000000000..7e0dd8541c
+index 0000000000..fee09b5604
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,153 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Pure layout planning for member-ordered NIXL transfers."""
@@ -1423,6 +1423,7 @@ index 0000000000..7e0dd8541c
 +    if (
 +        len(remote_metadata.kv_caches_base_addr) != num_regions
 +        or len(remote_metadata.block_lens) != num_regions
++        or len(remote_metadata.block_strides) != num_regions
 +    ):
 +        raise RuntimeError("NIXL region metadata has inconsistent lengths")
 +
@@ -1453,6 +1454,11 @@ index 0000000000..7e0dd8541c
 +    group_ids: list[int] = []
 +    remote_base_addresses: list[int] = []
 +    remote_block_lens: list[int] = []
++    # Member-ordered like the two above. _build_fa_remote indexes all three
++    # with the same member position, so a region-ordered block_strides is
++    # read out of range as soon as a worker owns more members than the
++    # remote advertises regions -- which HMA dedup makes the normal case.
++    remote_block_strides: list[int] = []
 +    local_layouts: list[MemberLayout] = []
 +
 +    for local_region, local_members in enumerate(local_region_members):
@@ -1490,6 +1496,7 @@ index 0000000000..7e0dd8541c
 +            group_ids.append(group_id)
 +            remote_base_addresses.append(remote_base)
 +            remote_block_lens.append(remote_len)
++            remote_block_strides.append(remote_metadata.block_strides[remote_region])
 +
 +    if not member_names:
 +        raise RuntimeError("Remote NIXL metadata has no members owned by this worker")
@@ -1498,6 +1505,7 @@ index 0000000000..7e0dd8541c
 +        remote_metadata,
 +        kv_caches_base_addr=remote_base_addresses,
 +        block_lens=remote_block_lens,
++        block_strides=remote_block_strides,
 +        region_members=[],
 +        packed_block_stride=0,
 +        packed_member_layouts={},

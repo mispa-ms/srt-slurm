@@ -217,6 +217,15 @@ if "set_xfer_handshake_metadata_pp_aware" not in src(
         "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py"):
     fail.append("the MooncakeStore PP handshake override is missing; every "
                 "prefill-PP arm will die at engine core init")
+# block_strides arrived with connector metadata v9, after the member-identity
+# path was written, so plan_member_transfer let it through in region order
+# while _build_fa_remote indexes it by member position. Under HMA dedup a
+# worker owns more members than the remote advertises regions, so the read runs
+# off the end and every PP2 arm dies at handshake (65173551, 65212404).
+if "block_strides" not in src(
+        "vllm/distributed/kv_transfer/kv_connector/v1/nixl/member_transfer.py"):
+    fail.append("plan_member_transfer does not rebuild block_strides in member "
+                "order; PP2 handshake will IndexError in _build_fa_remote")
 if "to(tl.int64)" not in src("vllm/models/kimi_k3/nvidia/kda.py"):
     fail.append("the checkpoint-index int64 cast is missing; the store wraps "
                 "negative past state_idx 4854 and faults ~20 min in")
