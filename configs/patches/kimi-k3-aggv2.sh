@@ -1,36 +1,39 @@
 #!/bin/bash
-# Kimi-K3 AGG v2 runtime setup.
+# Kimi-K3 dependency setup. Shared root: ~94 configs call this, directly or
+# through a wrapper, and it is the only thing they all have in common.
 #
-# The image is built from mispa-ms/vllm@misunp/k3-dcp-agg-v2, so every vLLM
-# source patch this track used to apply at runtime is already compiled in:
+# WHAT THIS SCRIPT IS. Dependencies and verification, nothing else. It installs
+# FlashInfer, the Mooncake client, ibverbs/numactl, and then checks that the
+# image it landed in is the one the caller thinks it is. It applies no vLLM
+# source patch of its own; callers do that after it returns.
 #
-#   vllm main @75231eff2f          the pinned base; main is not chased
-#   + vllm#50484 @65328d0ee3       Kimi-K3 DCP, INCLUDING the direct
-#                                  symmetric-memory CUDA kernels under
-#                                  csrc/libtorch_stable/attention/dcp_utils/
-#   + vllm#50493 @9f409e3e2c       partial prefix cache hits under DCP
-#   + ours                         hybrid CPU-offload block accounting
-#   + ours                         stop DCP-scaling the Mamba block table
-#   + ours                         hybrid-aware KV-load-failure recompute
+# WHAT CHANGED, AND WHY THE OLD HEADER WAS WRONG. This began as the setup for a
+# custom image built from mispa-ms/vllm@misunp/k3-dcp-agg-v2, and said so: "the
+# image is built from ... so every vLLM source patch is already compiled in".
+# That has not been true since the v5 track moved to stock nightly images plus a
+# runtime patch, and it is not true for any arm running today. #50484's CUDA --
+# the reason a build was needed at all -- has been upstream since 63ac04a61e, so
+# every nightly from 08-11 carries torch.ops._C.direct_dcp_*, which the check at
+# the bottom still asserts.
 #
-# WHAT CHANGED FROM THE PATCH STACK. Two patches were dropped because upstream
-# now carries them: our cudagraph empty-shard mask (superseded by 76b2e9d45e,
-# same searchsorted approach) and wzhao18/vllm@d87cdf5ce4 (merged). The
-# hybrid-recompute fix was a string-surgery script keyed on a source anchor; it
-# is a real commit on the branch now, so an upstream edit to that block fails the
-# build instead of silently not applying.
+# THE TWO MARKER LISTS.
+#   UPSTREAM  what any base image must already have. Kept current with upstream
+#             moves: dcp_utils.py and the DCP half of common.py are dcp.py now.
+#   OURS      what only exists once our commits are applied. A stock nightly
+#             does not have them at this point, so nightly callers set
+#             K3_EXPECT_OURS=0 and re-check the same markers themselves once
+#             their patch is on.
 #
-# WHY THE BUILD. #50484 ships 884 lines of CUDA that no pre-built nightly has, so
-# every DCP number this track has published so far came off the Triton/NCCL
-# fallback with VLLM_USE_DIRECT_DCP_* forced to 0 -- not the implementation the
-# PR measures. The image now contains torch.ops._C.direct_dcp_*, and the ladder
-# and the A/B differ only by that env var.
+# The OURS list still describes the pre-08-28 shape of our patch -- upstream has
+# since absorbed the model_runner half -- which is correct for the older
+# pinned-image callers that assert K3_EXPECT_OURS=1 and wrong for a new nightly.
+# The five such callers all pin their own base SHA, so they cannot reach a
+# nightly that would trip it; a new caller should set K3_EXPECT_OURS=0.
 #
-# THIS SCRIPT THEREFORE ONLY DOES DEPENDENCIES.
-#
-# flashinfer 0.6.16rc5 is deliberate and stays: vLLM main pins 0.6.15.post1, and
-# this track has measured on rc5 throughout. Changing it here would put a second
-# variable into v2.
+# FI_VER defaults to 0.6.16rc5 because three v2-era callers depend on that
+# default and are pinned to images measured with it. Everything current exports
+# FI_VER=0.6.16.post3 explicitly. Do not "fix" the default without re-measuring
+# those three.
 
 set -euo pipefail
 
