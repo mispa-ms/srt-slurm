@@ -40,8 +40,22 @@
 #     PPMissingLayer whose forward would hand raw int64 ids to the draft backbone
 #
 # WHAT IT IS NOT. Not a perf patch. It makes DSpark+PP possible; it does not make it
-# fast, and the nightly is currently 10.9% behind the pinned image at c48 no-spec with
-# no speculation involved at all.
+# fast. An earlier version of this note said "10.9% behind the pinned image at c48
+# no-spec" -- right in direction, wrong in two ways: it compared against 7,914.1, a
+# number carried in another report, where this config's own harvest says 7,944.4
+# (pipeline 63403993), and it rested on one point.
+#
+# Measured since, across three concurrencies on the 08/28 nightly:
+#
+#   no-spec   c48 -11.5%   c72 -12.7%   c96 -11.1%     (7,033.8 vs 7,944.4 at c48)
+#   ns=4      c24  +8.7%   c32 +14.2%   c48 +12.1%
+#   ns=7       c8  +4.0%   c14  +5.3%   c24  +9.4%
+#
+# So the nightly is slower without speculation and faster with it, consistently, and
+# interactivity rises 12-32% on every speculative point. THE SIGN SPLITS ON
+# SPECULATION, NOT ON THIS PATCH -- read the whole table before concluding the nightly
+# regressed. The no-spec side is a real regression worth reporting upstream; the
+# speculative side moved the frontier.
 #
 # Verified against .vllm-wt-rubin: applies at fuzz 0, every touched file compiles, and
 # each new call site has its symbol present in that module. The container's --dry-run
