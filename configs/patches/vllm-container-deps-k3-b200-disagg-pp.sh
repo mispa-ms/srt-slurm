@@ -26,6 +26,16 @@ set -euo pipefail
 
 echo "=== k3-b200-disagg-pp: AGG chain + the PP handshake override ==="
 
+# THE CHECKPOINT PATH HAS TO BE SET HERE, NOT IN THE CONFIG. vllm-container-deps-k3-hfshim.sh
+# resolves ${K3_STAGED_DIR:-/lustre/share/coreai_comparch_aarwlt/...}, the bia path, and
+# refuses to continue rather than let HF start a 1.4 TB download. Our AGG configs set the
+# variable in `aggregated_environment` and it arrives; a disagg config setting it in
+# `prefill_environment` / `decode_environment` does NOT reach this preamble -- two
+# submissions died on the bia default with the variable present in the YAML. Rather than
+# keep guessing which block propagates, default it here and let a config still override.
+export K3_STAGED_DIR="${K3_STAGED_DIR:-/lustre/share/coreai_comparch_inferencex/models/kimi-k3}"
+echo "[k3-b200-disagg-pp] K3_STAGED_DIR=${K3_STAGED_DIR}"
+
 bash /configs/patches/vllm-container-deps-k3-b200-dspark-pp.sh
 bash /configs/patches/vllm-container-deps-k3-mooncake-pp-handshake.sh
 
