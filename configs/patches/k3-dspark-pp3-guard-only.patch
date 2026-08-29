@@ -1,0 +1,36 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -11,7 +11,32 @@
+                         "not forward auxiliary hidden states across pipeline stages."
+                     )
+                 pp_size = self.parallel_config.pipeline_parallel_size
+-                if pp_size > 2:
++                import os as _os
++
++                if pp_size > 2 and _os.environ.get(
++                    "VLLM_DSPARK_PP_ALLOW_UNVALIDATED"
++                ) == "1":
++                    # Opt-in bypass, deliberately an env var rather than a config
++                    # field: nothing in a recipe should be able to reach it by
++                    # accident. The accounting this guard protects is unit-tested
++                    # to pp=8 (tests/v1/worker/test_eagle3_aux_hidden_states_pp.py)
++                    # and was re-checked for the 32,32,29 partition K3 runs, where
++                    # rank 1 is the middle stage: it receives 2 taps, adds its own,
++                    # forwards 3, and the drafter sees [2,23,47,71,89] in order.
++                    # What is still unproven is acceptance on hardware, and this
++                    # feature degrades acceptance silently instead of crashing --
++                    # so the warning names the only measurement that settles it.
++                    logger.warning(
++                        "%s at pipeline_parallel_size=%d with the pp>2 refusal "
++                        "bypassed by VLLM_DSPARK_PP_ALLOW_UNVALIDATED=1. A middle "
++                        "pipeline stage is unvalidated on hardware and this feature "
++                        "fails as degraded acceptance, not a crash. Measure with "
++                        "rejection_sample_method=standard before trusting any "
++                        "number from this server; synthetic reports its input.",
++                        self.speculative_config.method,
++                        pp_size,
++                    )
++                elif pp_size > 2:
+                     # The aux forwarding itself is size-agnostic: every stage
+                     # derives what it owes downstream from the same rule, and
+                     # the accounting is unit-tested up to pp=8. What has not
