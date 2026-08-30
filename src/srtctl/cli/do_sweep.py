@@ -193,6 +193,7 @@ class SweepOrchestrator(
             container_image=str(self.runtime.container_image),
             container_mounts=mounts,
             het_group=self.runtime.nodes.het_group_for(infra_node),
+            srun_options=self.runtime.srun_options,
         )
 
         managed = ManagedProcess(
@@ -269,6 +270,12 @@ class SweepOrchestrator(
             container_image=container,
             container_mounts=self.runtime.container_mounts,
             het_group=self.runtime.nodes.het_group_for(infra_node),
+            # Without this the step runs --overlap with no --mem, so SLURM charges it
+            # the whole node inside an --exclusive job and every later step fails with
+            # "Unable to create step: Memory required by task is not available". That
+            # took three arms of pipeline 65278551; mooncake_master came up, then the
+            # model pre-download and both workers could not be created.
+            srun_options=self.runtime.srun_options,
         )
 
         managed = ManagedProcess(
@@ -421,6 +428,7 @@ class SweepOrchestrator(
                 container_image=str(self.runtime.container_image),
                 container_mounts=self.runtime.container_mounts,
                 het_group=self.runtime.nodes.het_group_for(node),
+                srun_options=self.runtime.srun_options,
             )
             procs.append((node, proc, log))
         failures = []
@@ -520,6 +528,7 @@ class SweepOrchestrator(
                 env_to_set=hf_env,
                 use_bash_wrapper=False,  # command is already bash -c
                 het_group=self.runtime.nodes.het_group_for(download_node),
+                srun_options=self.runtime.srun_options,
             )
 
             timeout_sec = 60 * 60  # 1 hour; large models can take a while
@@ -648,6 +657,7 @@ class SweepOrchestrator(
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+            srun_options=self.runtime.srun_options,
         )
 
         while proc.poll() is None:
