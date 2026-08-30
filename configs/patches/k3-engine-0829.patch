@@ -2136,7 +2136,7 @@ index 5008015abd..55c95e2f57 100644
              vllm_config=vllm_config,
              start_layer_id=target_layer_num,
 diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
-index 748e5219a7..a0b9e4ae13 100644
+index 748e5219a7..32831a7b6a 100644
 --- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
 +++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
 @@ -364,6 +364,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -2147,7 +2147,24 @@ index 748e5219a7..a0b9e4ae13 100644
          # Equivalent PyTorch "align" path:
          #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
          #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
-@@ -728,6 +729,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+@@ -588,8 +589,14 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             # prepare checkpoint metadata
+             assert m.seq_lens_cpu_upper_bound is not None
+             request_rows = list(range(m.num_reqs))
+-            if spec_sequence_masks_cpu is not None:
+-                # get non spec request rows
++            if num_spec_decodes > 0:
++                # num_spec_decodes, not "masks is not None", and the same guard
++                # line 572 uses: active_non_spec_mask_cpu is only defined in the
++                # num_spec_decodes > 0 branch. Without RecoverSSM the two agree,
++                # because a step with no draft tokens clears the mask to None a
++                # few lines above -- but that clearing is gated on
++                # `not self.use_recoverssm`, so under RecoverSSM the mask
++                # survives with a zero count and this read is unbound.
+                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
+             all_query_lens = query_start_loc_cpu.diff().tolist()
+             query_lens = [all_query_lens[row] for row in request_rows]
+@@ -728,6 +735,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
              checkpoint=checkpoint,
          )
  
