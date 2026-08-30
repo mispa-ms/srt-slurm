@@ -61,12 +61,16 @@ if "resolve_kda_spec_decode_backend" not in kda:
 if "kda_spec_decode_backend" not in kda:
     sys.exit("[pr54255] FATAL: the config knob is not read anywhere in kda.py")
 
+# Symbol -> file taken from the patch itself. The eligibility predicate lives in
+# kda.py, NOT in vllm.utils.flashinfer; only the availability probe and the wrapper
+# are in utils. Asserting the wrong home cost this arm one run.
 import vllm.utils.flashinfer as fi
 
-for f in ("has_flashinfer_fused_kda_decode_packed",
-          "is_flashinfer_fused_kda_spec_decode_supported"):
+for f in ("has_flashinfer_fused_kda_decode_packed", "flashinfer_fused_kda_decode_packed"):
     if not hasattr(fi, f):
         sys.exit(f"[pr54255] FATAL: {f} missing from vllm.utils.flashinfer")
+if "is_flashinfer_fused_kda_spec_decode_supported" not in kda:
+    sys.exit("[pr54255] FATAL: the eligibility predicate is missing from kda.py")
 
 # Say out loud whether the FlashInfer side is actually present in this image. If it is
 # not, forcing the backend will fail at startup -- which is the intended outcome, but it

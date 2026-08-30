@@ -48,9 +48,11 @@ VLLM_ROOT=${VLLM_ROOT:-$(python3 -c 'import importlib.util, os; print(os.path.di
 command -v patch >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq patch; }
 
 cd "$VLLM_ROOT"
-PRIM=vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py
+# Marker file chosen from the patch, not guessed: _SEVEN_CTA_MAX_M is added to the
+# early-exit module, not to primitives.py.
+MARK=vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py
 
-if grep -q "_SEVEN_CTA_MAX_M" "$PRIM" 2>/dev/null; then
+if grep -q "_SEVEN_CTA_MAX_M" "$MARK" 2>/dev/null; then
   echo "[pr54168] already applied"
 else
   patch -p1 --forward --dry-run --fuzz=0 < /configs/patches/k3-pr54168-828.patch
@@ -75,10 +77,18 @@ FILES = (
 for rel in FILES:
     compile(open(os.path.join(root, rel)).read(), rel, "exec")
 
-prim = open(os.path.join(root, f"{base}/primitives.py")).read()
-for s in ("_SEVEN_CTA_MAX_M", "_LAMPORT_COPY_THREADS"):
-    if s not in prim:
-        sys.exit(f"[pr54168] FATAL: {s} missing from primitives.py")
+# Symbol -> file taken from the patch itself. Guessing this wrong has cost this
+# workstream three arms; every name below was read out of k3-pr54168-828.patch.
+WANT = {
+    f"{base}/allreduce_rmsnorm_reduce_scatter_early_exit.py": ("_SEVEN_CTA_MAX_M",),
+    f"{base}/primitives.py": ("finalize_top16_bf16", "fma_f32_bf16", "stmc_bf16x8"),
+    "vllm/models/kimi_k3/nvidia/ops/latent_moe_tail.py": ("_LAMPORT_COPY_THREADS",),
+}
+for rel, syms in WANT.items():
+    src = open(os.path.join(root, rel)).read()
+    for sym in syms:
+        if sym not in src:
+            sys.exit(f"[pr54168] FATAL: {sym} missing from {rel}")
 
 # The whole point is the low-M specialisation. If the module imports but the fused tail
 # is never enabled, this arm measures the baseline and says nothing -- so state the
