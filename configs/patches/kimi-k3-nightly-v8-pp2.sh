@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v8, plus the two fixes a second pipeline stage needs.
+# v8, plus the three fixes a second pipeline stage needs.
 # =============================================================================
 # WHY THIS EXISTS. The B300 AGG ladder runs TP8 on eight chips because the model
 # fits: K3 MXFP4 is 1,454 GiB, /8 = 181.7 GiB per chip against B300's 288. On
@@ -9,7 +9,7 @@
 # find out whether the extra node buys anything above c70, where the eight-chip
 # ladder turns over (12,074 -> 10,911 -> 7,952 at c70/c78/c86).
 #
-# TWO FIXES, BOTH LOAD-BEARING, NEITHER UPSTREAM. They come from the B200 PP2
+# THREE FIXES, ALL LOAD-BEARING, NONE UPSTREAM. They come from the B200 PP2
 # line, which has run them for days; they are carried rather than re-derived.
 #
 # 1. int64idx. _store_cache_checkpoints_kernel loads state_idx from an int32
@@ -29,18 +29,45 @@
 #    hand, and capture dies on `expected 3 block tables, got 4`. This is the one
 #    that is PP-caused rather than PP-triggered.
 #
-# NOT CARRIED, AND WHY. The B200 chain also runs dspark-pp-828 (which lifts an
-# upstream refusal of PP combined with speculative decoding) and emptycache
-# (which returns the draft model's cache before the symmetric-memory workspace
-# is built). Both exist to make PP and DSpark coexist. Every B300 arm at these
-# concurrencies is no-spec -- the frontier above c32 is `mcv8-dcp8-nospec-ts`,
-# and spec has no arms above c48 on this workload because the draft KV halves
-# the pool -- so neither has anything to do here, and carrying an unused patch
-# would only widen what this arm is measuring.
+# 3. dspark-pp-828. The nightly refuses speculation under PP outright --
+#    `{method} with pipeline parallel is not supported` in model_runner.py --
+#    and nobody upstream runs K3 with PP, so nobody upstream is lifting it. It
+#    narrows the refusal to models that cannot forward aux hidden states across
+#    stages, keeps a hard refusal above pp=2, carries the target's aux taps
+#    alongside IntermediateTensors, and loads the real embedding table on the
+#    last stage where the target's embed is a PPMissingLayer.
 #
-# The Mooncake PP handshake fix is likewise not carried: it unblocks PP under
-# DISAGGREGATED serving, where a pp_rank > 0 consumer must publish transfer
-# metadata. The B200 AGG PP2 chain does not include it and runs Mooncake fine.
+# ONE CHAIN, INCLUDING FOR THE NO-SPEC ARMS, AND THAT IS DELIBERATE. Half the
+# arms on this script never configure speculation, and the reflex is to keep an
+# unused patch off them. Read against this image, dspark-pp-828 executes nothing
+# without a speculative config:
+#
+#   compute_need_sampled_mask  the new branch is gated on
+#                              `num_draft_tokens_per_req is not None`
+#   PPSlot.draft_tokens        defaults None; the extra output is added only
+#                              when it is not
+#   pack/unpack/make_empty_aux_hidden_states
+#                              all iterate aux_hidden_state_layers, which is ()
+#                              unless EAGLE-style drafting set it -- zero tensors
+#                              added, so the PP transport buffers are unchanged
+#   speculative.py, dspark/utils.py, eagle3_utils.py
+#                              not reached
+#
+# So there is nothing to price, and splitting the chain would cost something
+# real: the no-spec points are the control for the speculative ones, and a
+# control that runs a different build is a weaker control. Same build for all
+# six; each is read as a delta against its own eight-chip PP1 point.
+#
+# STILL NOT CARRIED. emptycache, which returns the loader's cached blocks to the
+# driver before the draft's MLA builds a second direct-DCP symmetric-memory
+# workspace. Its own header says B300 does not hit that: 131.57 GiB of weights
+# against 288 rather than 180, so the loader's cache never reaches the ceiling,
+# and under PP2 each chip holds half the layers. It would also edit
+# model_runner.py, which dspark-pp-828 rewrites.
+#
+# Nor the Mooncake PP handshake fix: it unblocks PP under DISAGGREGATED serving,
+# where a pp_rank > 0 consumer must publish transfer metadata. The B200 AGG PP2
+# chain does not include it and runs Mooncake fine.
 # =============================================================================
 set -euo pipefail
 
@@ -49,11 +76,12 @@ HERE="$(dirname "${BASH_SOURCE[0]}")"
 # Everything the eight-chip control runs: deps, the six commits, the marker
 # assertions and the Mooncake DCP hit-boundary tests. Held identical on purpose
 # -- the PP2 arms are meant to differ from their controls in the layout and in
-# these two fixes, and in nothing else.
+# these three fixes, and in nothing else.
 bash "$HERE/kimi-k3-nightly-v8.sh"
 
 bash /configs/patches/vllm-container-deps-k3-int64idx.sh
 bash /configs/patches/vllm-container-deps-k3-mambacache.sh
+bash /configs/patches/vllm-container-deps-k3-dspark-pp-828.sh
 
 # Both scripts verify their own edit. What neither can see is whether this image
 # refuses the layout outright, before any of it matters. PCP is refused for this
@@ -83,7 +111,23 @@ assert not refusals, (
 pcp = [ln.strip() for p in k3.glob("*.py")
        for ln in p.read_text().splitlines()
        if "prefill_context_parallel_size == 1" in ln]
-print(f"=== pp2 preflight: no PP refusal; PCP still refused ({len(pcp)} sites) ===")
+# And the two halves of dspark-pp-828's own guard. The pp>2 refusal is
+# load-bearing on the speculative arms: a middle stage has never run on
+# hardware and fails as degraded acceptance rather than a crash, which under
+# synthetic rejection -- where the run reports the acceptance it was handed --
+# would be invisible. pp=2 has no middle stage.
+mr = (root / "v1/worker/gpu/model_runner.py").read_text()
+assert "supports_aux_hidden_states_over_pp" in mr, (
+    "the narrowed PP+spec refusal is missing; the blanket one may have been "
+    "removed without its replacement"
+)
+assert "pipeline_parallel_size=2" in mr, (
+    "the pp>2 refusal is gone; a middle stage could run and, under synthetic "
+    "acceptance, fail without showing it"
+)
+
+print(f"=== pp2 preflight: no PP refusal; pp=2 spec accepted, pp>2 refused; "
+      f"PCP still refused ({len(pcp)} sites) ===")
 PY
 
-echo "=== v8-pp2 ready: v8 + int64idx + mambacache ==="
+echo "=== v8-pp2 ready: v8 + int64idx + mambacache + dspark-pp-828 ==="
