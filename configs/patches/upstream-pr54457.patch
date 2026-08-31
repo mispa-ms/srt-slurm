@@ -1,0 +1,86 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 37304ec188..da803fb877 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2771,17 +2771,25 @@ class VllmConfig:
+             and self.kv_transfer_config.kv_connector is not None
+             and self.parallel_config.cp_kv_cache_interleave_size != local_block_size
+         ):
+-            interleave = self.parallel_config.cp_kv_cache_interleave_size
+-            self.parallel_config.cp_kv_cache_interleave_size = local_block_size
+-            logger.info_once(
+-                "When using PD disaggregation with DCP "
+-                "(decode_context_parallel_size=%d), "
+-                "cp_kv_cache_interleave_size is automatically adjusted "
+-                "from %d to block_size %d for block-level alignment.",
+-                dcp_size,
+-                interleave,
+-                local_block_size,
+-            )
++            from vllm.distributed.kv_transfer.kv_connector.factory import (
++                KVConnectorFactory,
++            )
++
++            connector_cls = KVConnectorFactory.get_connector_class(
++                self.kv_transfer_config
++            )
++            if connector_cls.requires_dcp_block_aligned_interleave:
++                interleave = self.parallel_config.cp_kv_cache_interleave_size
++                self.parallel_config.cp_kv_cache_interleave_size = local_block_size
++                logger.info_once(
++                    "When using PD disaggregation with DCP "
++                    "(decode_context_parallel_size=%d), "
++                    "cp_kv_cache_interleave_size is automatically adjusted "
++                    "from %d to block_size %d for block-level alignment.",
++                    dcp_size,
++                    interleave,
++                    local_block_size,
++                )
+ 
+     def validate_block_size(self) -> None:
+         """Validate block_size against DCP and mamba constraints.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 36e53828c0..1611b14d2f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -173,6 +173,14 @@ class KVConnectorBase_V1(ABC):
+     Base class for KV connectors.
+     """
+ 
++    requires_dcp_block_aligned_interleave: bool = True
++    """Whether this connector needs cp_kv_cache_interleave_size pinned to block_size
++    when decode_context_parallel_size > 1.
++
++    Connectors that only move KV within the same DCP rank (e.g. CPU offloading) should
++    set this to False.
++    """
++
+     @property
+     def supports_divergent_local_hybrid_hits(self) -> bool:
+         """Whether external hits can complete divergent local hybrid hits.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index a64f97805e..6133bbea12 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -47,6 +47,8 @@ from vllm.v1.request import Request
+ 
+ 
+ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
++    requires_dcp_block_aligned_interleave = False
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         # Runs as kv_both, but is a best-effort cache: a dropped save is just a
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 90a421da0f..c498837a00 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -54,6 +54,8 @@ _DISK_ONLY_KEYS = (
+ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+ 
++    requires_dcp_block_aligned_interleave = False
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         # Runs as kv_both, but is a best-effort cache: a dropped save is just a

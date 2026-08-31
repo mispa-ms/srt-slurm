@@ -1,0 +1,18 @@
+diff --git a/vllm/models/kimi_k3/nvidia/kda.py b/vllm/models/kimi_k3/nvidia/kda.py
+index 83460967a6..7bd40e1184 100644
+--- a/vllm/models/kimi_k3/nvidia/kda.py
++++ b/vllm/models/kimi_k3/nvidia/kda.py
+@@ -260,7 +260,12 @@ def _store_cache_checkpoints_kernel(
+     # store checkpoints to cache
+     seq_idx = tl.program_id(0)
+     cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx)
++    # Widen the state index to int64 before it reaches `state_idx *
++    # conv_state_stride` below: conv_state.stride(0) is 442,368 elements here, so
++    # the product passes 2**31 at state_idx >= 4,855 and Triton would otherwise do
++    # the multiply in int32 and wrap to a negative address. Same reasoning, and the
++    # same fix, as `_copy_mamba_state_block` in vllm/v1/worker/mamba_utils.py.
++    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx).to(tl.int64)
+     checkpoint_offset = tl.load(
+         checkpoint_offsets_ptr + seq_idx * checkpoint_offset_stride
+     )

@@ -1,0 +1,16 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index b6128b28db..4ee9794993 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -89,6 +89,11 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
+ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+     """KV connector using MooncakeDistributedStore as shared KV pool."""
+ 
++    # An offload tier, not a P/D transfer: no KV crosses instances, and the store
++    # has handled DCP block layout itself since #53324. Pinning the interleave to
++    # block_size is unnecessary here and makes both MLA backends refuse the config.
++    requires_dcp_block_aligned_interleave = False
++
+     @staticmethod
+     def _validate_kv_cache_config(
+         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
