@@ -1,0 +1,31 @@
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index fbd2432c93..f6a7ebb768 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -365,13 +365,23 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self._generate_draft(
+                 num_reqs,
+                 num_query_tokens,
+                 attn_metadata=None,
+                 slot_mappings=None,
+-                num_tokens_across_dp=(
+-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+-                ),
++                # The target model's dp_sync was built for its own dummy run
++                # of max_num_batched_tokens, but the draft runs
++                # num_query_tokens = num_reqs * num_query_per_req. Reusing it
++                # makes DPMetadata.make assert
++                # num_tokens_across_dp[dp_rank] == batchsize with the two
++                # numbers coming from different models -- 16384 against
++                # 128 * 7 = 896 on a TP1 x DP16 Kimi-K3 decode role.
++                # DPMetadata is only built when DP > 1, which is why this is
++                # invisible at DP1. Passing None makes set_forward_context
++                # re-derive it with coordinate_batch_across_dp at the draft's
++                # own token count. Every DP rank reaches this with identical
++                # shapes during memory profiling, so the collective agrees.
++                num_tokens_across_dp=None,
+                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+             )
+             return self.draft_tokens[:num_reqs]
+ 
+         # The query slot mapping is written into the shared BlockTables slot_mappings.
