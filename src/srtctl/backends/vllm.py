@@ -647,7 +647,22 @@ class VLLMProtocol:
                     f"{tp_size} does not match the endpoint's {endpoint.total_gpus} allocated GPUs"
                 )
 
-            local_dp_size = len(endpoint.gpu_indices) // tp_size
+            # per_node launching gives each node one process that owns the DP
+            # ranks resident on it, so a rank must fit inside a node. When
+            # tp_size exceeds the node's GPU count a rank straddles nodes and
+            # this floors to 0 -- which used to surface far downstream as
+            # "KV-event port block size must be at least 1", and would have gone
+            # on to pass --data-parallel-size-local 0 to vLLM.
+            gpus_on_node = len(endpoint.gpu_indices)
+            if tp_size > gpus_on_node:
+                raise ValueError(
+                    f"{endpoint.mode} tensor-parallel-size={tp_size} exceeds the "
+                    f"{gpus_on_node} GPUs on a node, so a data-parallel rank would span "
+                    f"nodes. dp_launch_mode=per_node cannot express that; use "
+                    f"tensor-parallel-size <= {gpus_on_node}, or drop data-parallel-size "
+                    f"and let the endpoint run as plain TP across nodes."
+                )
+            local_dp_size = gpus_on_node // tp_size
             dp_rpc_port = port_allocator.next_dp_rpc_port(endpoint.leader_node)
             nixl_base_port = port_allocator.next_nixl_port_block(dp_size)
             dp_start_rank = 0
