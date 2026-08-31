@@ -83,51 +83,11 @@ bash /configs/patches/vllm-container-deps-k3-int64idx.sh
 bash /configs/patches/vllm-container-deps-k3-mambacache.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pp-828.sh
 
-# Both scripts verify their own edit. What neither can see is whether this image
-# refuses the layout outright, before any of it matters. PCP is refused for this
-# model by a hard assert in the model file, and that refusal was found only after
-# a submission; check the same shape for PP rather than assume it differs.
-python3 - <<'PY'
-import importlib.util
-import pathlib
-import re
 
-root = pathlib.Path(importlib.util.find_spec("vllm").origin).parent
-k3 = root / "models/kimi_k3/nvidia"
-
-refusals = []
-for path in sorted(k3.glob("*.py")):
-    for ln in path.read_text().splitlines():
-        if re.search(r"pipeline_parallel_size\s*==\s*1", ln):
-            refusals.append(f"{path.name}: {ln.strip()}")
-assert not refusals, (
-    "this image refuses pipeline parallelism for Kimi-K3 and the run would die "
-    f"at engine init: {refusals}"
-)
-
-# The PCP assert IS expected to be here. If it ever disappears, that is worth
-# knowing -- it is the one parallelism axis this model has never been able to
-# use -- but it must not be read as licence to set PCP.
-pcp = [ln.strip() for p in k3.glob("*.py")
-       for ln in p.read_text().splitlines()
-       if "prefill_context_parallel_size == 1" in ln]
-# And the two halves of dspark-pp-828's own guard. The pp>2 refusal is
-# load-bearing on the speculative arms: a middle stage has never run on
-# hardware and fails as degraded acceptance rather than a crash, which under
-# synthetic rejection -- where the run reports the acceptance it was handed --
-# would be invisible. pp=2 has no middle stage.
-mr = (root / "v1/worker/gpu/model_runner.py").read_text()
-assert "supports_aux_hidden_states_over_pp" in mr, (
-    "the narrowed PP+spec refusal is missing; the blanket one may have been "
-    "removed without its replacement"
-)
-assert "pipeline_parallel_size=2" in mr, (
-    "the pp>2 refusal is gone; a middle stage could run and, under synthetic "
-    "acceptance, fail without showing it"
-)
-
-print(f"=== pp2 preflight: no PP refusal; pp=2 spec accepted, pp>2 refused; "
-      f"PCP still refused ({len(pcp)} sites) ===")
-PY
+# The three scripts verify their own edits. This asks the different question:
+# does the image refuse the layout outright, before any of it matters. Kept in
+# its own file because the first inline version matched a substring rather than
+# a statement and failed six healthy jobs -- the file's docstring is that story.
+python3 /configs/patches/k3-pp2-preflight.py
 
 echo "=== v8-pp2 ready: v8 + int64idx + mambacache + dspark-pp-828 ==="
