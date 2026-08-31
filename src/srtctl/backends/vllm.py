@@ -505,6 +505,12 @@ class VLLMProtocol:
         from srtctl.core.topology import NodePortAllocator, Process, endpoints_to_processes
 
         if frontend_type == "vllm":
+            # Direct `vllm serve` spans nodes with --nnodes/--node-rank, so the
+            # one-process-per-node layout this already returns is what we want.
+            # 802ead08 rejected data-parallel layouts here on the grounds that DP
+            # needs a router; on this branch it does not -- `vllm serve` manages
+            # local DP ranks from one process, which TestVLLMDataParallelMode
+            # covers -- so that rejection is not carried.
             return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
 
         # Check if any endpoint uses DP mode
@@ -717,8 +723,6 @@ class VLLMProtocol:
         if frontend_type == "vllm":
             if mode != "agg":
                 raise ValueError("frontend.type: vllm supports aggregate vLLM jobs only")
-            if is_multi_node:
-                raise ValueError("frontend.type: vllm currently supports single-node aggregate jobs only")
 
             config.pop("host", None)
             config.pop("port", None)
@@ -740,7 +744,28 @@ class VLLMProtocol:
                 device_ids = ",".join(str(i) for i in sorted(process.gpu_indices))
                 if device_ids:
                     cmd.extend(["--device-ids", device_ids])
+            if is_multi_node:
+                # `vllm serve` spans nodes itself: rank 0 serves the OpenAI API and the
+                # other ranks join headless. No router process is involved.
+                node_rank = endpoint_nodes.index(process.node)
+                cmd.extend(
+                    [
+                        "--master-addr",
+                        leader_ip,
+                        "--nnodes",
+                        str(len(endpoint_nodes)),
+                        "--node-rank",
+                        str(node_rank),
+                    ]
+                )
+                if node_rank > 0:
+                    cmd.append("--headless")
             cmd.extend(_config_to_cli_args(config))
+            if is_multi_node:
+                # Same reason as the dynamo multi-node path below: an inherited
+                # VLLM_PORT seeds vLLM's cross-node message-queue allocator, so every
+                # local TP worker starts from the same base and they race on bind.
+                cmd = ["env", "-u", "VLLM_PORT"] + cmd
             return cmd
 
         # Base command - use dynamo.vllm module

@@ -1648,8 +1648,6 @@ class SrtConfig:
             raise ValidationError("frontend.type: vllm supports aggregate jobs only, not disaggregated layouts")
         if self.resources.num_agg < 1:
             raise ValidationError("frontend.type: vllm requires resources.agg_workers >= 1")
-        if (self.resources.agg_nodes or 1) != 1:
-            raise ValidationError("frontend.type: vllm currently supports single-node aggregate jobs only")
 
     def _validate_het_jobs(self):
         """When ``resources.het_jobs`` is set to True, enforce supported shape.
