@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v8, plus the three fixes a second pipeline stage needs.
+# v8, plus the four fixes a second pipeline stage needs.
 # =============================================================================
 # WHY THIS EXISTS. The B300 AGG ladder runs TP8 on eight chips because the model
 # fits: K3 MXFP4 is 1,454 GiB, /8 = 181.7 GiB per chip against B300's 288. On
@@ -9,7 +9,7 @@
 # find out whether the extra node buys anything above c70, where the eight-chip
 # ladder turns over (12,074 -> 10,911 -> 7,952 at c70/c78/c86).
 #
-# THREE FIXES, ALL LOAD-BEARING, NONE UPSTREAM. They come from the B200 PP2
+# FOUR FIXES, ALL LOAD-BEARING, NONE UPSTREAM. They come from the B200 PP2
 # line, which has run them for days; they are carried rather than re-derived.
 #
 # 1. int64idx. _store_cache_checkpoints_kernel loads state_idx from an int32
@@ -28,6 +28,13 @@
 #    so with PP2 the config the cache answers for is provably not the config in
 #    hand, and capture dies on `expected 3 block tables, got 4`. This is the one
 #    that is PP-caused rather than PP-triggered.
+#
+# 4. dcp-dummy-seqlens. The MLA builder's DCP branch substitutes
+#    dcp_local_seq_lens for seq_lens unconditionally, and the dummy batch
+#    that data parallelism runs on idle ranks leaves that field None. It
+#    needs DP, DCP > 1 and MLA cudagraph capture at once, which is why it
+#    only appeared when DEP arrived. A no-op without DP, so it rides in the
+#    one chain rather than forking it.
 #
 # 3. dspark-pp-828. The nightly refuses speculation under PP outright --
 #    `{method} with pipeline parallel is not supported` in model_runner.py --
@@ -76,12 +83,13 @@ HERE="$(dirname "${BASH_SOURCE[0]}")"
 # Everything the eight-chip control runs: deps, the six commits, the marker
 # assertions and the Mooncake DCP hit-boundary tests. Held identical on purpose
 # -- the PP2 arms are meant to differ from their controls in the layout and in
-# these three fixes, and in nothing else.
+# these four fixes, and in nothing else.
 bash "$HERE/kimi-k3-nightly-v8.sh"
 
 bash /configs/patches/vllm-container-deps-k3-int64idx.sh
 bash /configs/patches/vllm-container-deps-k3-mambacache.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pp-828.sh
+bash /configs/patches/vllm-container-deps-k3-dcp-dummy-seqlens.sh
 
 
 # The three scripts verify their own edits. This asks the different question:
@@ -90,4 +98,4 @@ bash /configs/patches/vllm-container-deps-k3-dspark-pp-828.sh
 # a statement and failed six healthy jobs -- the file's docstring is that story.
 python3 /configs/patches/k3-pp2-preflight.py
 
-echo "=== v8-pp2 ready: v8 + int64idx + mambacache + dspark-pp-828 ==="
+echo "=== v8-pp2 ready: v8 + int64idx + mambacache + dspark-pp-828 + dcp-dummy-seqlens ==="
