@@ -96,6 +96,7 @@ bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 bash /configs/patches/vllm-container-deps-k3-pr53803-829.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-829.sh
 bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
+bash /configs/patches/vllm-container-deps-k3-dpspec-829.sh
 
 echo "=== k3-pp: apply k3-engine-0829 ==="
 
@@ -229,6 +230,15 @@ if "block_strides" not in src(
 if "to(tl.int64)" not in src("vllm/models/kimi_k3/nvidia/kda.py"):
     fail.append("the checkpoint-index int64 cast is missing; the store wraps "
                 "negative past state_idx 4854 and faults ~20 min in")
+# The memory-profiling path handed the draft model the target's dp_sync, sized
+# for max_num_batched_tokens, while the draft runs num_reqs x num_query_per_req.
+# DPMetadata.make then compares two models' numbers -- "AssertionError:
+# 16384 896" at engine init on TP1 x DP16 (65537819). DPMetadata is only built
+# when DP > 1, so this is invisible on every TP8/DP1 arm.
+if "num_tokens_across_dp=None" not in src(
+        "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"):
+    fail.append("the DFlash profile-path DP fix is missing; any DSpark arm "
+                "with decode DP > 1 dies at engine init in DPMetadata.make")
 
 if fail:
     sys.exit("[k3-pp] FATAL:\n  - " + "\n  - ".join(fail))
