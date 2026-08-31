@@ -664,29 +664,42 @@ class VLLMProtocol:
                     f"endpoint's {endpoint.total_gpus} allocated GPUs"
                 )
 
-            # per_node launching gives each node one process that owns the DP
-            # ranks resident on it, so a rank must fit inside a node. When
-            # tp_size exceeds the node's GPU count a rank straddles nodes and
-            # this floors to 0 -- which used to surface far downstream as
-            # "KV-event port block size must be at least 1", and would have gone
-            # on to pass --data-parallel-size-local 0 to vLLM.
+            # per_node launching gives each node one process. Two shapes:
+            #
+            #   rank fits in a node   -> that node owns gpus_on_node/gpus_per_rank
+            #                            whole DP ranks
+            #   rank spans nodes      -> nodes_per_rank nodes together own ONE rank
+            #
+            # vLLM models the second itself: nnodes_within_dp is
+            # nnodes / (data_parallel_size / data_parallel_size_local), and it
+            # builds a separate _INNER_DP_WORLD group when that is > 1
+            # (parallel_state.py). The CLI branches on node_rank_within_dp, which
+            # it derives as node_rank % nnodes_within_dp -- so all srtctl has to
+            # do is report the global node rank and nnodes honestly, and let vLLM
+            # place the node inside its rank.
+            #
+            # The only assert against nnodes_within_dp > 1 in vLLM is on the
+            # Elastic EP path, which this does not use.
             gpus_on_node = len(endpoint.gpu_indices)
             if gpus_per_rank > gpus_on_node:
-                raise ValueError(
-                    f"{endpoint.mode} tensor-parallel-size={tp_size} x "
-                    f"pipeline-parallel-size={pp_size} needs {gpus_per_rank} GPUs, more "
-                    f"than the {gpus_on_node} on a node, so a data-parallel rank would "
-                    f"span nodes. dp_launch_mode=per_node cannot express that; keep "
-                    f"tensor-parallel-size x pipeline-parallel-size <= {gpus_on_node}, or "
-                    f"drop data-parallel-size and let the endpoint run as plain TP/PP "
-                    f"across nodes."
-                )
-            local_dp_size = gpus_on_node // gpus_per_rank
+                if gpus_per_rank % gpus_on_node:
+                    raise ValueError(
+                        f"{endpoint.mode} tensor-parallel-size={tp_size} x "
+                        f"pipeline-parallel-size={pp_size} = {gpus_per_rank} GPUs per "
+                        f"data-parallel rank does not divide into the {gpus_on_node} on "
+                        f"a node, so a rank would own part of one. Make tp x pp a "
+                        f"multiple of the node's GPU count."
+                    )
+                nodes_per_rank = gpus_per_rank // gpus_on_node
+                local_dp_size = 1
+            else:
+                nodes_per_rank = 1
+                local_dp_size = gpus_on_node // gpus_per_rank
             dp_rpc_port = port_allocator.next_dp_rpc_port(endpoint.leader_node)
             nixl_base_port = port_allocator.next_nixl_port_block(dp_size)
             dp_start_rank = 0
 
-            for node in endpoint.nodes:
+            for node_index, node in enumerate(endpoint.nodes, start=1):
                 processes.append(
                     Process(
                         node=node,
@@ -706,7 +719,10 @@ class VLLMProtocol:
                     )
                 )
                 current_sys_port += 1
-                dp_start_rank += local_dp_size
+                # A rank is finished only after nodes_per_rank nodes; the
+                # start rank advances then, not on every node.
+                if node_index % nodes_per_rank == 0:
+                    dp_start_rank += local_dp_size
 
         return processes
 
@@ -863,10 +879,15 @@ class VLLMProtocol:
             config.pop("data_parallel_hybrid_lb", None)
             config.pop("headless", None)
 
+            # A rank's footprint is tp * pp, so size-local counts whole ranks on
+            # this node -- and is 1, not a fraction, when the rank spans nodes.
+            gpus_per_rank = self._get_tp_size(mode) * self._get_pp_size(mode)
+            gpus_on_node = len(process.gpu_indices)
+            spans_nodes = gpus_per_rank > gpus_on_node
             cmd.extend(
                 [
                     "--data-parallel-size-local",
-                    str(len(process.gpu_indices) // self._get_tp_size(mode)),
+                    str(1 if spans_nodes else gpus_on_node // gpus_per_rank),
                     "--data-parallel-start-rank",
                     str(process.node_rank),
                     "--data-parallel-address",
@@ -876,6 +897,21 @@ class VLLMProtocol:
                     "--data-parallel-hybrid-lb",
                 ]
             )
+            if spans_nodes:
+                # vLLM derives node_rank_within_dp as node_rank % nnodes_within_dp
+                # and nnodes_within_dp from nnodes and data_parallel_size_local,
+                # so it only needs the GLOBAL node rank and the endpoint's node
+                # count. Getting these wrong does not crash -- it silently places
+                # a node in the wrong rank -- which is why test_vllm_dp_spans_nodes
+                # pins the mapping rather than trusting this comment.
+                cmd.extend(
+                    [
+                        "--nnodes",
+                        str(len(endpoint_nodes)),
+                        "--node-rank",
+                        str(endpoint_nodes.index(process.node)),
+                    ]
+                )
         elif is_dp_mode:
             # DP+EP mode: each GPU runs its own process
             # process.node_rank is the dp_rank (set in endpoints_to_processes)

@@ -107,22 +107,26 @@ class TestValidation:
         else:
             raise AssertionError("expected a ValueError for dp4 on 8 GPUs")
 
-    def test_rejects_a_rank_that_would_span_nodes(self):
+    def test_a_rank_that_spans_nodes_is_laid_out_not_refused(self):
         """tp8 x dp2 on 4-GPU nodes: a rank straddles two nodes.
 
-        per_node launching gives each node one process owning its resident
-        ranks, so a rank has to fit inside a node. This shape used to floor
-        local_dp_size to 0 and surface as "KV-event port block size must be at
-        least 1" from the port allocator -- eight GB300 arms died on that
-        before the shape itself was named.
+        This shape used to floor local_dp_size to 0 and surface as "KV-event port
+        block size must be at least 1" from the port allocator -- eight GB300 arms
+        died on that before the shape was named -- and was then refused outright.
+        It is now laid out, because vLLM supports it: nnodes_within_dp is
+        nnodes / (data_parallel_size / data_parallel_size_local) and it builds a
+        separate _INNER_DP_WORLD group when that exceeds one.
+
+        What must never come back is the zero. Two nodes make up each of the two
+        ranks, so every node reports one whole rank and the start ranks pair as
+        0, 0, 1, 1. The full flag mapping is pinned in test_vllm_dp_spans_nodes.
         """
         backend = _backend(**{"data-parallel-size": 2, "tensor-parallel-size": 8})
         endpoint = _endpoint("decode", ("node0", "node1", "node2", "node3"), gpus_per_node=4)
 
-        try:
-            backend.endpoints_to_processes([endpoint])
-        except ValueError as exc:
-            assert "would span" in str(exc), exc
-            assert "tensor-parallel-size=8" in str(exc), exc
-        else:
-            raise AssertionError("expected a ValueError for a node-spanning DP rank")
+        processes = backend.endpoints_to_processes([endpoint])
+
+        assert [p.node_rank for p in processes] == [0, 0, 1, 1]
+        assert all(p.kv_events_port > 0 for p in processes), (
+            "a zero-width KV-event block is the failure this shape used to produce"
+        )
