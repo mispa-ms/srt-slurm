@@ -489,6 +489,18 @@ class VLLMProtocol:
         config = self.get_config_for_mode(mode)
         return int(config.get("tensor-parallel-size") or config.get("tensor_parallel_size") or 1)
 
+    def _get_pp_size(self, mode: WorkerMode) -> int:
+        """Pipeline-parallel degree for a mode, defaulting to 1.
+
+        A rank's GPU footprint is ``tp_size * pp_size``: PP shards layers over
+        additional GPUs, so leaving it out of the accounting under-counts the
+        endpoint and rejects a valid layout.
+        """
+        config = self.get_config_for_mode(mode)
+        return int(
+            config.get("pipeline-parallel-size") or config.get("pipeline_parallel_size") or 1
+        )
+
     def should_set_cuda_visible_devices(self, process: Process) -> bool:
         """Whether worker_stage should set CUDA_VISIBLE_DEVICES.
 
@@ -640,11 +652,16 @@ class VLLMProtocol:
                 continue
 
             tp_size = self._get_tp_size(endpoint.mode)
-            dp_size = self._get_dp_size(endpoint.mode) or endpoint.total_gpus // tp_size
-            if dp_size * tp_size != endpoint.total_gpus:
+            pp_size = self._get_pp_size(endpoint.mode)
+            gpus_per_rank = tp_size * pp_size
+            dp_size = (
+                self._get_dp_size(endpoint.mode) or endpoint.total_gpus // gpus_per_rank
+            )
+            if dp_size * gpus_per_rank != endpoint.total_gpus:
                 raise ValueError(
                     f"{endpoint.mode} data-parallel-size={dp_size} x tensor-parallel-size="
-                    f"{tp_size} does not match the endpoint's {endpoint.total_gpus} allocated GPUs"
+                    f"{tp_size} x pipeline-parallel-size={pp_size} does not match the "
+                    f"endpoint's {endpoint.total_gpus} allocated GPUs"
                 )
 
             # per_node launching gives each node one process that owns the DP
@@ -654,15 +671,17 @@ class VLLMProtocol:
             # "KV-event port block size must be at least 1", and would have gone
             # on to pass --data-parallel-size-local 0 to vLLM.
             gpus_on_node = len(endpoint.gpu_indices)
-            if tp_size > gpus_on_node:
+            if gpus_per_rank > gpus_on_node:
                 raise ValueError(
-                    f"{endpoint.mode} tensor-parallel-size={tp_size} exceeds the "
-                    f"{gpus_on_node} GPUs on a node, so a data-parallel rank would span "
-                    f"nodes. dp_launch_mode=per_node cannot express that; use "
-                    f"tensor-parallel-size <= {gpus_on_node}, or drop data-parallel-size "
-                    f"and let the endpoint run as plain TP across nodes."
+                    f"{endpoint.mode} tensor-parallel-size={tp_size} x "
+                    f"pipeline-parallel-size={pp_size} needs {gpus_per_rank} GPUs, more "
+                    f"than the {gpus_on_node} on a node, so a data-parallel rank would "
+                    f"span nodes. dp_launch_mode=per_node cannot express that; keep "
+                    f"tensor-parallel-size x pipeline-parallel-size <= {gpus_on_node}, or "
+                    f"drop data-parallel-size and let the endpoint run as plain TP/PP "
+                    f"across nodes."
                 )
-            local_dp_size = gpus_on_node // tp_size
+            local_dp_size = gpus_on_node // gpus_per_rank
             dp_rpc_port = port_allocator.next_dp_rpc_port(endpoint.leader_node)
             nixl_base_port = port_allocator.next_nixl_port_block(dp_size)
             dp_start_rank = 0
