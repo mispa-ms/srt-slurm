@@ -97,6 +97,7 @@ bash /configs/patches/vllm-container-deps-k3-pr53803-829.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-829.sh
 bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
 bash /configs/patches/vllm-container-deps-k3-dpspec-829.sh
+bash /configs/patches/vllm-container-deps-k3-fullblock-829.sh
 
 echo "=== k3-pp: apply k3-engine-0829 ==="
 
@@ -239,6 +240,13 @@ if "num_tokens_across_dp=None" not in src(
         "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"):
     fail.append("the DFlash profile-path DP fix is missing; any DSpark arm "
                 "with decode DP > 1 dies at engine init in DPMetadata.make")
+# Opt-in only; the gate must exist even when the env var is unset, or the
+# prefix replay silently measures re-prefill (46.9% wave-2 recovery instead of
+# 99.8%) and decode runs at a batch of one or two.
+if "VLLM_K3_FORCE_FULL_BLOCK_PREFIX_HITS" not in src(
+        "vllm/v1/core/kv_cache_coordinator.py"):
+    fail.append("the full-block prefix-hit escape hatch is missing; the "
+                "prefix replay cannot be made valid under DCP on this image")
 
 if fail:
     sys.exit("[k3-pp] FATAL:\n  - " + "\n  - ".join(fail))

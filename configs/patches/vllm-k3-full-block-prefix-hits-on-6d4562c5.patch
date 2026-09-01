@@ -1,0 +1,34 @@
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index c097542f89..d4d373bd74 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import ABC, abstractmethod
+ from collections.abc import Sequence
+ from typing import NamedTuple
+ 
+@@ -634,8 +635,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             )
+             for g in kv_cache_config.kv_cache_groups
+         )
+         self.enable_partial_hash_hits = has_partial_mamba_group
++        # Escape hatch for the K3 disagg prefix-replay measurement.
++        # #50493 made partial (fine-grained) prefix-cache hits reachable under
++        # DCP; before it this was `dcp_world_size == 1 and ...`, so a TP8 x DCP8
++        # prefill took the full-block path. The fine-grained finder scans hash
++        # units strictly below max_length with no full-block phase, so when
++        # speculation's eagle drop lowers the ceiling by one hash unit the only
++        # retained Mamba boundary is stranded and the probe returns 0 rather
++        # than degrading. Measured on GB300 1P1D at ISL 131072: wave-2 recovery
++        # 99.8% before #50493, 46.9% after.
++        # Opt-in only, and it does not remove the DCP branch above -- upstream
++        # behaviour is unchanged unless the variable is set.
++        if os.environ.get("VLLM_K3_FORCE_FULL_BLOCK_PREFIX_HITS", "0") == "1":
++            self.enable_partial_hash_hits = False
+         if self.enable_partial_hash_hits:
+             unsupported_partial_hit_managers = {
+                 type(manager).__name__
+                 for manager in self.single_type_managers
