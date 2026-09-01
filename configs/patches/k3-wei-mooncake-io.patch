@@ -114,7 +114,7 @@ index d8ed4dee0a..1630a4e73a 100644
              size_list.append(self.block_len[index % length])
          return addr_list, size_list
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index ff85e8253c..ce7812a3a2 100644
+index ff85e8253c..89132cc2e5 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 @@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
@@ -125,15 +125,17 @@ index ff85e8253c..ce7812a3a2 100644
  import json
  import os
  import queue
-@@ -71,6 +72,7 @@ from vllm.v1.core.kv_cache_utils import (
+@@ -71,7 +72,9 @@ from vllm.v1.core.kv_cache_utils import (
      resolve_kv_cache_block_sizes,
  )
  from vllm.v1.kv_cache_interface import (
 +    AttentionSpec,
      KVCacheConfig,
++    KVCacheGroupSpec,
      KVCacheSpec,
      MambaSpec,
-@@ -79,7 +81,6 @@ from vllm.v1.kv_cache_interface import (
+     MLAAttentionSpec,
+@@ -79,7 +82,6 @@ from vllm.v1.kv_cache_interface import (
      UniformTypeKVCacheSpecs,
      group_kernel_blocks,
  )
@@ -141,7 +143,7 @@ index ff85e8253c..ce7812a3a2 100644
  from .metrics import MooncakeStoreConnectorStats
  
  logger = init_logger(__name__)
-@@ -89,6 +90,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+@@ -89,6 +91,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
  DEFAULT_TENANT_ID = "default"
  
  MOONCAKE_NO_AVAILABLE_HANDLE = -200
@@ -149,7 +151,7 @@ index ff85e8253c..ce7812a3a2 100644
  _T = TypeVar("_T")
  
  
-@@ -112,6 +114,179 @@ def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
+@@ -112,6 +115,179 @@ def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
      return f"vllm-mooncake-store:{prefix}{metadata.model_name}@{chunk_hash}"
  
  
@@ -329,7 +331,7 @@ index ff85e8253c..ce7812a3a2 100644
  # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
  DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
  
-@@ -1135,6 +1310,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1135,6 +1311,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          tp_rank: int,
          ready_event: threading.Event,
          disk_offload_buffer_budget_bytes: int | None = None,
@@ -337,7 +339,7 @@ index ff85e8253c..ce7812a3a2 100644
          record_operation: Callable[..., None] | None = None,
          request_queue: queue.Queue[Any] | None = None,
      ):
-@@ -1152,6 +1328,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1152,6 +1329,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          self._invalid_block_ids_lock = threading.Lock()
          self._invalid_block_ids: set[int] = set()
          self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
@@ -347,7 +349,7 @@ index ff85e8253c..ce7812a3a2 100644
          self.usable_disk_offload_buffer_budget_bytes = (
              None
              if disk_offload_buffer_budget_bytes is None
-@@ -1272,11 +1451,35 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1272,11 +1452,35 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                      )
                      block_id_offset = next_block_id_offset
  
@@ -384,7 +386,7 @@ index ff85e8253c..ce7812a3a2 100644
                  current_batch_keys = batch_keys
                  current_batch_block_ids = batch_block_ids
                  batch_bytes = _sum_batch_bytes(batch_sizes)
-@@ -1308,8 +1511,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1308,8 +1512,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                      num_failed_keys=len(failed),
                  )
                  if failed:
@@ -399,7 +401,7 @@ index ff85e8253c..ce7812a3a2 100644
                      )
                      logger.warning(
                          "Failed to get %d Mooncake keys from sub-batch "
-@@ -1320,7 +1529,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -1320,7 +1530,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                      )
                      break
          except Exception as e:
@@ -415,7 +417,7 @@ index ff85e8253c..ce7812a3a2 100644
              self._record_operation(
                  "load_get",
                  load_get_start,
-@@ -1383,6 +1599,15 @@ class MooncakeStoreWorker:
+@@ -1383,6 +1600,15 @@ class MooncakeStoreWorker:
          assert kv_role is not None
          self.kv_role = kv_role
          extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
@@ -431,7 +433,7 @@ index ff85e8253c..ce7812a3a2 100644
          self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
              extra_config.get("save_decode_cache", False)
          )
-@@ -1494,6 +1719,12 @@ class MooncakeStoreWorker:
+@@ -1494,6 +1720,12 @@ class MooncakeStoreWorker:
          # Pool of load-receive threads
          self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
          self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
@@ -444,7 +446,7 @@ index ff85e8253c..ce7812a3a2 100644
          self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
          self.finished_store_req: set[str] = set()
          self._kv_connector_stats_lock = threading.Lock()
-@@ -1539,17 +1770,25 @@ class MooncakeStoreWorker:
+@@ -1539,17 +1771,25 @@ class MooncakeStoreWorker:
          # key namespace is its TP shard id: ranks holding identical bytes
          # (MLA / shared GQA KV heads) share a namespace, TP-sharded Mamba
          # state gets one namespace per rank.
@@ -475,7 +477,7 @@ index ff85e8253c..ce7812a3a2 100644
          )
          self._group_tp_replication_factors: tuple[int, ...] = (
              self._compute_group_tp_replication_factors()
-@@ -1645,6 +1884,20 @@ class MooncakeStoreWorker:
+@@ -1645,6 +1885,20 @@ class MooncakeStoreWorker:
          assert self.cache_config.num_gpu_blocks is not None
          self.num_blocks = self.cache_config.num_gpu_blocks
  
@@ -496,7 +498,7 @@ index ff85e8253c..ce7812a3a2 100644
          seen_storage_ptrs: set[int] = set()
          seen_region_ptrs: set[int] = set()
          addrs: list[int] = []
-@@ -1706,9 +1959,31 @@ class MooncakeStoreWorker:
+@@ -1706,9 +1960,31 @@ class MooncakeStoreWorker:
              self.num_blocks,
          )
  
@@ -531,7 +533,7 @@ index ff85e8253c..ce7812a3a2 100644
  
          # Start transfer threads
          if self.can_put:
-@@ -1742,6 +2017,7 @@ class MooncakeStoreWorker:
+@@ -1742,6 +2018,7 @@ class MooncakeStoreWorker:
                  self.tp_rank,
                  ready_event_recving,
                  disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,

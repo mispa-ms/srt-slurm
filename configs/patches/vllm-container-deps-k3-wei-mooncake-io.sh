@@ -29,6 +29,15 @@
 # nothing until a config sets them, which is what makes it safe to put in the
 # chain and price separately.
 #
+# ONE LINE HERE IS NOT WEI'S. The compact helpers annotate their parameters with
+# KVCacheGroupSpec, which his 08-26 base imported in this file and the 08-28
+# nightly does not, so the import has to be added or every arm dies at module
+# import with NameError. The first submission did die that way, on both AGG
+# points, because the local check before it was `python -m py_compile` -- which
+# parses and never resolves a name. `ruff check --select F821` does, and reports
+# three errors on the version that shipped. Check that, not py_compile, before
+# trusting a port of a patch across a base.
+#
 # WHAT IS NOT HERE, AND WHY. Wei's branch has 28 commits. Six more touch Mooncake
 # and four of those collide with our own carry, which reworks the same
 # connector/coordinator/worker for DCP hit boundaries:
