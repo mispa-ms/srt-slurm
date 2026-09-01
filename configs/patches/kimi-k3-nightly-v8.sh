@@ -33,7 +33,17 @@ set -euo pipefail
 
 # The nightly this patch was generated against: vllm/vllm-openai:nightly-3ee2df3033...
 readonly PINNED_SHA=6f7df92a8e
-readonly PATCH=/configs/patches/k3-ours6-v8-nightly.patch
+
+# Two switches, both defaulting to what this script has always done, so every
+# existing arm is unchanged. They exist for one caller:
+# kimi-k3-nightly-v8-mc53324.sh, which swaps our Mooncake DCP carry for upstream
+# vllm#53324. That swap cannot be expressed as another patch on top -- ours and
+# #53324 rewrite the same functions -- so the carry has to be applied without
+# its three Mooncake files, and the Mooncake assertions below have to move to
+# the script that knows which contract is live. Anything else that sets these
+# is doing something wrong.
+readonly PATCH=${K3_OURS_PATCH:-/configs/patches/k3-ours6-v8-nightly.patch}
+readonly SKIP_MC_CHECKS=${K3_SKIP_MOONCAKE_CHECKS:-0}
 
 export FI_VER=0.6.16.post3
 # Our commits are applied below, after this returns, so the deps script must
@@ -102,17 +112,32 @@ assert not missing, f"patch applied but markers are missing: {missing}"
 # Mooncake under DCP: the refusal must be gone, PCP must still be refused, and
 # #50359's retry must be present -- without it a fine-grained hit lands inside a
 # dcp-scaled attention block and every load of it is -704.
-mc = root / "distributed/kv_transfer/kv_connector/v1/mooncake/store"
-conn = (mc / "connector.py").read_text()
-fn = next(n for n in ast.walk(ast.parse(conn))
-          if isinstance(n, ast.FunctionDef) and n.name == "_validate_kv_cache_config")
-dcp_refusals = [ast.unparse(n.test) for n in ast.walk(fn)
-                if isinstance(n, ast.If) and "dcp" in ast.unparse(n.test)]
-assert not dcp_refusals, f"a DCP refusal survives in the connector: {dcp_refusals}"
-assert "pcp > 1" in conn, "the PCP refusal was dropped; it is not covered by this change"
-assert "_exact_partial_hit_key_exists" in (mc / "coordinator.py").read_text(), (
-    "vllm#50359's exact-boundary retry is missing"
-)
+#
+# Skipped only by the #53324 swap arm, which removes our Mooncake carry and so
+# genuinely does not have _exact_partial_hit_key_exists -- that helper is ours.
+# Its own script asserts the equivalent #53324 contract instead, and asserts it
+# before any GPU time, in the same place. Do not skip these to make a red run
+# green: on this connector "the patch is present" and "the patch is right" have
+# already diverged once, at a cost of 2,757,664 -704s.
+import os  # noqa: E402
+
+if os.environ.get("K3_SKIP_MOONCAKE_CHECKS", "0") != "1":
+    mc = root / "distributed/kv_transfer/kv_connector/v1/mooncake/store"
+    conn = (mc / "connector.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(conn))
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_validate_kv_cache_config")
+    dcp_refusals = [ast.unparse(n.test) for n in ast.walk(fn)
+                    if isinstance(n, ast.If) and "dcp" in ast.unparse(n.test)]
+    assert not dcp_refusals, f"a DCP refusal survives in the connector: {dcp_refusals}"
+    assert "pcp > 1" in conn, (
+        "the PCP refusal was dropped; it is not covered by this change"
+    )
+    assert "_exact_partial_hit_key_exists" in (mc / "coordinator.py").read_text(), (
+        "vllm#50359's exact-boundary retry is missing"
+    )
+else:
+    print("=== mooncake carry checks skipped: the #53324 swap arm owns them ===")
 
 # Upstream's own uniform-decode fix must be here, and ours must not be on top of
 # it -- #51865 takes has_prefill where our dropped carry took the token arrays.
@@ -159,5 +184,14 @@ PY
 # Mooncake DCP refusal the first time passed every one of them and then
 # livelocked with 2,757,664 OBJECT_NOT_FOUND (-704) failures. This asserts the
 # property that failure violates, before any GPU time.
-echo "=== mooncake DCP hit-boundary tests ==="
-python3 /configs/patches/test_mooncake_dcp_keyset.py
+#
+# Deferred, not dropped, on the #53324 swap arm: at this point that arm has the
+# carry minus its Mooncake files and #53324 is not on yet, so NEITHER of the two
+# contracts the test knows about holds. Its own script runs this same file
+# immediately after applying #53324, which is where it becomes meaningful.
+if [ "$SKIP_MC_CHECKS" = "1" ]; then
+    echo "=== mooncake DCP hit-boundary tests deferred to the #53324 swap ==="
+else
+    echo "=== mooncake DCP hit-boundary tests ==="
+    python3 /configs/patches/test_mooncake_dcp_keyset.py
+fi

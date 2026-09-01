@@ -1,0 +1,276 @@
+diff --git a/vllm/models/kimi_k3/nvidia/kda_metadata.py b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+index 748e5219a7..a0b9e4ae13 100644
+--- a/vllm/models/kimi_k3/nvidia/kda_metadata.py
++++ b/vllm/models/kimi_k3/nvidia/kda_metadata.py
+@@ -364,6 +364,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         assert isinstance(self.kv_cache_spec, MambaSpec)
++        self._check_block_table_width(m.block_table_tensor.shape[1])
+         # Equivalent PyTorch "align" path:
+         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
+         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
+@@ -728,6 +729,35 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+             checkpoint=checkpoint,
+         )
+ 
++    def _check_block_table_width(self, width: int) -> None:
++        """Fail at startup if the block table cannot hold the slot we index.
++
++        ``_get_aligned_state_indices_kernel`` reads column
++        ``(seq_lens - 1) // spec.block_size`` and its mask bounds only the row,
++        so a table narrower than ``max_num_blocks_per_req`` reads off the end of
++        the row and yields an arbitrary block id. That surfaces far away, either
++        as an index-out-of-bounds assert in whichever consumer touches the state
++        cache first or, when the stray id happens to be in range, as silently
++        wrong recurrent state. Neither names this as the cause, so check it once
++        where the contract is stated.
++        """
++        if getattr(self, "_block_table_width_checked", False):
++            return
++        self._block_table_width_checked = True
++        required = self.kv_cache_spec.max_num_blocks_per_req(
++            self.vllm_config, self.vllm_config.model_config.max_model_len
++        )
++        if width < required:
++            raise ValueError(
++                f"KDA block table is {width} columns but the state slot is "
++                f"indexed over {required} (max_model_len="
++                f"{self.vllm_config.model_config.max_model_len}, block_size="
++                f"{self.kv_cache_spec.block_size}). Mamba state is replicated "
++                f"across DCP ranks, so its block table must not be scaled by "
++                f"decode_context_parallel_size="
++                f"{self.vllm_config.parallel_config.decode_context_parallel_size}."
++            )
++
+ 
+ class KimiK3KDAAttentionBackend(GDNAttentionBackend):
+     @staticmethod
+diff --git a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+index ecab56dbe4..52e6aa0475 100644
+--- a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
++++ b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+@@ -725,6 +725,7 @@ class _KimiK3LowLatencyApply:
+     """Mixin: try the precomputed plan, else defer to the base method."""
+ 
+     def __init__(self, plan: dict[int, ResolvedCall]) -> None:
++        super().__init__()
+         self._plan = plan
+ 
+     def apply(
+diff --git a/vllm/v1/attention/backends/mla/tokenspeed_mla.py b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+index 31c16bd2b6..f40b11e5a6 100644
+--- a/vllm/v1/attention/backends/mla/tokenspeed_mla.py
++++ b/vllm/v1/attention/backends/mla/tokenspeed_mla.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
+ 
++import os
+ from typing import TYPE_CHECKING, ClassVar
+ 
+ import torch
+@@ -30,6 +31,14 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# OFF by default. Restored purely to answer one question with GSM8K: every
++# measurement showing DSpark accuracy-neutral (0.951 at DCP=1 and DCP=4, pipeline
++# 61661482) was taken with this block present, and the first measurement without
++# it came back 0.923 against 0.950 no-spec. It was removed on an acceptance A/B,
++# and acceptance is exactly what a "target sees the drafted KV" defect inflates,
++# so acceptance could not have settled it.
++_DCP_FLATTEN = os.environ.get("VLLM_TS_MLA_DCP_FLATTEN", "0") == "1"
++
+ # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
+ #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
+ # Matches the kernel's `get_workspace_size` formula. MAX_Q_LEN=8 covers up to
+@@ -262,9 +271,47 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
+         seq_lens = attn_metadata.decode.seq_lens
+         causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
+ 
++        # Per-query causal bounds for a causal multi-token block under DCP.
++        # causal_seqs is ONE global bound per request, but query j of a q_len
++        # block ending at global length L must see KV only up to
++        # L - (q_len - 1 - j). The kernel does compute that -- k_bound =
++        # ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world) -- which
++        # is why this was removed. Off by default; the flag exists so GSM8K can
++        # decide, because acceptance already gave the wrong answer once.
++        q_len_per_req = num_decode_tokens // num_decodes if num_decodes else 0
++        if (
++            _DCP_FLATTEN
++            and attn_metadata.causal
++            and self.dcp_world_size > 1
++            and q_len_per_req > 1
++            and num_decode_tokens % num_decodes == 0
++            and causal_seqs is not None
++        ):
++            offsets = torch.arange(
++                q_len_per_req - 1, -1, -1,
++                device=causal_seqs.device, dtype=causal_seqs.dtype,
++            )
++            per_q_global = torch.clamp(
++                (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1), min=0
++            )
++            # Rank-local length of each global bound, matching
++            # prepare_dcp_local_seq_lens in vllm/v1/worker/gpu/cp_utils.py.
++            interleave = self.cp_kv_cache_interleave_size
++            span = self.dcp_world_size * interleave
++            remainder = torch.clamp(
++                per_q_global % span - self.dcp_rank * interleave, min=0
++            )
++            seq_lens = (per_q_global // span) * interleave + torch.clamp(
++                remainder, max=interleave
++            )
++            causal_seqs = per_q_global
++            block_tables = block_tables.repeat_interleave(q_len_per_req, dim=0)
++            q = q.view(num_decodes * q_len_per_req, 1, q.shape[-2], q.shape[-1])
+         # tokenspeed_mla_decode expects query shape
+-        # (num_decodes, q_len_per_request, num_heads, head_dim).
+-        if num_decode_tokens % num_decodes != 0:
++        # (num_decodes, q_len_per_request, num_heads, head_dim). Standalone `if`,
++        # never chained to the block above: chaining skips the reshape on exactly
++        # the DCP multi-token path and the kernel gets a 3D query.
++        elif num_decode_tokens % num_decodes != 0:
+             logger.warning_once(
+                 """TokenspeedMLAImpl got a query of uneven length.
+                 This usually indicates an issue in batch reordering
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 51f75a63d6..d62fef384e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2928,14 +2928,37 @@ class Scheduler(SchedulerInterface):
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            # TODO (davidb): add support for hybrid memory allocator
+-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
++            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+             )
+ 
++            if len(req_block_id_groups) != 1:
++                # Mooncake reports load failures as physical block IDs without
++                # identifying the hybrid KV group. Attention and Mamba groups
++                # can use different logical block sizes, so there is no safe
++                # common token boundary at which to truncate them. Conservatively
++                # recompute the complete prefix for every matching hybrid request.
++                # This is a rare eviction-race path and preserves correctness.
++                req_hybrid_block_ids = {
++                    block_id
++                    for group_block_ids in req_block_id_groups
++                    for block_id in group_block_ids
++                }
++                if req_hybrid_block_ids.isdisjoint(invalid_block_ids):
++                    continue
++
++                request.num_computed_tokens = 0
++                total_affected_tokens += max(req_num_computed_tokens, 0)
++                if evict_blocks:
++                    blocks_to_evict.update(req_hybrid_block_ids)
++                affected_req_ids.add(req_id)
++                continue
++
++            (req_block_ids,) = req_block_id_groups
++
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 0a78c5e9c6..ca098dfbc0 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_coordinator import (
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
++    KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
+ )
+@@ -107,11 +108,8 @@ class SimpleCPUOffloadScheduler:
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+         # FA group's own block_size; divides scheduler_block_size (the LCM)
+         # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        self.fa_block_size: int = self._group_block_size(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec
+         )
+         assert self.block_size % self.fa_block_size == 0
+ 
+@@ -217,6 +215,22 @@ class SimpleCPUOffloadScheduler:
+             kv_cache_tensors=cpu_tensors,
+         )
+ 
++    def _group_block_size(self, spec: KVCacheSpec) -> int:
++        """Tokens one block of this group covers across the DCP ranks.
++
++        Mirrors ``resolve_kv_cache_block_sizes`` and the ``dcp_world_size`` that
++        ``HybridKVCacheCoordinator.find_longest_cache_hit`` passes down: DCP
++        shards the sequence for full-attention groups only, so a full-attention
++        block spans ``block_size * dcp`` tokens while a Mamba group keeps its
++        full per-rank state and spans ``block_size``. Scaling every group is a
++        no-op at dcp=1, which is why it went unnoticed; on a hybrid model at
++        dcp=4 it makes this manager take a quarter of the Mamba blocks it
++        should.
++        """
++        if isinstance(spec, FullAttentionSpec):
++            return spec.block_size * self.cp_world_size
++        return spec.block_size
++
+     @staticmethod
+     def _estimate_lazy_target_blocks(
+         kv_cache_config: "KVCacheConfig",
+@@ -268,6 +282,12 @@ class SimpleCPUOffloadScheduler:
+             remaining_hashes, max_hit_len
+         )
+ 
++        # update_state_after_alloc() indexes whole scheduler blocks per group and
++        # asserts that contract. Partial hash hits can return a finer length --
++        # under DCP the full-attention block is dcp x the hash block, so a hybrid
++        # model reports multiples of the hash block -- so re-align here. The
++        # surplus blocks stay pinned and are released with the rest.
++        hit_length = hit_length // self.block_size * self.block_size
+         if hit_length > 0:
+             pin_blocks = [
+                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
+@@ -351,9 +371,7 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+                 f"group {g} block_size={g_block_size}"
+@@ -372,9 +390,7 @@ class SimpleCPUOffloadScheduler:
+                 continue
+ 
+             # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-            )
++            g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+ 
+             # Back-trace: ext blocks sit at the tail of the computed range.
+@@ -591,9 +607,7 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+-                )
++                g_block_size = self._group_block_size(kv_cache_groups[g].kv_cache_spec)
+                 ready_blocks_g = aligned_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
