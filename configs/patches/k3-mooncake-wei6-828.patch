@@ -1,0 +1,661 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -184,6 +184,8 @@
+             )
+         self.kv_caches_base_addr: list[int] = []
+         self.block_len: list[int] = []
++        self.block_stride: list[int] = []
++        self._compact_regions = False
+         self._key_prefix = PoolKey.build_prefix(metadata)
+ 
+     def key_for(self, chunk_hash: BlockHash) -> str:
+@@ -194,6 +196,28 @@
+ 
+     def set_block_len(self, block_len: list[int]):
+         self.block_len = block_len
++        self.block_stride = block_len
++        self._compact_regions = False
++
++    def set_kv_cache_regions(
++        self,
++        base_addrs: list[int],
++        block_strides: list[int],
++        transfer_lens: list[int],
++    ) -> None:
++        if not (len(base_addrs) == len(block_strides) == len(transfer_lens)):
++            raise ValueError("KV cache region metadata lengths must match")
++        if any(length <= 0 for length in (*block_strides, *transfer_lens)):
++            raise ValueError("KV cache region strides and lengths must be positive")
++        if any(
++            length > stride
++            for stride, length in zip(block_strides, transfer_lens, strict=True)
++        ):
++            raise ValueError("KV cache transfer length cannot exceed block stride")
++        self.kv_caches_base_addr = base_addrs
++        self.block_stride = block_strides
++        self.block_len = transfer_lens
++        self._compact_regions = True
+ 
+     def prepare_value(
+         self, start: int, end: int, block_ids: list[int]
+@@ -226,19 +250,59 @@
+             [self.block_len[i % length] for i in range(base.shape[0])],
+             dtype=np.int64,
+         )
++        strides = np.asarray(
++            [
++                self.block_stride[i % len(self.block_stride)]
++                for i in range(base.shape[0])
++            ],
++            dtype=np.int64,
++        )
+         n = len(chunks)
+         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
+         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
+         assert not (spans % self.hash_block_size).any()
++        block_indices = starts // self.block_size
+         bids = np.fromiter(
+-            (block_ids[i] for i in (starts // self.block_size).tolist()),
++            (block_ids[i] for i in block_indices.tolist()),
+             dtype=np.int64,
+             count=n,
+         )
+-        addrs = base[None, :] + bids[:, None] * blen[None, :]
+         block_counts = (spans + self.block_size - 1) // self.block_size
+-        sizes = blen[None, :] * block_counts[:, None]
+-        return addrs.tolist(), sizes.tolist(), bids.tolist()
++        if self._compact_regions and (block_counts > 1).any():
++            raise ValueError(
++                "Compact Mooncake values must span exactly one database block"
++            )
++        addr_lists: list[list[int]] = []
++        size_lists: list[list[int]] = []
++        for block_index, count in zip(
++            block_indices.tolist(), block_counts.tolist(), strict=True
++        ):
++            chunk_block_ids = block_ids[block_index : block_index + count]
++            if len(chunk_block_ids) != count:
++                raise ValueError("Token range exceeds the supplied block IDs")
++            consecutive = all(
++                right == left + 1
++                for left, right in zip(chunk_block_ids, chunk_block_ids[1:])
++            )
++            if np.array_equal(strides, blen) and consecutive:
++                first_block_id = chunk_block_ids[0]
++                addr_lists.append(
++                    [
++                        int(addr + first_block_id * stride)
++                        for addr, stride in zip(base, strides, strict=True)
++                    ]
++                )
++                size_lists.append([int(size * count) for size in blen])
++                continue
++            addr_lists.append(
++                [
++                    int(addr + block_id * stride)
++                    for block_id in chunk_block_ids
++                    for addr, stride in zip(base, strides, strict=True)
++                ]
++            )
++            size_lists.append([int(size) for _ in range(count) for size in blen])
++        return addr_lists, size_lists, bids.tolist()
+ 
+     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+         """Return addresses and sizes for one physical block slot."""
+@@ -246,7 +310,7 @@
+         size_list = []
+         length = len(self.block_len)
+         for index, base_addr in enumerate(self.kv_caches_base_addr):
+-            addr = base_addr + block_id * self.block_len[index % length]
++            addr = base_addr + block_id * self.block_stride[index % length]
+             addr_list.append(addr)
+             size_list.append(self.block_len[index % length])
+         return addr_list, size_list
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -117,6 +117,17 @@
+         if request.num_tokens < align:
+             return 0, False
+ 
++        load_spec = self.load_specs.get(request.request_id)
++        if load_spec is not None and not load_spec.can_load:
++            need_to_allocate = (
++                load_spec.kvpool_cached_tokens - num_computed_tokens
++            )
++            if need_to_allocate <= 0:
++                self.load_specs.pop(request.request_id)
++                return 0, False
++            load_spec.vllm_cached_tokens = num_computed_tokens
++            return need_to_allocate, self.load_async
++
+         lookup_result = self.client.lookup(
+             request.request_id,
+             request.num_tokens,
+@@ -160,11 +171,13 @@
+         num_external_tokens: int,
+     ):
+         """Update state after block allocation."""
+-        local_block_ids: tuple[list[int], ...] = ()
+-        if num_external_tokens > 0:
+-            local_block_ids = self.kv_cache_config.select_transfer_block_ids(
+-                blocks.get_block_ids()
+-            )
++        # Wei's bb9afd1578: capture the block ids unconditionally. Under
++        # MultiConnector num_external_tokens is zero when another child was chosen
++        # to load, and the old guard then dropped the blocks so they were never
++        # stored. Our #53324 select_transfer_block_ids() wrapper is kept.
++        local_block_ids = self.kv_cache_config.select_transfer_block_ids(
++            blocks.get_block_ids()
++        )
+ 
+         self._unfinished_requests[request.request_id] = (request, local_block_ids)
+         self._unfinished_request_ids.add(request.request_id)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -11,6 +11,7 @@
+ """
+ 
+ import dataclasses
++import hashlib
+ import json
+ import os
+ import queue
+@@ -71,6 +72,7 @@
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheSpec,
+@@ -80,7 +82,6 @@
+     UniformTypeKVCacheSpecs,
+     group_kernel_blocks,
+ )
+-
+ from .metrics import MooncakeStoreConnectorStats
+ 
+ logger = init_logger(__name__)
+@@ -90,6 +91,7 @@
+ DEFAULT_TENANT_ID = "default"
+ 
+ MOONCAKE_NO_AVAILABLE_HANDLE = -200
++MOONCAKE_COMPACT_GROUP_IO_FORMAT = "compact-group-io-v1"
+ _T = TypeVar("_T")
+ 
+ 
+@@ -113,6 +115,179 @@
+     return f"vllm-mooncake-store:{prefix}{metadata.model_name}@{chunk_hash}"
+ 
+ 
++def _compact_group_io_schema_fingerprint(
++    groups: Sequence[KVCacheGroupSpec],
++    layout_name: str,
++    chunk_block_sizes: Sequence[int],
++    hash_block_size: int,
++) -> str:
++    if len(groups) != len(chunk_block_sizes):
++        raise ValueError("Compact Mooncake schema group metadata lengths must match")
++    schema = []
++    for group, chunk_block_size in zip(groups, chunk_block_sizes, strict=True):
++        layers = []
++        for layer_name in group.layer_names:
++            spec = _group_layer_spec(group, layer_name)
++            layers.append(
++                {
++                    "name": layer_name,
++                    "spec": f"{type(spec).__module__}.{type(spec).__qualname__}",
++                    "block_size": spec.block_size,
++                    "page_size": spec.page_size_bytes,
++                    "unpadded_page_size": _unpadded_page_size(spec),
++                    "state_content_size": spec.state_content_size_bytes,
++                    "num_heads": spec.num_heads,
++                    "dtype": str(getattr(spec, "dtype", None)),
++                    "shapes": getattr(spec, "shapes", None),
++                    "dtypes": [
++                        str(dtype) for dtype in getattr(spec, "dtypes", ())
++                    ],
++                    "page_size_padded": getattr(spec, "page_size_padded", None),
++                }
++            )
++        schema.append({"chunk_block_size": chunk_block_size, "layers": layers})
++    encoded = json.dumps(
++        {
++            "layout": layout_name,
++            "hash_block_size": hash_block_size,
++            "groups": schema,
++        },
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode()
++    return hashlib.sha256(encoded).hexdigest()[:32]
++
++
++def _compact_group_io_cache_prefix(
++    cache_prefix: str, layout_name: str, schema_fingerprint: str
++) -> str:
++    value_format = (
++        f"{MOONCAKE_COMPACT_GROUP_IO_FORMAT}-{layout_name.lower()}-"
++        f"{schema_fingerprint}"
++    )
++    if cache_prefix:
++        return f"{cache_prefix}|{value_format}"
++    return value_format
++
++
++def _group_layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
++    spec = group.kv_cache_spec
++    if isinstance(spec, UniformTypeKVCacheSpecs):
++        return spec.kv_cache_specs[layer_name]
++    return spec
++
++
++def _unpadded_page_size(spec: KVCacheSpec) -> int:
++    if isinstance(spec, AttentionSpec):
++        return spec.unpadded_page_size_bytes
++    if isinstance(spec, MambaSpec):
++        return dataclasses.replace(spec, page_size_padded=None).page_size_bytes
++    raise ValueError(f"Compact Mooncake I/O does not support {type(spec).__name__}")
++
++
++def _compact_regions_for_group(
++    group: KVCacheGroupSpec,
++    kv_caches: dict[str, torch.Tensor],
++    num_blocks: int,
++) -> tuple[list[int], list[int], list[int]]:
++    base_addrs: list[int] = []
++    block_strides: list[int] = []
++    transfer_lens: list[int] = []
++    seen: set[tuple[int, int, int]] = set()
++
++    def regions_overlap(
++        left: tuple[int, int, int], right: tuple[int, int, int]
++    ) -> bool:
++        left_base, left_stride, left_len = left
++        right_base, right_stride, right_len = right
++        left_end = left_base + (num_blocks - 1) * left_stride + left_len
++        right_end = right_base + (num_blocks - 1) * right_stride + right_len
++        if left_end <= right_base or right_end <= left_base:
++            return False
++        if left_stride == right_stride:
++            delta = right_base - left_base
++            min_offset = (-right_len - delta) // left_stride + 1
++            max_offset = (left_len - delta - 1) // left_stride
++            valid_offset = num_blocks - 1
++            return max(min_offset, -valid_offset) <= min(
++                max_offset, valid_offset
++            )
++        left_idx = right_idx = 0
++        while left_idx < num_blocks and right_idx < num_blocks:
++            left_start = left_base + left_idx * left_stride
++            right_start = right_base + right_idx * right_stride
++            if (
++                left_start < right_start + right_len
++                and right_start < left_start + left_len
++            ):
++                return True
++            if left_start + left_len <= right_start:
++                left_idx += 1
++            else:
++                right_idx += 1
++        return False
++
++    def add_region(base_addr: int, block_stride: int, transfer_len: int) -> None:
++        if transfer_len > block_stride:
++            raise ValueError(
++                "Compact Mooncake transfer length exceeds its block stride: "
++                f"length={transfer_len}, stride={block_stride}"
++            )
++        region = (base_addr, block_stride, transfer_len)
++        if region in seen:
++            return
++        for existing in seen:
++            if regions_overlap(existing, region):
++                raise ValueError(
++                    "Compact Mooncake regions overlap with different geometry: "
++                    f"{existing} and {region}"
++                )
++        seen.add(region)
++        base_addrs.append(base_addr)
++        block_strides.append(block_stride)
++        transfer_lens.append(transfer_len)
++
++    for layer_name in group.layer_names:
++        cache = kv_caches.get(layer_name)
++        if cache is None:
++            raise ValueError(
++                f"KV cache group layer {layer_name!r} has no registered tensor"
++            )
++        cache = group_kernel_blocks(cache, num_blocks)
++        spec = _group_layer_spec(group, layer_name)
++        transfer_len = _unpadded_page_size(spec)
++        element_size = cache.element_size()
++        if is_non_overlapping_and_dense(cache[0]):
++            add_region(
++                cache.data_ptr(),
++                cache.stride(0) * element_size,
++                transfer_len,
++            )
++            continue
++
++        num_head_regions = cache.shape[1]
++        if transfer_len % num_head_regions:
++            raise ValueError(
++                "Compact Mooncake page cannot be divided across head regions: "
++                f"page={transfer_len}, heads={num_head_regions}"
++            )
++        head_transfer_len = transfer_len // num_head_regions
++        for head_idx in range(num_head_regions):
++            head_cache = cache[:, head_idx]
++            if not is_non_overlapping_and_dense(head_cache[0]):
++                raise ValueError(
++                    "Compact Mooncake I/O only supports one scattered head "
++                    "dimension"
++                )
++            add_region(
++                head_cache.data_ptr(),
++                head_cache.stride(0) * element_size,
++                head_transfer_len,
++            )
++
++    return base_addrs, block_strides, transfer_lens
++
++
+ # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
+ DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
+ 
+@@ -1136,6 +1311,7 @@
+         tp_rank: int,
+         ready_event: threading.Event,
+         disk_offload_buffer_budget_bytes: int | None = None,
++        max_load_batch_keys: int | None = None,
+         record_operation: Callable[..., None] | None = None,
+         request_queue: queue.Queue[Any] | None = None,
+     ):
+@@ -1153,6 +1329,9 @@
+         self._invalid_block_ids_lock = threading.Lock()
+         self._invalid_block_ids: set[int] = set()
+         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
++        if max_load_batch_keys is not None and max_load_batch_keys <= 0:
++            raise ValueError("max_load_batch_keys must be positive")
++        self.max_load_batch_keys = max_load_batch_keys
+         self.usable_disk_offload_buffer_budget_bytes = (
+             None
+             if disk_offload_buffer_budget_bytes is None
+@@ -1273,11 +1452,35 @@
+                     )
+                     block_id_offset = next_block_id_offset
+ 
++        if self.max_load_batch_keys is not None:
++            load_batches = [
++                (
++                    batch_keys[start : start + self.max_load_batch_keys],
++                    batch_addrs[start : start + self.max_load_batch_keys],
++                    batch_sizes[start : start + self.max_load_batch_keys],
++                    batch_block_ids[start : start + self.max_load_batch_keys],
++                )
++                for (
++                    batch_keys,
++                    batch_addrs,
++                    batch_sizes,
++                    batch_block_ids,
++                ) in load_batches
++                for start in range(0, len(batch_keys), self.max_load_batch_keys)
++            ]
++
+         current_batch_keys: list[str] = key_list_c
+         current_batch_block_ids: list[int] = block_id_list_c
++        current_batch_index = 0
+         batch_bytes = 0
+         try:
+-            for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
++            for batch_index, (
++                batch_keys,
++                batch_addrs,
++                batch_sizes,
++                batch_block_ids,
++            ) in enumerate(load_batches):
++                current_batch_index = batch_index
+                 current_batch_keys = batch_keys
+                 current_batch_block_ids = batch_block_ids
+                 batch_bytes = _sum_batch_bytes(batch_sizes)
+@@ -1309,8 +1512,14 @@
+                     num_failed_keys=len(failed),
+                 )
+                 if failed:
++                    unattempted_block_ids = [
++                        block_id
++                        for future_batch in load_batches[batch_index + 1 :]
++                        for block_id in future_batch[3]
++                    ]
+                     self._add_load_error_block_ids(
+                         [block_id for _, _, block_id in failed]
++                        + unattempted_block_ids
+                     )
+                     logger.warning(
+                         "Failed to get %d Mooncake keys from sub-batch "
+@@ -1321,7 +1530,14 @@
+                     )
+                     break
+         except Exception as e:
+-            self._add_load_error_block_ids(current_batch_block_ids)
++            unattempted_block_ids = [
++                block_id
++                for future_batch in load_batches[current_batch_index + 1 :]
++                for block_id in future_batch[3]
++            ]
++            self._add_load_error_block_ids(
++                current_batch_block_ids + unattempted_block_ids
++            )
+             self._record_operation(
+                 "load_get",
+                 load_get_start,
+@@ -1384,6 +1600,15 @@
+         assert kv_role is not None
+         self.kv_role = kv_role
+         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
++        self.compact_group_io = (
++            str(extra_config.get("compact_group_io", "False")).strip().lower()
++            == "true"
++        )
++        self.kv_cache_layout = (
++            vllm_config.cache_config.get_resolved_kv_cache_layout()
++            if self.compact_group_io
++            else None
++        )
+         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
+             extra_config.get("save_decode_cache", False)
+         )
+@@ -1495,6 +1720,12 @@
+         # Pool of load-receive threads
+         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
+         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
++        max_load_batch_keys = extra_config.get("max_load_batch_keys")
++        self.max_load_batch_keys = (
++            None if max_load_batch_keys is None else int(max_load_batch_keys)
++        )
++        if self.max_load_batch_keys is not None and self.max_load_batch_keys <= 0:
++            raise ValueError("max_load_batch_keys must be positive")
+         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
+         self.finished_store_req: set[str] = set()
+         self._kv_connector_stats_lock = threading.Lock()
+@@ -1544,17 +1775,25 @@
+         # key namespace is its TP shard id: ranks holding identical bytes
+         # (MLA / shared GQA KV heads) share a namespace, TP-sharded Mamba
+         # state gets one namespace per rank.
++        cache_prefix = str(extra_config.get("cache_prefix", ""))
++        if self.compact_group_io:
++            assert self.kv_cache_layout is not None
++            schema_fingerprint = _compact_group_io_schema_fingerprint(
++                kv_cache_config.kv_cache_groups,
++                self.kv_cache_layout.name,
++                [group.kv_cache_spec.block_size for group in self._kv_cache_groups],
++                self.hash_block_size,
++            )
++            cache_prefix = _compact_group_io_cache_prefix(
++                cache_prefix, self.kv_cache_layout.name, schema_fingerprint
++            )
+         metadata = KeyMetadata(
+             model_name=model_config.model.rstrip("/").split("/")[-1],
+             tp_rank=self.tp_rank,
+             pcp_rank=self.pcp_rank,
+             dcp_rank=self.dcp_rank,
+             pp_rank=self.pp_rank,
+-            cache_prefix=str(
+-                vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+-                    "cache_prefix", ""
+-                )
+-            ),
++            cache_prefix=cache_prefix,
+         )
+         self._group_tp_replication_factors: tuple[int, ...] = (
+             self._compute_group_tp_replication_factors()
+@@ -1650,6 +1889,20 @@
+         assert self.cache_config.num_gpu_blocks is not None
+         self.num_blocks = self.cache_config.num_gpu_blocks
+ 
++        if self.compact_group_io and (
++            self.kv_cache_layout is None
++            or not self.kv_cache_layout.is_layer_compact
++        ):
++            layout_name = (
++                self.kv_cache_layout.name
++                if self.kv_cache_layout is not None
++                else "unknown"
++            )
++            raise ValueError(
++                "Compact Mooncake group I/O currently requires a layer-compact "
++                f"KV cache layout, got {layout_name}"
++            )
++
+         seen_storage_ptrs: set[int] = set()
+         seen_region_ptrs: set[int] = set()
+         addrs: list[int] = []
+@@ -1711,9 +1964,31 @@
+             self.num_blocks,
+         )
+ 
+-        for db in self.token_dbs:
+-            db.set_kv_caches_base_addr(addrs)
+-            db.set_block_len(block_lens)
++        if self.compact_group_io:
++            region_counts = []
++            value_sizes = []
++            for group, db in zip(
++                self._kv_cache_config.kv_cache_groups,
++                self.token_dbs,
++                strict=True,
++            ):
++                group_addrs, group_strides, group_lens = (
++                    _compact_regions_for_group(group, kv_caches, self.num_blocks)
++                )
++                db.set_kv_cache_regions(group_addrs, group_strides, group_lens)
++                region_counts.append(len(group_addrs))
++                value_sizes.append(sum(group_lens))
++            logger.info(
++                "Compact Mooncake group I/O enabled: format=%s, "
++                "regions_per_group=%s, bytes_per_value=%s",
++                MOONCAKE_COMPACT_GROUP_IO_FORMAT,
++                region_counts,
++                value_sizes,
++            )
++        else:
++            for db in self.token_dbs:
++                db.set_kv_caches_base_addr(addrs)
++                db.set_block_len(block_lens)
+ 
+         # Start transfer threads
+         if self.can_put:
+@@ -1747,6 +2022,7 @@
+                 self.tp_rank,
+                 ready_event_recving,
+                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
++                max_load_batch_keys=self.max_load_batch_keys,
+                 record_operation=self._record_kv_connector_operation,
+                 request_queue=self.recv_request_queue,
+             )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2928,8 +2928,16 @@
+             is_affected = False
+             marked_invalid_block = False
+             req_id = request.request_id
+-            # TODO (davidb): add support for hybrid memory allocator
+-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
++            # get_block_ids returns one block-id list per KV-cache group.
++            # Hybrid models (e.g. Mamba + attention) expose several groups; in
++            # align mode they share the scheduler block_size and block count,
++            # and block_ids are globally unique. Scan by logical position and
++            # treat a position as invalid if ANY group's block there failed to
++            # load, truncating the request at the earliest such position.
++            # (Previously this unpacked a single group -- ``(req_block_ids,) =
++            # ...`` -- and crashed hybrid models with a failed external KV load
++            # via "ValueError: too many values to unpack (expected 1)".)
++            block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
+             # We iterate only over blocks that may contain externally computed
+             # tokens
+             req_num_computed_tokens = (
+@@ -2939,23 +2947,35 @@
+             req_num_computed_blocks = (
+                 req_num_computed_tokens + self.block_size - 1
+             ) // self.block_size
+-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+-                if block_id not in invalid_block_ids:
++            for idx in range(req_num_computed_blocks):
++                invalid_here = [
++                    group_block_ids[idx]
++                    for group_block_ids in block_ids_per_group
++                    if idx < len(group_block_ids)
++                    and group_block_ids[idx] in invalid_block_ids
++                ]
++                if not invalid_here:
+                     continue
+ 
+                 is_affected = True
+ 
+-                if block_id in marked_invalid_block_ids:
+-                    # This invalid block is shared with a previous request
+-                    # and was already marked for recomputation.
+-                    # This means this request can still consider this block
+-                    # as computed when rescheduled.
++                # A position is "shared" only if every invalid block at it was
++                # already marked by a previous request (which will recompute
++                # it), so this request can still treat it as computed.
++                new_invalid = [
++                    block_id
++                    for block_id in invalid_here
++                    if block_id not in marked_invalid_block_ids
++                ]
++                marked_invalid_block_ids.update(invalid_here)
++
++                if not new_invalid:
++                    # All invalid blocks here are shared with a previous request
++                    # and already marked for recomputation.
+                     # Currently this only applies to sync loading; Async
+-                    # loading does not yet support block sharing
++                    # loading does not yet support block sharing.
+                     continue
+ 
+-                marked_invalid_block_ids.add(block_id)
+-
+                 if marked_invalid_block:
+                     # This request has already marked an invalid block for
+                     # recomputation and updated its num_computed_tokens.
+@@ -2969,9 +2989,11 @@
+                 )
+                 total_affected_tokens += num_affected_tokens
+ 
+-                # collect invalid block and all downstream dependent blocks
++                # collect invalid block and all downstream dependent blocks,
++                # across every group
+                 if evict_blocks:
+-                    blocks_to_evict.update(req_block_ids[idx:])
++                    for group_block_ids in block_ids_per_group:
++                        blocks_to_evict.update(group_block_ids[idx:])
+ 
+             if is_affected:
+                 if not marked_invalid_block:
