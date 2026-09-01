@@ -1,0 +1,59 @@
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index d578b4300a..d6d43ed458 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -678,6 +678,54 @@ def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCache
+ def resolve_kv_cache_block_sizes(
+     kv_cache_config: KVCacheConfig,
+     vllm_config: VllmConfig,
++) -> tuple[int, int]:
++    """Diagnostic wrapper. Logs the resolution once, then delegates.
++
++    The two-wave prefix replay recovers 99.8% of wave 2 on the 08-19 stack and
++    0-47% here depending on whether partial hash hits are on, with a
++    byte-identical finder and an equivalent MambaManager. That puts the break in
++    the finder's inputs -- block sizes and the hash unit -- and this function is
++    where they are decided. Neither stack logs the resolved values, so five arms
++    were spent on hypotheses instead. One line of output settles it.
++    """
++    scheduler_block_size, hash_block_size = _resolve_kv_cache_block_sizes_impl(
++        kv_cache_config, vllm_config
++    )
++    dcp = vllm_config.parallel_config.decode_context_parallel_size
++    groups = []
++    for i, g in enumerate(kv_cache_config.kv_cache_groups):
++        spec = g.kv_cache_spec
++        groups.append(
++            "%d:%s(cfg=%d,dcp=%d%s)"
++            % (
++                i,
++                type(spec).__name__,
++                spec.block_size,
++                resolve_dcp_kv_block_size(spec, dcp),
++                ",mode=%s" % spec.mamba_cache_mode
++                if isinstance(spec, MambaSpec)
++                else "",
++            )
++        )
++    logger.info_once(
++        "[blocksize-probe] dcp=%d n_groups=%d scheduler_block_size=%d "
++        "hash_block_size=%d prefix_match_unit=%s enable_prefix_caching=%s "
++        "connector=%s groups=[%s]",
++        dcp,
++        len(kv_cache_config.kv_cache_groups),
++        scheduler_block_size,
++        hash_block_size,
++        vllm_config.cache_config.prefix_match_unit,
++        vllm_config.cache_config.enable_prefix_caching,
++        vllm_config.kv_transfer_config is not None,
++        " ".join(groups),
++    )
++    return scheduler_block_size, hash_block_size
++
++
++def _resolve_kv_cache_block_sizes_impl(
++    kv_cache_config: KVCacheConfig,
++    vllm_config: VllmConfig,
+ ) -> tuple[int, int]:
+     """Resolve (scheduler_block_size, hash_block_size).
+ 
