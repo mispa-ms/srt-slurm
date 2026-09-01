@@ -1,0 +1,37 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 566bcc14df..5a4dcf2355 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -160,11 +160,15 @@ class MooncakeStoreScheduler:
+         num_external_tokens: int,
+     ):
+         """Update state after block allocation."""
+-        local_block_ids: tuple[list[int], ...] = ()
+-        if num_external_tokens > 0:
+-            local_block_ids = self.kv_cache_config.select_transfer_block_ids(
+-                blocks.get_block_ids()
+-            )
++        # Not guarded on num_external_tokens: under MultiConnector another child
++        # may have won the load after this connector reported a hit, and this
++        # connector still owns the SAVE for the blocks that were really
++        # allocated. Recording an empty tuple there loses them. Wei's commit
++        # bb9afd157 drops the guard from the pre-#53324 form of this line; this
++        # is the same removal on the form #53324 left behind.
++        local_block_ids = self.kv_cache_config.select_transfer_block_ids(
++            blocks.get_block_ids()
++        )
+ 
+         self._unfinished_requests[request.request_id] = (request, local_block_ids)
+         self._unfinished_request_ids.add(request.request_id)
+@@ -173,7 +177,10 @@ class MooncakeStoreScheduler:
+             return
+ 
+         if num_external_tokens == 0:
+-            self.load_specs[request.request_id].can_load = False
++            # Another MultiConnector child may have won the load after this
++            # connector reported a hit. Keep the real allocation for saves,
++            # but discard this connector's unchosen load.
++            self.load_specs.pop(request.request_id)
+             return
+ 
+         assert (
