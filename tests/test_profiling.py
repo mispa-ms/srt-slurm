@@ -161,6 +161,40 @@ class TestProfilingConfig:
         assert env["PROFILE_AGG_START_STEP"] == "0"
         assert env["PROFILE_AGG_STOP_STEP"] == "100"
 
+    def test_nsys_trace_defaults_to_cuda_nvtx(self):
+        """Without nsys_trace the historical -t value is unchanged."""
+        from srtctl.core.schema import ProfilingConfig
+
+        cmd = ProfilingConfig(type="nsys-time", delay_secs=10, duration_secs=5).get_nsys_prefix(
+            "/out/x", backend_type="vllm", frontend_type="vllm"
+        )
+
+        assert cmd[cmd.index("-t") + 1] == "cuda,nvtx"
+
+    def test_nsys_trace_overrides_and_stays_single(self):
+        """nsys_trace replaces the -t value rather than adding a second one.
+
+        Blackwell needs software CUDA tracing ("cuda-sw"), which the hardcoded
+        "cuda,nvtx" cannot express. Passing it through extra_nsys_args instead would
+        leave two -t specs on one command line, so the field has to replace the value.
+        """
+        from srtctl.core.schema import ProfilingConfig
+
+        cmd = ProfilingConfig(
+            type="nsys-time",
+            nsys_trace="cuda-sw,nvtx",
+            delay_secs=2700,
+            duration_secs=25,
+            extra_nsys_args=["--trace-fork-before-exec=true", "--kill=none"],
+        ).get_nsys_prefix("/out/x", backend_type="vllm", frontend_type="vllm")
+
+        assert cmd.count("-t") == 1
+        assert cmd[cmd.index("-t") + 1] == "cuda-sw,nvtx"
+        # the window and the pass-through args survive alongside it
+        assert cmd[cmd.index("--delay") + 1] == "2700"
+        assert cmd[cmd.index("--duration") + 1] == "25"
+        assert "--kill=none" in cmd
+
 
 class TestProfilingValidation:
     """Tests for profiling config validation in SrtConfig."""

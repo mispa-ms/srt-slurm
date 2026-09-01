@@ -797,6 +797,16 @@ class ProfilingConfig:
     decode: ProfilingPhaseConfig | None = None
     aggregated: ProfilingPhaseConfig | None = None
 
+    # nsys -t / --trace selection. None keeps the historical "cuda,nvtx".
+    #
+    # Blackwell needs "cuda-sw,nvtx": CUDA hardware tracing is what the default
+    # "cuda" asks for, and on SM100 that path yields an empty or truncated capture,
+    # so the trace has to be taken in software. Every K3 B200 trace this workstream
+    # owns was captured that way. Without this field the value is unreachable, and a
+    # second -t passed through extra_nsys_args would leave two conflicting trace
+    # specs on one command line.
+    nsys_trace: str | None = None
+
     # nsys-time fields: time-based capture window, same on all workers
     delay_secs: int | None = None  # nsys --delay: seconds from worker launch before capture starts
     duration_secs: int | None = None  # nsys --duration: seconds to capture after delay
@@ -962,7 +972,7 @@ class ProfilingConfig:
                 self.nsys_binary,
                 "profile",
                 "-t",
-                "cuda,nvtx",
+                self.nsys_trace or "cuda,nvtx",
                 "--cuda-graph-trace=node",
                 "--force-overwrite",
                 "true",
@@ -983,7 +993,7 @@ class ProfilingConfig:
             self.nsys_binary,
             "profile",
             "-t",
-            "cuda,nvtx",
+            self.nsys_trace or "cuda,nvtx",
             "--cuda-graph-trace=node",
             "-c",
             "cudaProfilerApi",
