@@ -30,6 +30,19 @@
 # exactly what makes this a clean discriminator: the only thing separating this
 # arm from the mcv8 arm that scored 83% is our Mooncake/mambacache carry.
 #
+#
+# WHAT THIS IMAGE NEEDS THAT THE NEWER ONE DOES NOT. The first attempt at this arm
+# died in profile_run with
+#
+#   AttributeError: 'KimiK3LowLatencyLinearMethod' object has no attribute '_gemm_impl'
+#
+# because vllm#54167 (the missing super().__init__() in low_latency_gemm.py) merged
+# 2026-08-28 08:32 and this nightly was cut at 06:13 -- two hours short. The 08/31
+# image has it built in, which is why the v1/v2 chains correctly drop our carry.
+# Going backwards to this container means carrying it again. Asking only "which of
+# the newer patches still apply" was not enough; an older base can also need
+# something the newer one no longer does.
+#
 # ours-mooncake-interleave.patch is deliberately NOT applied. It applies cleanly
 # but is inert -- nothing on this image reads
 # requires_dcp_block_aligned_interleave -- and leaving it out keeps the arm's
@@ -77,6 +90,10 @@ apply_patch() {
     echo "[upstream-0828] ${name}: applied"
 }
 
+apply_patch k3-gemmfix-54167.patch \
+    'super().__init__()' \
+    vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+
 apply_patch upstream-pr50514.patch \
     'supports_aux_hidden_states_over_pp' \
     vllm/models/kimi_k3/nvidia/model.py
@@ -100,6 +117,8 @@ if "supports_aux_hidden_states_over_pp = True" not in rd("vllm/models/kimi_k3/nv
     fail.append("K3 does not opt in to aux hidden states over PP")
 if "seq_idx).to(tl.int64)" not in rd("vllm/models/kimi_k3/nvidia/kda.py"):
     fail.append("the KDA checkpoint state index is still int32")
+if "super().__init__()" not in rd("vllm/models/kimi_k3/nvidia/low_latency_gemm.py"):
+    fail.append("#54167 is missing: profile_run will die on _gemm_impl")
 
 # This image must NOT have the two things the newer chain works around. If it
 # does, the image is not what we think it is and the comparison is void.
