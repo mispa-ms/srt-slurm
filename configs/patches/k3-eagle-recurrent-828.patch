@@ -1,0 +1,723 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -14,6 +14,7 @@
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     KVCacheBlock,
++    replay_boundary,
+ )
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+@@ -105,6 +106,18 @@
+         )
+         return length // alignment * alignment
+ 
++    def get_replay_boundary(self, num_prompt_tokens: int) -> int:
++        """Position the engine resumes at, for the store's retention.
++
++        Shares ``kv_cache_utils.replay_boundary`` with the engine rather than
++        mirroring it: if the two drift the store keeps state where nothing can
++        reach it. ``lcm_block_size`` is the scheduler block size (set in
++        ``__init__``), which is the alignment the engine floors to.
++        """
++        return replay_boundary(
++            num_prompt_tokens, self.lcm_block_size, bool(self.eagle_group_ids)
++        )
++
+     def _verify_and_split_kv_cache_groups(self) -> None:
+         """Mirrors KVCacheCoordinator.verify_and_split_kv_cache_groups but
+         dispatches via spec_manager_map (we don't allocate managers).
+@@ -247,6 +260,13 @@
+             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+             f"{mask_alignment}"
+         )
++        # Model-level, so it is computed once and shared by every group (see
++        # KVCacheCoordinator.get_replay_boundary).
++        reachable_boundaries = (
++            ()
++            if num_prompt_tokens is None
++            else (self.get_replay_boundary(num_prompt_tokens),)
++        )
+         masks: list[list[bool] | None] = []
+         for g_idx, g in enumerate(self.kv_cache_groups):
+             spec = _unwrap_spec(g.kv_cache_spec)
+@@ -255,9 +275,6 @@
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             assert manager_cls is not None
+             use_eagle = g_idx in self.eagle_group_ids
+-            reachable_boundaries = (
+-                () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
+-            )
+             mask = manager_cls.reachable_block_mask(
+                 start_block=start_chunk,
+                 end_block=end_chunk,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -418,7 +418,6 @@
+                     # are going away, so the offload is conservatively dropped.
+                     logger.debug("Dropping partial-tail offload for request %s", req_id)
+                     continue
+-                assert len({boundary for _, _, boundary in groups}) == 1
+                 tracker.has_pending_offload = True
+                 meta.add_request(
+                     ReqMeta(
+@@ -453,16 +452,15 @@
+             self._next_store_job_id += 1
+             block_ids: list[int] = []
+             if req_meta.partial_tail_offloads:
+-                # A partial-tail CoW block is deliberately kept out of the
+-                # request's block table, so it is absent from `block_ids` even
+-                # though the worker DMAs out of it just as asynchronously.
+-                # It leads the list, as in `pop_blocks_for_free`.
++                # A partial-tail CoW block is kept out of the request table,
++                # while an exact-page handoff remains in it.
+                 block_ids += [bid for _, bid, _ in req_meta.partial_tail_offloads]
+             # Every allocated block is referenced, not just the ones covering
+             # this job's token range: a rank resumes from its own last
+             # successful offset, which lags the scheduler's whenever a save was
+             # skipped or failed, so it may read anywhere below the range.
+             block_ids += [bid for group in req_meta.block_ids for bid in group]
++            block_ids = list(dict.fromkeys(block_ids))
+             if not block_ids:
+                 continue
+             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -832,9 +832,11 @@
+         the normal save floors to ``lcm_block_size``, so a smaller-block
+         group's full blocks in that gap are never persisted elsewhere, and
+         the consumer's lookup needs every group at every probed boundary.
+-        Full blocks are keyed by their block-end hash, the partial boundary
+-        block by the boundary sub-hash; the mamba "align" boundary block is
+-        the core-provided CoW block. All keys are deduped against the store.
++        Full blocks are keyed by their block-end hash. Recurrent groups use
++        the replay boundary and the core-provided CoW block. EAGLE groups
++        without a recurrent handoff also publish through the prompt boundary
++        so lookup can verify one hash unit ahead before dropping back to the
++        recurrent checkpoint. All keys are deduped against the store.
+ 
+         Returns:
+             True when no put is needed or every put succeeds, False otherwise.
+@@ -844,20 +846,46 @@
+         partial_tail_offloads = req_meta.partial_tail_offloads
+         if not partial_tail_offloads:
+             return True
++        offloads_by_boundary: dict[int, list[tuple[int, int, int]]] = {}
++        for offload in partial_tail_offloads:
++            offloads_by_boundary.setdefault(offload[2], []).append(offload)
++
++        successful = True
++        for boundary_offloads in offloads_by_boundary.values():
++            if not self._offload_partial_tail_boundary(req_meta, boundary_offloads):
++                successful = False
++        return successful
++
++    def _offload_partial_tail_boundary(
++        self,
++        req_meta: ReqMeta,
++        partial_tail_offloads: list[tuple[int, int, int]],
++    ) -> bool:
+         hash_block_size = self.coord.hash_block_size
+-        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
+-        if len(boundaries) != 1:
++        offload_sources = {
++            group_id: (block_id, boundary)
++            for group_id, block_id, boundary in partial_tail_offloads
++        }
++        replay_boundaries = {boundary for _, boundary in offload_sources.values()}
++        if len(replay_boundaries) != 1:
+             raise ValueError(
+                 "Partial-tail offloads for one request must share a boundary"
+             )
+-        boundary = boundaries.pop()
+-        if boundary == 0:
++        replay_boundary = replay_boundaries.pop()
++        if replay_boundary == 0:
+             return True
+-        if boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
++        prompt_boundary = (
++            replay_boundary
++            if req_meta.num_prompt_tokens is None
++            else req_meta.num_prompt_tokens // hash_block_size * hash_block_size
++        )
++        lookup_boundary = (
++            max(replay_boundary, prompt_boundary)
++            if self.coord.eagle_group_ids
++            else replay_boundary
++        )
++        if lookup_boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
+             return True
+-        mamba_offloads = {
+-            group_id: block_id for group_id, block_id, _ in partial_tail_offloads
+-        }
+ 
+         keys: list[str] = []
+         addrs: list[list[int]] = []
+@@ -867,26 +895,28 @@
+         )
+         saved = self._saved_offset.get(req_meta.req_id, 0)
+         for g_idx, db in enumerate(self.token_databases):
++            group_boundary = (
++                lookup_boundary
++                if g_idx in self.coord.eagle_group_ids
++                and g_idx not in offload_sources
++                else replay_boundary
++            )
+             group_blocks = req_meta.block_ids[g_idx]
+             # Distribute across ranks by the same rule as normal chunks.
+             put_step = self.group_put_steps[g_idx]
+             put_step_rank = (self.tp_rank + g_idx) % put_step
+             # Always include the boundary block: its sub-hash key is written
+             # only here, even if normal saves already advanced past it.
+-            last_block = cdiv(boundary, db.block_size) - 1
++            last_block = cdiv(group_boundary, db.block_size) - 1
+             for block_idx in range(
+                 min(saved // db.block_size, last_block), last_block + 1
+             ):
+                 if block_idx % put_step != put_step_rank:
+                     continue
+-                valid_end = min((block_idx + 1) * db.block_size, boundary)
++                valid_end = min((block_idx + 1) * db.block_size, group_boundary)
+                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
+-                if (
+-                    g_idx in mamba_offloads
+-                    and valid_end == boundary
+-                    and boundary % db.block_size != 0
+-                ):
+-                    block_id = mamba_offloads[g_idx]
++                if g_idx in offload_sources and valid_end == group_boundary:
++                    block_id = offload_sources[g_idx][0]
+                 else:
+                     if block_idx >= len(group_blocks):
+                         continue
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -449,6 +449,8 @@
+         num_tokens: int,
+         kv_cache_group_id: int,
+         block_size: int,
++        *,
++        replace_older: bool = True,
+     ) -> BlockHashWithGroupId | None:
+         """Register a partial prefix-cache entry for an existing block.
+ 
+@@ -476,6 +478,7 @@
+                 entry hash itself is always the prefix-chain hash at
+                 ``num_tokens``; ``block_size`` is used to assert that the
+                 entry is partial within the owning cache block.
++            replace_older: Remove earlier aliases owned by the same block.
+ 
+         Returns:
+             The hash key with group ID if a partial entry can be registered;
+@@ -498,7 +501,8 @@
+             )
+         )
+         if (
+-            not already_cached
++            replace_older
++            and not already_cached
+             and block.block_hash is not None
+             and block.block_hash_num_tokens is not None
+             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -11,6 +11,7 @@
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     KVCacheBlock,
++    replay_boundary,
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     CrossAttentionManager,
+@@ -300,6 +301,18 @@
+             for manager in self.single_type_managers
+         )
+ 
++    def get_replay_boundary(self, request: Request) -> int:
++        """Position a later request replaying this prompt resumes at.
++
++        See ``kv_cache_utils.replay_boundary``; external stores share it so
++        their retention names the same position the engine resumes at.
++        """
++        return replay_boundary(
++            request.num_prompt_tokens,
++            self.scheduler_block_size,
++            bool(self.eagle_group_ids),
++        )
++
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         """
+         Cache the blocks for the request.
+@@ -310,6 +323,7 @@
+                 that need to be cached
+                 (including tokens that are already cached).
+         """
++        replay_boundary = self.get_replay_boundary(request)
+         for manager in self.single_type_managers:
+             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
+             # tokens can be re-prefilled during multi-module MTP.
+@@ -320,6 +334,7 @@
+                 request,
+                 num_tokens_to_cache,
+                 retention_interval=self.retention_interval,
++                replay_boundary=replay_boundary,
+             )
+ 
+     def free(self, request_id: str) -> None:
+@@ -726,6 +741,7 @@
+ 
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
++        replay_boundary = self.get_replay_boundary(request)
+         for manager in self.single_type_managers:
+             num_tokens_to_cache = cached_num_computed_tokens
+             # EAGLE groups match one block past each aligned boundary and drop
+@@ -752,6 +768,7 @@
+                 request,
+                 num_tokens_to_cache,
+                 retention_interval=self.retention_interval,
++                replay_boundary=replay_boundary,
+             )
+ 
+     def find_longest_cache_hit(
+@@ -912,6 +929,9 @@
+                 kv_cache_spec=spec,
+                 drop_eagle_block=use_eagle,
+                 alignment_tokens=self._cache_hit_alignment_tokens,
++                dcp_world_size=(
++                    self.dcp_world_size if isinstance(spec, FullAttentionSpec) else 1
++                ),
+             )
+             for gid, blks in zip(group_ids, blocks):
+                 hit_blocks[gid] = blks
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -863,18 +863,14 @@
+         A KV connector reads the referenced blocks and offloads them so a later
+         request can hit the sub-block prefix.
+ 
+-        Each handed-off block lives off the request block table, so it is
+-        pinned here and unpinned when the request's blocks are freed — for a
+-        producer with saved tokens, after the connector reports sends done.
++        Partial-page CoW blocks live off the request block table; exact-page
++        blocks remain in it. Both are pinned here until the request is freed.
+         """
+         offloads: dict[str, list[tuple[int, int, int]]] = {}
+         for mgr in self.coordinator.single_type_managers:
+-            for (
+-                req_id,
+-                group_id,
+-                block,
+-                boundary_tokens,
+-            ) in mgr.take_pending_partial_tail_offloads():
++            pending = mgr.take_pending_partial_tail_offloads()
++            pending += mgr.take_pending_exact_page_offloads()
++            for req_id, group_id, block, boundary_tokens in pending:
+                 self.block_pool.touch((block,))
+                 self._partial_tail_pins.setdefault(req_id, []).append(block)
+                 offloads.setdefault(req_id, []).append(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -715,6 +715,53 @@
+     return scheduler_block_size, hash_block_size
+ 
+ 
++def replay_boundary(
++    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
++) -> int:
++    """Return the position a later request replaying this prompt resumes at.
++
++    A cache hit is the shortest hit across all groups, so this is a model-level
++    position: every group has to retain state here, whether or not it is the
++    group that drops. Groups differ only in how much they keep around it --
++    EAGLE groups also keep the block above, which they match and drop back from
++    (see ``reachable_block_mask``).
++
++    Under EAGLE that block must exist, so the boundary sits one alignment unit
++    below the prompt's last aligned position; every group's block size divides
++    the alignment, so the block above always fits in the prompt.
++
++    Shared by the engine (``KVCacheCoordinator.get_replay_boundary``) and by
++    external stores (``MooncakeStoreCoordinator.get_replay_boundary``). A store
++    that retains at a different position than the engine resumes at keeps state
++    where nothing can reach it, so the two must not drift apart.
++    """
++    if not use_eagle:
++        return num_prompt_tokens - 1
++    aligned = num_prompt_tokens // scheduler_block_size * scheduler_block_size
++    return max(aligned - scheduler_block_size, 0)
++
++
++def eagle_partial_tail_boundary(num_prompt_tokens: int, hash_block_size: int) -> int:
++    """Return the latest fine-grained prompt state reusable under EAGLE.
++
++    A later chat turn can either append exactly or replace a terminal suffix.
++    EAGLE then drops one additional matched hash unit.
++    """
++    if num_prompt_tokens <= 0:
++        return 0
++    aligned = num_prompt_tokens // hash_block_size * hash_block_size
++    return max(aligned - hash_block_size, 0)
++
++
++def eagle_partial_tail_boundaries(
++    num_prompt_tokens: int, hash_block_size: int
++) -> tuple[int, ...]:
++    """Return both tail states reachable after a terminal-unit replacement."""
++    latest = eagle_partial_tail_boundary(num_prompt_tokens, hash_block_size)
++    previous = max(latest - hash_block_size, 0)
++    return tuple(dict.fromkeys((previous, latest)))
++
++
+ def get_request_block_hasher(
+     hash_block_size: int,
+     caching_hash_fn: Callable[[Any], bytes],
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -37,7 +37,11 @@
+ )
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+-from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlock,
++    eagle_partial_tail_boundaries,
++    eagle_partial_tail_boundary,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -442,6 +446,30 @@
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        tail_boundaries = (tail_boundary,)
++        if tail_boundary and self.use_eagle:
++            # Eagle matches one hash unit past the candidate and drops it, so
++            # nothing proves the prompt's own last hash boundary. Materialize
++            # the state one unit lower, where the hit can actually land.
++            tail_boundary = eagle_partial_tail_boundary(
++                request.num_prompt_tokens, self.hash_block_size
++            )
++            tail_boundaries = eagle_partial_tail_boundaries(
++                request.num_prompt_tokens, self.hash_block_size
++            )
++        junction = request.shared_prefix_boundary
++        if self.mamba_partial_cache_hit and self.use_eagle:
++            junction_stop = junction // self.hash_block_size * self.hash_block_size
++            if junction_stop > request.num_prompt_tokens:
++                junction_stop = 0
++        else:
++            junction_stop = start + (junction - start) // block_size * block_size
++        periodic_stop = 0
++        retention_interval = getattr(
++            self.cache_config, "prefix_cache_retention_interval", None
++        )
++        if retention_interval:
++            periodic_stop = (start // retention_interval + 1) * retention_interval
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+@@ -450,15 +478,22 @@
+             last_cache_position,
+             # Fine-grained hits: the prompt's partial-tail entry can only be
+             # registered by a chunk ending exactly at its last hash boundary.
+-            tail_boundary
+-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+-            else 0,
+-            # Marconi shared-prefix junction, block-floored (a sub-block
+-            # junction's state is not separately cacheable): cache its state
+-            # so sibling requests sharing the prefix can reuse it.
+-            start + (request.shared_prefix_boundary - start) // block_size * block_size
+-            if start < request.shared_prefix_boundary < end
+-            else 0,
++            *(
++                boundary
++                if last_cache_position < boundary < request.num_prompt_tokens
++                else 0
++                for boundary in tail_boundaries
++            ),
++            # Marconi shared-prefix junction. Under eagle the sibling resumes
++            # one hash unit below the boundary full attention matched, which is
++            # not on the block grid, so floor to the hash grid instead -- block
++            # flooring rounds the resume point away. Prompt only: the tail entry
++            # is registered during the prompt, so a junction past it would split
++            # the chunk for a check-point that is never written.
++            junction_stop if start < request.shared_prefix_boundary < end else 0,
++            # A retained recurrent checkpoint must be materialized by a
++            # forward that ends at its exact interval boundary.
++            periodic_stop if periodic_stop < request.num_prompt_tokens else 0,
+         )
+         # Stop at the earliest mandatory position strictly inside the chunk.
+         end = min((s for s in stops if start < s < end), default=end)
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -13,6 +13,7 @@
+     BlockHashListWithBlockSize,
+     BlockHashWithGroupId,
+     KVCacheBlock,
++    eagle_partial_tail_boundaries,
+     resolve_block_hashes,
+ )
+ from vllm.v1.kv_cache_interface import (
+@@ -107,7 +108,6 @@
+         # aligned segment (SWA). Initialized lazily by the coordinator after
+         # determining the attention groups.
+         self.use_eagle = False
+-
+         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
+         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
+@@ -121,6 +121,7 @@
+         self._pending_partial_tail_offloads: list[
+             tuple[str, int, KVCacheBlock, int]
+         ] = []
++        self._pending_exact_page_offloads: list[tuple[str, int, KVCacheBlock, int]] = []
+ 
+     @classmethod
+     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
+@@ -400,6 +401,14 @@
+         self._pending_partial_tail_offloads = []
+         return pending
+ 
++    def take_pending_exact_page_offloads(
++        self,
++    ) -> list[tuple[str, int, KVCacheBlock, int]]:
++        """Drain completed recurrent-page hand-offs."""
++        pending = self._pending_exact_page_offloads
++        self._pending_exact_page_offloads = []
++        return pending
++
+     def _apply_cow(
+         self,
+         request_id: str,
+@@ -427,6 +436,8 @@
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         """
+         Cache the blocks for the request.
+@@ -449,7 +460,7 @@
+         # Token boundaries whose reachable tail must be retained under sparse
+         # retention: the replay boundary (``num_prompt - 1``, capped by
+         # ``get_computed_blocks``) and any detected shared-prefix junction.
+-        reachable_boundaries = [request.num_prompt_tokens - 1]
++        reachable_boundaries = [replay_boundary]
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
+@@ -784,30 +795,57 @@
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
++        super().cache_blocks(
++            request,
++            num_tokens,
++            retention_interval=retention_interval,
++            replay_boundary=replay_boundary,
++        )
+         hash_block_size = self.block_pool.hash_block_size
+         if self.block_size == hash_block_size:
+             return
+-        self._cache_partial_tail_block(request, num_tokens)
++        self._cache_partial_tail_block(request, num_tokens, retention_interval)
+ 
+     def _cache_partial_tail_block(
+         self,
+         request: Request,
+         num_tokens: int,
++        retention_interval: int | None = None,
+     ) -> None:
+-        """Cache the prompt tail when it ends inside a cache block.
+-
+-        Only the final prompt hash boundary is registered as a partial
+-        prefix-cache entry; intermediate hash boundaries inside the same cache
+-        block are intentionally skipped.
+-        """
++        """Cache the prompt's reachable fine-grained proof boundaries."""
+         hash_block_size = self.block_pool.hash_block_size
+-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
++        prompt_tokens = request.num_prompt_tokens
++        if self.use_eagle:
++            latest_proof = prompt_tokens // hash_block_size * hash_block_size
++            proof_boundaries = [
++                max(latest_proof - hash_block_size, 0),
++                latest_proof,
++            ]
++            if retention_interval:
++                periodic_resume = (
++                    max(num_tokens - hash_block_size, 0)
++                    // retention_interval
++                    * retention_interval
++                )
++                if periodic_resume:
++                    proof_boundaries.append(periodic_resume + hash_block_size)
++        else:
++            proof_boundaries = [
++                prompt_tokens // hash_block_size * hash_block_size,
++            ]
++        boundary_tokens = max(
++            (
++                boundary
++                for boundary in proof_boundaries
++                if boundary <= num_tokens and boundary % self.block_size != 0
++            ),
++            default=0,
++        )
+         if boundary_tokens == 0 or boundary_tokens > num_tokens:
+             return
+-        if boundary_tokens % self.block_size == 0:
+-            return
+ 
+         blocks = self.req_to_blocks[request.request_id]
+         block_idx = boundary_tokens // self.block_size
+@@ -819,6 +857,7 @@
+             num_tokens=boundary_tokens,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
++            replace_older=not self.use_eagle,
+         )
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+@@ -1698,6 +1737,11 @@
+                 for entry in self._pending_partial_tail_offloads
+                 if entry[0] != request_id
+             ]
++            self._pending_exact_page_offloads = [
++                entry
++                for entry in self._pending_exact_page_offloads
++                if entry[0] != request_id
++            ]
+         return super().pop_blocks_for_free(request_id)
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+@@ -1713,9 +1757,16 @@
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
++        super().cache_blocks(
++            request,
++            num_tokens,
++            retention_interval=retention_interval,
++            replay_boundary=replay_boundary,
++        )
+         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+         if self.mamba_cache_mode == "align":
+             partial_hash = self._cache_partial_tail_block(request, num_tokens)
+@@ -1744,17 +1795,51 @@
+         hash_block_size = self.block_pool.hash_block_size
+         if self.block_size == hash_block_size:
+             return None
+-        if num_tokens % self.block_size == 0:
++        if num_tokens <= 0:
+             return None
+         if num_tokens % hash_block_size != 0:
+             return None
+-        latest_prompt_hash_boundary = (
+-            request.num_prompt_tokens // hash_block_size
+-        ) * hash_block_size
+-        if num_tokens != latest_prompt_hash_boundary:
++        prompt_hash_boundaries = (
++            request.num_prompt_tokens // hash_block_size * hash_block_size,
++        )
++        if self.use_eagle:
++            prompt_hash_boundaries = eagle_partial_tail_boundaries(
++                request.num_prompt_tokens, hash_block_size
++            )
++        # When the shared prefix ends BEFORE this prompt's tail -- a system
++        # prompt followed by a per-request suffix -- a sibling's match stops at
++        # the last shared block boundary and eagle drops one unit below that.
++        # The tail position above is over this request's own suffix and cannot
++        # serve it, so accept the block-grid resume point too. Prompt only:
++        # during decode the target is the running state block, mutated in place
++        # and only equal to what its key promises after that step's forward.
++        block_grid_resume_point = (
++            self.use_eagle
++            and num_tokens <= request.num_prompt_tokens
++            and (num_tokens + hash_block_size) % self.block_size == 0
++        )
++        # A junction is a position a sibling was observed resuming from, so the
++        # scheduler already split the chunk here (`scheduler.py:474`). Register
++        # the state it stopped for, otherwise the split costs a forward pass and
++        # buys nothing -- and having replaced the block-boundary stop, it leaves
++        # less cached than block-flooring would have. Prompt only, for the same
++        # reason as the block-grid clause.
++        junction_resume_point = (
++            self.use_eagle
++            and num_tokens <= request.num_prompt_tokens
++            and num_tokens == request.shared_prefix_boundary
++        )
++        if (
++            num_tokens not in prompt_hash_boundaries
++            and not block_grid_resume_point
++            and not junction_resume_point
++        ):
+             return None
+ 
+-        block_idx = num_tokens // self.block_size
++        is_exact_page = num_tokens % self.block_size == 0
++        if is_exact_page and not self.use_eagle:
++            return None
++        block_idx = cdiv(num_tokens, self.block_size) - 1
+         blocks = self.req_to_blocks[request.request_id]
+         if block_idx >= len(blocks):
+             return None
+@@ -1762,6 +1847,28 @@
+         if source_block.is_null:
+             return None
+ 
++        if is_exact_page:
++            if source_block.block_hash is None:
++                self.block_pool.cache_full_blocks(
++                    request=request,
++                    blocks=blocks,
++                    num_cached_blocks=block_idx,
++                    num_full_blocks=block_idx + 1,
++                    block_size=self.block_size,
++                    kv_cache_group_id=self.kv_cache_group_id,
++                )
++            if source_block.block_hash is None:
++                return None
++            self._pending_exact_page_offloads.append(
++                (
++                    request.request_id,
++                    self.kv_cache_group_id,
++                    source_block,
++                    num_tokens,
++                )
++            )
++            return source_block.block_hash
++
+         partial_hash = self.block_pool.cache_partial_block(
+             request=request,
+             block=source_block,
+@@ -1808,6 +1915,8 @@
+         request: Request,
+         num_tokens: int,
+         retention_interval: int | None = None,
++        *,
++        replay_boundary: int,
+     ) -> None:
+         # We do not cache blocks for cross-attention to be shared between
+         # requests, so this method is not relevant.
