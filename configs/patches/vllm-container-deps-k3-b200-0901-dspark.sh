@@ -42,6 +42,13 @@ bash /configs/patches/vllm-container-deps-k3-int64idx.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pp-0901.sh
 bash /configs/patches/vllm-container-deps-k3-tokenspeed-mtp-interleave.sh
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
-bash /configs/patches/vllm-container-deps-k3-mambagroups2.sh
+
+# mambagroups2 is deliberately NOT in this chain. It patches the mamba align
+# context so block tables are sliced with the context's own group ids, and it
+# only matters for `mamba-cache-mode align` + DCP8 -- which these arms do not
+# set, so it was inert here even on 08/28. On 7c5dc571 it is worse than inert:
+# upstream restructured the align context, its anchor
+# (initialize_from_forward_context) is gone, and its FATAL gate takes the whole
+# run down before serving. Re-derive it only if an arm actually needs align mode.
 
 echo "=== k3-b200-0901: done ==="
