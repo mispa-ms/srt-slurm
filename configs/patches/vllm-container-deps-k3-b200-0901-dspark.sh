@@ -41,6 +41,7 @@ bash /configs/patches/vllm-container-deps-k3-pr54167.sh
 bash /configs/patches/vllm-container-deps-k3-int64idx.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pp-0901.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-embed-snapshot.sh
+bash /configs/patches/vllm-container-deps-k3-mooncake-no-interleave-promo.sh
 bash /configs/patches/vllm-container-deps-k3-tokenspeed-mtp-interleave.sh
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
 
