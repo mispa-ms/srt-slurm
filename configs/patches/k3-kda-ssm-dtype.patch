@@ -14,10 +14,10 @@ index bf81cdd75f..f0d82a68dd 100644
  
      def get_state_shape(
 diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
-index 71872de47c..ae3447ce1c 100644
+index 71872de47c..a150876403 100644
 --- a/vllm/model_executor/layers/mamba/mamba_utils.py
 +++ b/vllm/model_executor/layers/mamba/mamba_utils.py
-@@ -132,9 +132,29 @@ class MambaStateDtypeCalculator:
+@@ -132,9 +132,28 @@ class MambaStateDtypeCalculator:
          cls,
          model_dtype: ModelDType | torch.dtype,
          mamba_cache_dtype: MambaDType,
@@ -26,17 +26,16 @@ index 71872de47c..ae3447ce1c 100644
 +        """(conv, ssm) dtypes for KDA.
 +
 +        The ssm half was hardcoded ``torch.float32`` while ``CacheConfig``
-+        already carried ``mamba_ssm_cache_dtype``; this reads it. The KDA state
-+        is large enough that its page size drives the ATTENTION block size --
-+        the worker log says "Setting attention block size to 1536 tokens to
-+        ensure that attention page size is >= mamba page size" -- so halving it
-+        changes block geometry, not just capacity.
++        already carried ``mamba_ssm_cache_dtype``; this reads it. KDA state is
++        large enough that its page size drives the ATTENTION block size -- the
++        worker log says "Setting attention block size to 1536 tokens to ensure
++        that attention page size is >= mamba page size" -- so halving it changes
++        block geometry, not just capacity.
 +
 +        ``auto`` keeps ``torch.float32``, NOT the conv dtype as
-+        ``_mamba_state_dtype`` does for Mamba-2. Following that pattern here
-+        would silently move every K3 run to bf16 recurrent state; the ssm state
-+        is recurrent, so error accumulates per token, and that is a change to
-+        make on purpose and measure, not to inherit.
++        ``_mamba_state_dtype`` does for Mamba-2: the ssm state is recurrent, so
++        error accumulates per token, and moving every K3 run to bf16 is a change
++        to make on purpose and measure, not to inherit.
 +        """
          state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
 -        return (state_dtype, torch.float32)
@@ -48,3 +47,33 @@ index 71872de47c..ae3447ce1c 100644
  
      @classmethod
      def append_kda_recoverssm_record(
+diff --git a/vllm/models/kimi_k3/nvidia/kda.py b/vllm/models/kimi_k3/nvidia/kda.py
+index fa89587ce1..18d6c71b8b 100644
+--- a/vllm/models/kimi_k3/nvidia/kda.py
++++ b/vllm/models/kimi_k3/nvidia/kda.py
+@@ -368,7 +368,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
+         if self.model_config is None or self.cache_config is None:
+             raise ValueError("model_config and cache_config must be set")
+         base_dtypes = MambaStateDtypeCalculator.kda_state_dtype(
+-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
++            self.model_config.dtype,
++            self.cache_config.mamba_cache_dtype,
++            self.cache_config.mamba_ssm_cache_dtype,
+         )
+         if self.cache_config.use_kda_recoverssm:
+             return MambaStateDtypeCalculator.append_kda_recoverssm_record(
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 29539bcdc5..6752e01ad3 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -2338,7 +2338,9 @@ class KimiLinearForCausalLM(
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, ...]:
+         dtypes = MambaStateDtypeCalculator.kda_state_dtype(
+-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
++            vllm_config.model_config.dtype,
++            vllm_config.cache_config.mamba_cache_dtype,
++            vllm_config.cache_config.mamba_ssm_cache_dtype,
+         )
+         if vllm_config.cache_config.use_kda_recoverssm:
+             dtypes = MambaStateDtypeCalculator.append_kda_recoverssm_record(

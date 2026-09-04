@@ -69,6 +69,36 @@ if bf16[1] is not torch.bfloat16:
 print("    verified: auto keeps fp32, explicit bfloat16 takes effect")
 PY
 
+# THE CHECK THAT ACTUALLY MATTERS, and the one the first attempt lacked.
+# Calling kda_state_dtype proves the helper answers; it does NOT prove the served
+# model asks it. The first version patched only gdn/kimi_gdn_linear_attn.py,
+# which K3 does not use -- the served class is KimiK3DeltaAttention in
+# models/kimi_k3/nvidia/kda.py -- so the run came back with a byte-identical KV
+# cache (43.66 GiB, 24,360,076 tokens) and an arm that measured nothing.
+python3 - <<'PYCHK'
+import inspect, sys
+import vllm.models.kimi_k3.nvidia.kda as kda
+import vllm.models.kimi_k3.nvidia.model as k3model
+from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn as gdn
+
+missing = []
+for mod, name in ((kda, "nvidia/kda.py"),
+                  (k3model, "nvidia/model.py"),
+                  (gdn, "gdn/kimi_gdn_linear_attn.py")):
+    src = inspect.getsource(mod)
+    i = src.find("kda_state_dtype(")
+    while i != -1:
+        if "mamba_ssm_cache_dtype" not in src[i:i + 260]:
+            missing.append(name)
+            break
+        i = src.find("kda_state_dtype(", i + 1)
+if missing:
+    sys.exit("wei-gb300-kdassm: these call sites still drop the ssm dtype: "
+             + ", ".join(sorted(set(missing)))
+             + ". The knob would be inert and the arm would measure nothing.")
+print("    verified: every NVIDIA K3 call site forwards mamba_ssm_cache_dtype")
+PYCHK
+
 # The five modules a K3 worker loads, same as the base script.
 python3 - <<'PY'
 import importlib, sys
