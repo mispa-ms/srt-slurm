@@ -47,6 +47,12 @@ bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
 # never joins and PP1 waits out the NCCL timeout on a 1-element broadcast. Our
 # retired carry had this guard; #50514 does not.
 bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
+# Second wall behind the first, found only once the loader guard let PP1 finish
+# loading: #50514 hands the draft create_draft_parallel_config(), which never
+# sets decode_context_parallel_size, so the draft's MLA impl sees DCP=1 and builds
+# no MLADCPManager while the metadata builder (process group, DCP=8) asserts one.
+# 08/28 never overrode the draft's parallel_config, so it inherited DCP=8.
+bash /configs/patches/vllm-container-deps-k3-dspark-draft-dcp.sh
 
 # Confirm the two things this chain is betting on, rather than assuming them: that
 # int64idx really landed, and that spec decode under PP is present without our
