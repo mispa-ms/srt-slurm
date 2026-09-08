@@ -41,6 +41,12 @@ echo "=== k3-b200-908: chain for the 2026-09-08 nightly ==="
 
 bash /configs/patches/vllm-container-deps-k3-b200-828.sh
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
+# NOT in the original 908 chain, and the reason all four 09/08 arms died: upstream
+# #50514 builds the drafter on the last PP stage only, but the draft loader inherits
+# load_format=fastsafetensors, whose iterator collectives over group.WORLD. PP0
+# never joins and PP1 waits out the NCCL timeout on a 1-element broadcast. Our
+# retired carry had this guard; #50514 does not.
+bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
 
 # Confirm the two things this chain is betting on, rather than assuming them: that
 # int64idx really landed, and that spec decode under PP is present without our

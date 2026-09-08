@@ -31,6 +31,11 @@ echo "=== k3-b200-908-noint64: the 09/08 chain WITHOUT the int64 cast ==="
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8-diag.sh
 bash /configs/patches/vllm-container-deps-k3-pr54167.sh
 bash /configs/patches/vllm-container-deps-k3-b200-dcp8-emptycache.sh
+# Same draft-loader guard as the twin. Without it this arm dies in model load on
+# the fastsafetensors WORLD broadcast, ten minutes before the int32 overflow it
+# exists to reproduce could ever happen -- which is exactly what pipeline
+# 66807945 did. The two chains must differ in int64idx and nothing else.
+bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
 
 # Assert the omission, so a silently-already-fixed image cannot be mistaken for a
 # reproduction. If upstream lands the cast, this arm stops being meaningful and
