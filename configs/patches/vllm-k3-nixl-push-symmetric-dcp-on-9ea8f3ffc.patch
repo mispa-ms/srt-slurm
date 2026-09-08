@@ -1,0 +1,47 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index 4516c851cf..a48ab11d6b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -486,8 +486,10 @@ class NixlBaseConnectorWorker:
+         # DCP support is scoped to MLA, with dcp_size in (1, tp_size): either fully
+         # replicated or fully sharded. A DCP rank is always derivable this way.
+         self.dcp_rank = self.tp_rank % self.dcp_size
+-        if self._has_mamba and self.dcp_size > 1:
++        if self._has_mamba and self.dcp_size > 1 and self._TRANSFER_MODE != "push":
+             # Prefix-cache-aware DCP slicing isn't implemented for the Mamba group.
++            # Push never slices: it writes rank-to-rank between identically
++            # sharded instances (enforced at handshake).
+             raise ValueError("DCP is not supported for hybrid MLA+Mamba models.")
+ 
+         self.num_blocks = kv_cache_config.num_blocks
+@@ -710,6 +712,12 @@ class NixlBaseConnectorWorker:
+                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
+                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+             )
++        if self._TRANSFER_MODE == "push" and local_dcp_size != remote_dcp_size:
++            raise NotImplementedError(
++                "NixlPushConnector supports decode_context_parallel_size > 1 only "
++                "when both instances shard identically (push writes rank-to-rank). "
++                f"Local DCP={local_dcp_size}; remote DCP={remote_dcp_size}."
++            )
+ 
+     def _sync_block_size_with_kernel(self) -> None:
+         backends = get_current_attn_backends(self.vllm_config)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+index ee7b991799..50f6fe09e2 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+@@ -369,10 +369,9 @@ class NixlPushConnector(NixlBaseConnector):
+         kv_cache_config: "KVCacheConfig",
+     ):
+         super().__init__(vllm_config, role, kv_cache_config)
+-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+-            raise ValueError(
+-                "NixlPushConnector does not support decode_context_parallel_size > 1."
+-            )
++        # DCP is validated at handshake (_validate_remote_parallel_config): push
++        # writes rank-to-rank, so it is supported when both instances shard the
++        # KV cache identically and refused otherwise.
+         self.connector_scheduler: NixlPushConnectorScheduler | None = None
+         self.connector_worker: NixlPushConnectorWorker | None = None
+         if role == KVConnectorRole.SCHEDULER:

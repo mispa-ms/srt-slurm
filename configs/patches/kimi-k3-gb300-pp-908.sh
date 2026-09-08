@@ -25,6 +25,11 @@
 #     MLADCPManager)`. Pipeline 66821387 (both arms) died exactly there.
 #     Steps 5 and 6 are the other session's B200 stopgaps, proven green on this
 #     nightly in pipelines 66814090 / 66814200. Loader guard MUST precede #55472.
+#  7. pushdcp-908 -- lift #50611's blanket refusals of push + DCP and hybrid +
+#     DCP for the push path only; enforce equal DCP at handshake. Pipeline
+#     66827142 (both arms) died on decode at NixlPushConnector.__init__:
+#     "does not support decode_context_parallel_size > 1". Ours, but a carry
+#     for the base: without it no K3 disagg topology exists on this nightly.
 #
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba members over the member-identity path. #50499 says
@@ -75,6 +80,7 @@ bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-908.sh
+bash /configs/patches/vllm-container-deps-k3-pushdcp-908.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-908.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
@@ -95,6 +101,10 @@ if 'load_config=replace(draft_vllm_config.load_config, load_format="auto")' not 
 if "parallel_config=replace(vllm_config.parallel_config,pipeline_parallel_size=1" not in "".join(du.split()):
     fail.append("#55472 missing: the draft parallel config drops DCP (MLADCPManager assert on decode)")
 bw = src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py")
+if "does not support decode_context_parallel_size > 1" in src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py"):
+    fail.append("#50611's push+DCP refusal is still in connector.py")
+if "shard identically" not in bw:
+    fail.append("push DCP handshake equality check missing")
 if "_align_remote_regions_by_member" not in bw:
     fail.append("#50499 member-identity routing missing")
 refusal = "with Mamba/SSM hybrid KV cache layouts yet" in bw
