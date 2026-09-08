@@ -15,6 +15,16 @@
 #     mamba_utils.py:1083 ('expected N block tables').
 #  4. pr50499-908 -- vllm#50494 + #50499 head ce830b04 (2026-09-05). Applies
 #     clean. Fixes the block_strides remap itself, so that carry is gone.
+#  5. dspark-draft-loader -- #54416's mechanism (its patch does not apply to
+#     this nightly): under PP the drafter lives on the last stage only, but
+#     fastsafetensors collectives over group.WORLD, so the draft load deadlocks.
+#     Our configs set load-format: fastsafetensors on both roles.
+#  6. dspark-pr55472 -- vllm#55472 verbatim: merged #50514 hands the draft a
+#     parallel config without DCP, and the decode side (TP8 x DCP8) dies in
+#     profile_cudagraph_memory on `assert isinstance(self.dcp_manager,
+#     MLADCPManager)`. Pipeline 66821387 (both arms) died exactly there.
+#     Steps 5 and 6 are the other session's B200 stopgaps, proven green on this
+#     nightly in pipelines 66814090 / 66814200. Loader guard MUST precede #55472.
 #
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba members over the member-identity path. #50499 says
@@ -62,6 +72,8 @@ fi
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-829.sh
 bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
+bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
+bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-908.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-908.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
@@ -77,6 +89,11 @@ if "aux_hidden_states_over_pp" not in src("vllm/models/kimi_k3/nvidia/model.py")
     fail.append("#50514 (spec decode under PP) missing")
 if "to(tl.int64)" not in src("vllm/models/kimi_k3/nvidia/kda.py"):
     fail.append("int64 checkpoint index missing")
+du = src("vllm/v1/worker/gpu/spec_decode/dspark/utils.py")
+if 'load_config=replace(draft_vllm_config.load_config, load_format="auto")' not in du:
+    fail.append("draft loader still uses fastsafetensors under PP (deadlock on the PP2 prefill)")
+if "parallel_config=replace(vllm_config.parallel_config,pipeline_parallel_size=1" not in "".join(du.split()):
+    fail.append("#55472 missing: the draft parallel config drops DCP (MLADCPManager assert on decode)")
 bw = src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py")
 if "_align_remote_regions_by_member" not in bw:
     fail.append("#50499 member-identity routing missing")
