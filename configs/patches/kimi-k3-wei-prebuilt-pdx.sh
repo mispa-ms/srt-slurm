@@ -49,6 +49,27 @@ set -euo pipefail
 : "${K3_STAGED_DIR:=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig}"
 export K3_STAGED_DIR
 
+# THE SETUP STAGE DOES NOT SEE THE CONFIG'S `environment:` BLOCK. Four runs died
+# here with `[k3-hfshim] FATAL: HF_HOME is not set` *after* the shim had already
+# confirmed `shards visible: 96` -- the checkpoint was fine, the shim simply had
+# nowhere to put the cache entry. The workers get HF_HOME from the YAML; this
+# script runs earlier and does not.
+#
+# So default it, and default it to the SAME path the YAML sets. If these two
+# ever drift the shim writes a cache the workers never read, and the failure
+# would be a silent re-download rather than an error -- keep them in sync:
+#
+#   environment.HF_HOME  in  ci/sweep_configs/.../B300/*/**-pdx.yml
+#
+# An already-set HF_HOME wins, so a caller can still redirect it.
+: "${HF_HOME:=/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/misunp/hf-cache}"
+export HF_HOME
+echo "=== wei-prebuilt-pdx: HF_HOME = $HF_HOME ==="
+mkdir -p "$HF_HOME" || {
+    echo "wei-prebuilt-pdx: FATAL: cannot create HF_HOME at $HF_HOME" >&2
+    exit 1
+}
+
 echo "=== wei-prebuilt-pdx: staged checkpoint = $K3_STAGED_DIR ==="
 if [[ ! -d "$K3_STAGED_DIR" ]]; then
     echo "wei-prebuilt-pdx: FATAL: $K3_STAGED_DIR is not a directory." >&2
