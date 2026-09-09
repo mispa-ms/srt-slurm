@@ -11,8 +11,8 @@
 #  1. hfshim -- HF cache -> staged checkpoint.
 #  2. ckptidx-829 -- the int64 checkpoint index. Byte-identical to vllm#55924
 #     (opened 2026-09-08); patch(1) absorbs the +156 line offset. Not ours.
-#  3. revert52388-829 -- vllm#53774, still open; its crash site is still at
-#     mamba_utils.py:1083 ('expected N block tables').
+#  3. (dropped 09-09) revert52388-829 / vllm#53774 -- no longer needed: the
+#     no-spec c64 arm completed without it at the same throughput (66998420).
 #  4. pr50499-908 -- vllm#50494 + #50499 head ce830b04 (2026-09-05). Applies
 #     clean. Fixes the block_strides remap itself, so that carry is gone.
 #  5. dspark-draft-loader -- #54416's mechanism (its patch does not apply to
@@ -38,9 +38,6 @@
 #     draft broadcast. The 09/08 "wall 3" race: every DSpark PP2 arm died on a
 #     PP1 gather assert ~20 s after the first request unless launches were
 #     serialised. With it, DSpark arms should complete without CLB.
-#
-# K3_SKIP_REVERT52388=1 drops step 3 (the vllm#53774 revert) to test whether the
-# 09-08 nightly still needs it; every other step is unchanged.
 #
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba members over the member-identity path. #50499 says
@@ -87,11 +84,9 @@ fi
 
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-829.sh
-if [ "${K3_SKIP_REVERT52388:-0}" = "1" ]; then
-    echo "[k3-pp-908] K3_SKIP_REVERT52388=1: NOT applying the #52388 revert (vllm#53774) -- necessity arm"
-else
-    bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
-fi
+# The #52388 revert (vllm#53774) is NOT applied: on 09-08 the no-spec c64 arm
+# completed without it, 5,381 tok/s/GPU vs 5,369 with it (66998420 vs 66873102),
+# no "expected N block tables" assert. The 08-28/08-29 crash it fixed is gone.
 bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-908.sh
