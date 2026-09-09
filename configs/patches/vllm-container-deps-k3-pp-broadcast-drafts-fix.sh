@@ -27,6 +27,10 @@
 # out-of-bounds index. Our retired carry broadcast the whole `draft_tokens`
 # buffer (no gather), which is why 08/28 never saw this.
 #
+# UPSTREAM. vllm#55745 (eastwood-c) fixes the same race with
+# `input_batch.idx_mapping.record_stream(self.broadcast_stream)`; merged 2026-09-09
+# (e8064a96d0). Images that carry it are detected below and left alone.
+#
 # THE FIX. Gather on the main stream, where `idx_mapping` is both valid and
 # ordered, and let the side stream only own the broadcast. `send` is then a
 # main-stream allocation used on the side stream, which the existing
@@ -69,6 +73,10 @@ new = (
 )
 if new in src:
     print("[bcfix] already applied"); sys.exit(0)
+# Upstream's own fix (vllm#55745, merged 2026-09-09 as e8064a96d0) keeps the gather on the
+# side stream and records that stream on idx_mapping instead. Equivalent; nothing to do.
+if "input_batch.idx_mapping.record_stream(self.broadcast_stream)" in src:
+    print("[bcfix] upstream #55745 present in this image (record_stream on idx_mapping); skipping"); sys.exit(0)
 if src.count(old) != 1:
     sys.exit(f"[bcfix] FATAL: expected exactly one broadcast_drafts block, found {src.count(old)}; image differs from 9ea8f3ff")
 # The block must be inside broadcast_drafts, not receive().
