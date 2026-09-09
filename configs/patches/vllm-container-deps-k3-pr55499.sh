@@ -31,6 +31,11 @@ TR="$VLLM_ROOT/vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py"
 FI_VER=$(python3 - "$FI_ROOT" <<'PY'
 import os, re, sys
 root = sys.argv[1]
+import glob
+for d in glob.glob(os.path.join(root, "flashinfer_python-*.dist-info")) + glob.glob(os.path.join(root, "flashinfer-*.dist-info")):
+    for line in open(os.path.join(d, "METADATA")):
+        if line.startswith("Version:"):
+            print(line.split(":", 1)[1].strip()); sys.exit(0)
 for rel in ("flashinfer/version.py", "flashinfer/_version.py", "version.txt", "flashinfer/version.txt"):
     p = os.path.join(root, rel)
     if os.path.exists(p):
@@ -48,17 +53,18 @@ PY
 )
 echo "[pr55499] flashinfer $FI_VER under $FI_ROOT"
 
-# 1. FlashInfer prefill.py
+# 1. FlashInfer prefill.py. The nightly builds FlashInfer from source and its version.py
+# reads "0.0.0+unknown", so the version string is informational only; the gate is the
+# exact-context dry-run of the post1 hunk (3 hunks, fuzz 0) -- it applies to 0.6.18 and
+# to nothing else, which is a stricter check than any version string.
 if grep -q "skip_all_rows_active_check" "$FI_PREFILL"; then
     echo "[pr55499] flashinfer already has skip_all_rows_active_check (>= 0.6.18.post1); skipping the FlashInfer hunk"
-elif [ "$FI_VER" = "0.6.18" ]; then
+else
     if ! patch -p1 -d "$FI_ROOT" --dry-run --forward --fuzz=0 < /configs/patches/flashinfer-0.6.18.post1-prefill.patch > /tmp/pr55499-fi-dry.log 2>&1; then
-        echo "[pr55499] FATAL: the post1 prefill.py hunk does not apply to this flashinfer 0.6.18" >&2; cat /tmp/pr55499-fi-dry.log >&2; exit 1
+        echo "[pr55499] FATAL: the post1 prefill.py hunk does not apply to this flashinfer ($FI_VER); it is cut against 0.6.18" >&2; cat /tmp/pr55499-fi-dry.log >&2; exit 1
     fi
     patch -p1 -d "$FI_ROOT" --forward --fuzz=0 < /configs/patches/flashinfer-0.6.18.post1-prefill.patch
-    echo "[pr55499] applied the FlashInfer 0.6.18.post1 prefill.py hunk in place"
-else
-    echo "[pr55499] FATAL: flashinfer $FI_VER is neither 0.6.18 nor post1+; refusing to guess" >&2; exit 1
+    echo "[pr55499] applied the FlashInfer 0.6.18.post1 prefill.py hunk in place (flashinfer reported $FI_VER)"
 fi
 
 # 2. vLLM
