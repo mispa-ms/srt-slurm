@@ -35,6 +35,9 @@
 #     without it every WRITE-complete request still waits out the 30 s lease
 #     (77,584 "Releasing expired KV blocks" lines in 66850730, 0 on 08-29).
 #
+# K3_SKIP_REVERT52388=1 drops step 3 (the vllm#53774 revert) to test whether the
+# 09-08 nightly still needs it; every other step is unchanged.
+#
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba members over the member-identity path. #50499 says
 #          "Mamba/SSM hybrid layouts under PP remain unsupported" and refuses
@@ -80,7 +83,11 @@ fi
 
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 bash /configs/patches/vllm-container-deps-k3-ckptidx-829.sh
-bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
+if [ "${K3_SKIP_REVERT52388:-0}" = "1" ]; then
+    echo "[k3-pp-908] K3_SKIP_REVERT52388=1: NOT applying the #52388 revert (vllm#53774) -- necessity arm"
+else
+    bash /configs/patches/vllm-container-deps-k3-revert52388-829.sh
+fi
 bash /configs/patches/vllm-container-deps-k3-dspark-draft-loader.sh
 bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-908.sh
