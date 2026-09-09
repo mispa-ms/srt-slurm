@@ -34,6 +34,10 @@
 #     the other base_worker patches). Undoes #54518's push-producer regression:
 #     without it every WRITE-complete request still waits out the 30 s lease
 #     (77,584 "Releasing expired KV blocks" lines in 66850730, 0 on 08-29).
+#  9. pr55745-908 -- vllm#55745 verbatim: record_stream idx_mapping in the PP
+#     draft broadcast. The 09/08 "wall 3" race: every DSpark PP2 arm died on a
+#     PP1 gather assert ~20 s after the first request unless launches were
+#     serialised. With it, DSpark arms should complete without CLB.
 #
 # K3_SKIP_REVERT52388=1 drops step 3 (the vllm#53774 revert) to test whether the
 # 09-08 nightly still needs it; every other step is unchanged.
@@ -95,6 +99,7 @@ bash /configs/patches/vllm-container-deps-k3-pushdcp-908.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-908.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 bash /configs/patches/vllm-container-deps-k3-pr55900-908.sh
+bash /configs/patches/vllm-container-deps-k3-pr55745-908.sh
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
@@ -118,6 +123,8 @@ if "does not support decode_context_parallel_size > 1" in src("vllm/distributed/
 if "shard identically" not in bw:
     fail.append("push DCP handshake equality check missing")
 pw = src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py")
+if "idx_mapping.record_stream(self.broadcast_stream)" not in src("vllm/v1/worker/gpu/pp_utils.py"):
+    fail.append("#55745 missing: PP draft broadcast still gathers idx_mapping without record_stream (wall 3 race)")
 if "is_recv=False" not in pw or "_failed_recv_pending" not in bw:
     fail.append("#55900 missing: push producer never reports done_sending (every request expires its lease)")
 if "_align_remote_regions_by_member" not in bw:
