@@ -85,6 +85,37 @@ if [[ "$n" -lt 90 ]]; then
     exit 1
 fi
 
+# BUILD THE THP SHIM. Without it the Mooncake store cannot mount on EFA at all:
+# one EFA device refuses ibv_reg_mr past a cumulative 383 GiB (measured; equals
+# its reported max_mr_size), the generic RDMA transport registers the whole
+# segment on every named device, and 8 ranks x 190 GiB + 8 x 4 GiB asks each NIC
+# for 1,552 GiB. Seven of eight ranks died with
+#   real_client.cpp:1078] Failed to mount segment: INVALID_PARAMS
+#
+# The budget is counted in 4 KiB PAGES (efa_verbs.c: max_mr_size =
+# max_mr_pages * PAGE_SIZE), so 2 MiB-backed memory costs 1/512 of it. Measured
+# on a pool0 node, same binary, only LD_PRELOAD differing:
+#   without shim: fails at   383 GiB, AnonHugePages 0
+#   with shim:    1,700 GiB registered, AnonHugePages 1,703 GiB
+#
+# The config sets LD_PRELOAD to the .so this builds. If the build fails, fail
+# here rather than an hour later at segment mount.
+SHIM_SRC=/configs/patches/thp_mmap_shim.c
+SHIM_SO=/configs/patches/thp_mmap_shim.so
+echo "=== wei-prebuilt-pdx: building the THP mmap shim ==="
+if ! gcc -O2 -fPIC -shared -o "$SHIM_SO" "$SHIM_SRC" -ldl; then
+    echo "wei-prebuilt-pdx: FATAL: could not build $SHIM_SO." >&2
+    echo "  Without it the 190 GiB Mooncake segment cannot register on EFA." >&2
+    exit 1
+fi
+ls -l "$SHIM_SO"
+# Prove it loads before any worker depends on it: a broken .so under LD_PRELOAD
+# makes every process fail with a linker error that reads nothing like this.
+if ! LD_PRELOAD="$SHIM_SO" python3 -c "print('    shim loads: ok')"; then
+    echo "wei-prebuilt-pdx: FATAL: $SHIM_SO does not load under LD_PRELOAD." >&2
+    exit 1
+fi
+
 # The HF cache shim first: a missing checkpoint should fail here, not later.
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
