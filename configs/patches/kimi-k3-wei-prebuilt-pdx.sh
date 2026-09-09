@@ -85,34 +85,46 @@ if [[ "$n" -lt 90 ]]; then
     exit 1
 fi
 
-# BUILD THE THP SHIM. Without it the Mooncake store cannot mount on EFA at all:
-# one EFA device refuses ibv_reg_mr past a cumulative 383 GiB (measured; equals
-# its reported max_mr_size), the generic RDMA transport registers the whole
-# segment on every named device, and 8 ranks x 190 GiB + 8 x 4 GiB asks each NIC
-# for 1,552 GiB. Seven of eight ranks died with
-#   real_client.cpp:1078] Failed to mount segment: INVALID_PARAMS
+# PROVE HUGE PAGES ARE ON BEFORE SPENDING AN HOUR FINDING OUT THEY ARE NOT.
+# EFA counts its registration budget in 4 KiB PAGES (efa_verbs.c:
+# max_mr_size = max_mr_pages * PAGE_SIZE), ~383 GiB per device measured here.
+# 190 GB x 8 ranks does not fit on 4 KiB pages; the same memory on 2 MiB pages
+# does, by 512x.
 #
-# The budget is counted in 4 KiB PAGES (efa_verbs.c: max_mr_size =
-# max_mr_pages * PAGE_SIZE), so 2 MiB-backed memory costs 1/512 of it. Measured
-# on a pool0 node, same binary, only LD_PRELOAD differing:
-#   without shim: fails at   383 GiB, AnonHugePages 0
-#   with shim:    1,700 GiB registered, AnonHugePages 1,703 GiB
+# The segment comes from aligned_alloc inside glibc malloc
+# (real_client.cpp -> client_buffer_allocation.cpp), and glibc reaches the
+# kernel via its internal __mmap, so an LD_PRELOAD interposer cannot see it --
+# three runs were spent proving that the hard way. glibc's own tunable is the
+# switch, and the config sets it:
 #
-# The config sets LD_PRELOAD to the .so this builds. If the build fails, fail
-# here rather than an hour later at segment mount.
-SHIM_SRC=/configs/patches/thp_mmap_shim.c
-SHIM_SO=/configs/patches/thp_mmap_shim.so
-echo "=== wei-prebuilt-pdx: building the THP mmap shim ==="
-if ! gcc -O2 -fPIC -shared -o "$SHIM_SO" "$SHIM_SRC" -ldl; then
-    echo "wei-prebuilt-pdx: FATAL: could not build $SHIM_SO." >&2
-    echo "  Without it the 190 GiB Mooncake segment cannot register on EFA." >&2
+#   GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+#
+# This probe is the gate. It aligned_allocs 2 GiB, touches it, and reads
+# AnonHugePages for THAT RANGE out of /proc/self/smaps -- not the global
+# counter in /proc/meminfo, which moves for unrelated reasons and is how this
+# tunable was first, wrongly, written off.
+# NOTE ON WHAT THIS CAN AND CANNOT CHECK. This script runs BEFORE the config's
+# `environment:` block is applied -- the same trap that cost four runs with
+# HF_HOME -- so GLIBC_TUNABLES is not set here even when the workers will have
+# it. Gating on the variable's presence would fail a perfectly good run. So the
+# gate proves the MECHANISM works in this container, with and without, and the
+# workers' own `Mounting segment` lines are what confirm the plumbing.
+echo "=== wei-prebuilt-pdx: verifying huge pages for the store segment ==="
+gcc -O2 -o /tmp/thp_probe /configs/patches/thp_probe.c || {
+    echo "wei-prebuilt-pdx: FATAL: could not build thp_probe." >&2
     exit 1
-fi
-ls -l "$SHIM_SO"
-# Prove it loads before any worker depends on it: a broken .so under LD_PRELOAD
-# makes every process fail with a linker error that reads nothing like this.
-if ! LD_PRELOAD="$SHIM_SO" python3 -c "print('    shim loads: ok')"; then
-    echo "wei-prebuilt-pdx: FATAL: $SHIM_SO does not load under LD_PRELOAD." >&2
+}
+echo "    control (no tunable, expect 0%):"
+/tmp/thp_probe 2 >/dev/null 2>&1 && {
+    echo "wei-prebuilt-pdx: NOTE: huge pages are already on without the tunable;" >&2
+    echo "  harmless, but it means this container's default differs from pdx's." >&2
+}
+echo "    arm (glibc.malloc.hugetlb=1, expect 100%):"
+if ! GLIBC_TUNABLES=glibc.malloc.hugetlb=1 /tmp/thp_probe 2; then
+    echo "wei-prebuilt-pdx: FATAL: the tunable does not produce huge pages here," >&2
+    echo "  so the store segment lands on 4 KiB pages, 190 GB x 8 ranks cannot" >&2
+    echo "  register on EFA, and every rank dies with 'Failed to mount segment'." >&2
+    echo "  glibc must be >= 2.35 (image is 2.39) and THP must not be 'never'." >&2
     exit 1
 fi
 
