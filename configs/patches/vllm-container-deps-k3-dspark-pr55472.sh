@@ -28,7 +28,12 @@ VLLM_ROOT=$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path
 DU="$VLLM_ROOT/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
 [ -f "$DU" ] || { echo "[pr55472] FATAL: no dspark/utils.py in this image" >&2; exit 1; }
 
-python3 - "$DU" <<'PY'
+# `|| rc=$?` is load-bearing: under `set -e` a bare heredoc call that exits 10
+# kills the script before `rc=$?` runs. That path is only reached once #55472 is
+# merged into the base image, which is why the 09-08 chain never hit it and the
+# 09-09 one died there (pipeline 67058063, worker exit 10).
+rc=0
+python3 - "$DU" <<'PY' || rc=$?
 import sys
 src = open(sys.argv[1]).read()
 flat = "".join(src.split())
@@ -37,17 +42,16 @@ if "parallel_config=replace(vllm_config.parallel_config,pipeline_parallel_size=1
 if "decode_context_parallel_size=(vllm_config.parallel_config.decode_context_parallel_size)" in flat:
     sys.exit("[pr55472] FATAL: the draft-dcp stopgap is already applied here -- the two rewrite the same block; drop one from the chain")
 PY
-rc=$?
 if [ "$rc" -eq 10 ]; then
     :
 elif [ "$rc" -ne 0 ]; then
     exit "$rc"
 else
     if ! patch -p1 -d "$VLLM_ROOT" --dry-run --forward --fuzz=0 \
-         < /configs/patches/k3-pr55472.patch > /tmp/pr55472-dry.log 2>&1; then
+         < /configs/patches/k3-pr55472.patch > "${TMPDIR:-/tmp}/pr55472-dry.log" 2>&1; then
         echo "[pr55472] FATAL: #55472 does not apply to this image" >&2
         echo "[pr55472] cut against 9ea8f3ff after the draft-loader guard; check both" >&2
-        cat /tmp/pr55472-dry.log >&2
+        cat "${TMPDIR:-/tmp}/pr55472-dry.log" >&2
         exit 1
     fi
     patch -p1 -d "$VLLM_ROOT" --forward --fuzz=0 < /configs/patches/k3-pr55472.patch
