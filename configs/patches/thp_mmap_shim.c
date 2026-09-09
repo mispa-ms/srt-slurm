@@ -63,6 +63,7 @@
 #define DEFAULT_MIN (2UL * 1024UL * 1024UL * 1024UL)   /* 2 GiB */
 
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
+static void *(*real_mmap64)(void *, size_t, int, int, int, off_t);
 static size_t min_bytes;
 static int quiet;
 static int ready;
@@ -70,6 +71,8 @@ static int ready;
 static void init_once(void) {
     if (ready) return;
     real_mmap = dlsym(RTLD_NEXT, "mmap");
+    real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
+    if (!real_mmap64) real_mmap64 = real_mmap;
     const char *m = getenv("THP_SHIM_MIN_BYTES");
     min_bytes = m ? strtoul(m, NULL, 10) : DEFAULT_MIN;
     if (min_bytes < TWO_MIB) min_bytes = TWO_MIB;
@@ -77,7 +80,20 @@ static void init_once(void) {
     ready = 1;
 }
 
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+/* Announce ourselves once per process. Without this a silent log is ambiguous:
+ * it could mean LD_PRELOAD never reached the worker, or that it did and the
+ * allocation simply does not come through the interposable mmap symbol. Those
+ * need opposite fixes, and one run was already spent not being able to tell. */
+__attribute__((constructor))
+static void thp_shim_banner(void) {
+    init_once();
+    if (!quiet)
+        fprintf(stderr, "[thp-shim] loaded in pid %d, min_bytes=%zu\n",
+                (int)getpid(), min_bytes);
+}
+
+static void *thp_mmap(void *addr, size_t len, int prot, int flags, int fd,
+                      off_t off, int use64) {
     init_once();
 
     /* Decide BEFORE calling through, because of MAP_POPULATE. */
@@ -97,7 +113,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
      * what MAP_POPULATE promised. */
     int passthru_flags = eligible ? (flags & ~MAP_POPULATE) : flags;
 
-    void *p = real_mmap(addr, len, prot, passthru_flags, fd, off);
+    void *p = (use64 ? real_mmap64 : real_mmap)(addr, len, prot,
+                                                passthru_flags, fd, off);
     if (p == MAP_FAILED || !eligible) return p;
 
     /* THP only backs a 2 MiB-aligned subrange, so advise the aligned interior
@@ -125,4 +142,20 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
                 (double)span / (1024.0 * 1024.0 * 1024.0), (void *)start,
                 rc_h, rc_p, (flags & MAP_POPULATE) ? " (MAP_POPULATE deferred)" : "");
     return p;
+}
+
+/* BOTH SYMBOLS, AND THIS IS WHAT THE FIRST TWO ATTEMPTS MISSED.
+ * Code compiled with _FILE_OFFSET_BITS=64 -- which is CPython, and every C++
+ * translation unit that includes <sys/mman.h> under large-file support, so
+ * Mooncake too -- does not call `mmap`. It calls `mmap64`, a separate glibc
+ * symbol. Interposing only `mmap` therefore catches almost nothing: the run
+ * logged zero treated mappings while the loader banner proved the shim WAS
+ * loaded, and a plain `mmap.mmap(-1, 3 GiB)` from python slipped through in the
+ * same way. Export both names. */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    return thp_mmap(addr, len, prot, flags, fd, off, 0);
+}
+
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    return thp_mmap(addr, len, prot, flags, fd, off, 1);
 }
