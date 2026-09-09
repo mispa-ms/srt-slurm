@@ -44,7 +44,7 @@
  *
  * Build:  gcc -O2 -fPIC -shared -o thp_mmap_shim.so thp_mmap_shim.c -ldl
  * Use:    LD_PRELOAD=/configs/patches/thp_mmap_shim.so
- * Tune:   THP_SHIM_MIN_BYTES=<n>   THP_SHIM_VERBOSE=1
+ * Tune:   THP_SHIM_MIN_BYTES=<n>   THP_SHIM_QUIET=1
  * ===========================================================================
  */
 #define _GNU_SOURCE
@@ -64,7 +64,7 @@
 
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
 static size_t min_bytes;
-static int verbose;
+static int quiet;
 static int ready;
 
 static void init_once(void) {
@@ -73,26 +73,36 @@ static void init_once(void) {
     const char *m = getenv("THP_SHIM_MIN_BYTES");
     min_bytes = m ? strtoul(m, NULL, 10) : DEFAULT_MIN;
     if (min_bytes < TWO_MIB) min_bytes = TWO_MIB;
-    verbose = getenv("THP_SHIM_VERBOSE") != NULL;
+    quiet = getenv("THP_SHIM_QUIET") != NULL;
     ready = 1;
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     init_once();
-    void *p = real_mmap(addr, len, prot, flags, fd, off);
-    if (p == MAP_FAILED) return p;
 
-    /* Anonymous, writable, at least min_bytes. Everything else is left alone:
-     * MADV_POPULATE_WRITE on a file mapping would force real I/O, and on a
-     * read-only mapping it fails. */
-    if (!(flags & MAP_ANONYMOUS) || !(prot & PROT_WRITE) || len < min_bytes)
-        return p;
-    /* hugetlb mappings are already huge; asking again is meaningless. */
-    if (flags & MAP_HUGETLB) return p;
+    /* Decide BEFORE calling through, because of MAP_POPULATE. */
+    int eligible = (flags & MAP_ANONYMOUS) && (prot & PROT_WRITE)
+                   && len >= min_bytes && !(flags & MAP_HUGETLB);
 
-    /* THP only backs a 2 MiB-aligned subrange, so madvise the aligned interior
-     * rather than the raw bounds -- an unaligned call is silently a no-op for
-     * the head and tail and would leave the segment on 4 KiB pages. */
+    /* THE ORDERING BUG THIS AVOIDS. Mooncake maps its segment with
+     * MAP_POPULATE, which faults every page in DURING the mmap call. By the
+     * time an madvise(MADV_HUGEPAGE) afterwards could run, the range is already
+     * backed by 4 KiB pages, and madvise does NOT retroactively collapse them
+     * -- khugepaged might, eventually, but not before ibv_reg_mr runs. The
+     * first version of this shim advised after the fact and changed nothing:
+     * the run failed with the same rdma_context.cpp:602 ENOMEM as without it.
+     *
+     * So drop MAP_POPULATE here and do the population ourselves, after the
+     * hugepage hint. The caller still gets a fully resident mapping, which is
+     * what MAP_POPULATE promised. */
+    int passthru_flags = eligible ? (flags & ~MAP_POPULATE) : flags;
+
+    void *p = real_mmap(addr, len, prot, passthru_flags, fd, off);
+    if (p == MAP_FAILED || !eligible) return p;
+
+    /* THP only backs a 2 MiB-aligned subrange, so advise the aligned interior
+     * rather than the raw bounds -- an unaligned call silently no-ops the head
+     * and tail and would leave those on 4 KiB pages. */
     unsigned long start = ((unsigned long)p + TWO_MIB - 1) & ~(TWO_MIB - 1);
     unsigned long end = ((unsigned long)p + len) & ~(TWO_MIB - 1);
     if (end <= start) return p;
@@ -102,14 +112,17 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     int rc_p = madvise((void *)start, span, MADV_POPULATE_WRITE);
     if (rc_p != 0) {
         /* Older kernels lack MADV_POPULATE_WRITE. Touch one byte per huge page
-         * instead; the fault is what assembles the THP. */
+         * instead; the write fault is what assembles the THP. */
         for (unsigned long o = 0; o < span; o += TWO_MIB)
             ((volatile char *)start)[o] = ((volatile char *)start)[o];
         rc_p = 0;
     }
-    if (verbose)
-        fprintf(stderr, "[thp-shim] %.2f GiB at %p: hugepage=%d populate=%d\n",
+    /* Log every mapping we touch, not only under a verbose flag: there are a
+     * handful of them per rank, and their absence is the only way to tell "the
+     * shim did not apply" from "the shim applied and did not help". */
+    if (!quiet)
+        fprintf(stderr, "[thp-shim] %.2f GiB at %p: hugepage=%d populate=%d%s\n",
                 (double)span / (1024.0 * 1024.0 * 1024.0), (void *)start,
-                rc_h, rc_p);
+                rc_h, rc_p, (flags & MAP_POPULATE) ? " (MAP_POPULATE deferred)" : "");
     return p;
 }
