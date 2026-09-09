@@ -1111,6 +1111,39 @@ def build_otel_env(observability: ObservabilityConfig, component: str) -> dict[s
 _DYNAMO_CACHE_ROOT = "/configs/dynamo-wheels"
 
 
+def _apt_install(pkgs: str) -> str:
+    """Bash to install *pkgs* non-interactively, and say why when it fails.
+
+    THE BUG THIS FIXES. On aws-pdx every cold-cache dynamo build died with exit
+    100 -- apt-get's own error code -- and the reason was invisible because the
+    chain redirected to /dev/null. Reproduced inside the same container:
+
+        *** ssh_config (Y/I/N/O/D/Z) [default=N] ? dpkg: error processing
+        package openssh-client (--configure): ...
+        E: Sub-process /usr/bin/dpkg returned an error code (1)
+
+    ``git`` pulls in openssh-client, whose ``/etc/ssh/ssh_config`` collides with
+    the copy already in the image, so dpkg stops to ask which one to keep. ``-y``
+    does NOT cover conffile prompts; ``DEBIAN_FRONTEND=noninteractive`` plus the
+    two ``--force-conf*`` options do. Keeping the image's file (``confold``) is
+    the conservative choice -- the build only wants the binaries, and silently
+    replacing a config the image author put there is the riskier default.
+
+    Output still goes to a file rather than the console, but on failure the tail
+    is printed. A build step that hides its own error costs a full cluster
+    round-trip to diagnose, which is what this one cost.
+    """
+    apt = ("DEBIAN_FRONTEND=noninteractive apt-get "
+           "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ")
+    log = "/tmp/dynamo-apt.log"
+    return (
+        apt + "update -qq && "
+        "{ " + apt + "install -y -qq " + pkgs + " > " + log + " 2>&1 || "
+        "{ echo '--- apt-get install failed; tail of " + log + " ---'; "
+        "tail -40 " + log + "; false; }; } && "
+    )
+
+
 def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | None = None) -> str:
     """Bash for hash-pinned source install with a /configs/dynamo-wheels cache.
 
@@ -1165,7 +1198,7 @@ def _hash_cached_source_install(dynamo_hash: str, cargo_patches: list[str] | Non
         f"flock -x 201; "
         f"if [ ! -f {cache}/.complete ]; then "
         # Build tools — install on cold cache only. apt + protoc + cargo + maturin.
-        f"apt-get update -qq && apt-get install -y -qq libclang-dev curl git protobuf-compiler > /dev/null 2>&1 && "
+        f"{_apt_install('libclang-dev curl git protobuf-compiler')}"
         f"if ! command -v cargo &>/dev/null; then "
         f"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -q && "
         f". $HOME/.cargo/env; fi && "
@@ -1213,7 +1246,7 @@ def _live_source_install_for_top_of_tree() -> str:
     sglang = (
         # protobuf-compiler is required by modelexpress-common's build.rs (prost-build).
         # Some SGLang images ship without /usr/bin/protoc; install it unconditionally.
-        "apt-get update -qq && apt-get install -y -qq libclang-dev curl protobuf-compiler > /dev/null 2>&1 && "
+        f"{_apt_install('libclang-dev curl protobuf-compiler')}"
         "if ! command -v cargo &>/dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -q && source $HOME/.cargo/env; fi && "
         # Force-reinstall maturin: see _hash_cached_source_install.
         "pip install --break-system-packages --force-reinstall --quiet maturin && "
@@ -1232,7 +1265,7 @@ def _live_source_install_for_top_of_tree() -> str:
 
     portable = (
         "if ! command -v cargo &> /dev/null || ! command -v maturin &> /dev/null; then "
-        "apt-get update -qq && apt-get install -y -qq git curl libclang-dev protobuf-compiler > /dev/null 2>&1 && "
+        f"{_apt_install('git curl libclang-dev protobuf-compiler')}"
         "if ! command -v cargo &> /dev/null; then "
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source $HOME/.cargo/env; fi; fi && "
         # Force-reinstall maturin: see _hash_cached_source_install.
