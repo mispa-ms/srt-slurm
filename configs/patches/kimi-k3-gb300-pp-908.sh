@@ -30,6 +30,10 @@
 #     66827142 (both arms) died on decode at NixlPushConnector.__init__:
 #     "does not support decode_context_parallel_size > 1". Ours, but a carry
 #     for the base: without it no K3 disagg topology exists on this nightly.
+#  8. pr55900-908 -- vllm#55900 verbatim, LAST (applies at offsets on top of
+#     the other base_worker patches). Undoes #54518's push-producer regression:
+#     without it every WRITE-complete request still waits out the 30 s lease
+#     (77,584 "Releasing expired KV blocks" lines in 66850730, 0 on 08-29).
 #
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba members over the member-identity path. #50499 says
@@ -83,6 +87,7 @@ bash /configs/patches/vllm-container-deps-k3-pr50499-908.sh
 bash /configs/patches/vllm-container-deps-k3-pushdcp-908.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-908.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
+bash /configs/patches/vllm-container-deps-k3-pr55900-908.sh
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
@@ -105,6 +110,9 @@ if "does not support decode_context_parallel_size > 1" in src("vllm/distributed/
     fail.append("#50611's push+DCP refusal is still in connector.py")
 if "shard identically" not in bw:
     fail.append("push DCP handshake equality check missing")
+pw = src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py")
+if "is_recv=False" not in pw or "_failed_recv_pending" not in bw:
+    fail.append("#55900 missing: push producer never reports done_sending (every request expires its lease)")
 if "_align_remote_regions_by_member" not in bw:
     fail.append("#50499 member-identity routing missing")
 refusal = "with Mamba/SSM hybrid KV cache layouts yet" in bw
