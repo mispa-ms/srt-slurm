@@ -1,0 +1,116 @@
+commit 8c87c333b84c85908b1d11f0044457692277c6f3
+Author: Wei Zhao <51183510+wzhao18@users.noreply.github.com>
+Date:   Wed Sep 9 16:38:20 2026 -0400
+
+    [Perf] Fix TRTLLM ragged prefill perf regression (#55499)
+    
+    Signed-off-by: wzhao18 <wzhao18.sz@gmail.com>
+    Co-authored-by: OpenAI Codex <noreply@openai.com>
+
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index daaef86898..a572d94522 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1547,6 +1547,7 @@ class MLACommonPrefillMetadata:
+         max_seq_len: int
+         seq_lens: torch.Tensor
+         token_to_seq: torch.Tensor
++        all_rows_active: bool
+ 
+         # for mla DCP
+         padded_local_seq_lens: list[int] | None = None
+@@ -2124,6 +2125,8 @@ def build_mla_chunked_context_metadata(
+             max_seq_len=max(plan.seq_lens),
+             seq_lens=seq_lens_cpu[request_slice],
+             token_to_seq=token_to_seq[token_slice],
++            all_rows_active=all(length > 0 for length in query_lens)
++            and all(length > 0 for length in plan.seq_lens),
+             num_local_context_tokens=local_token_slice.stop - local_token_slice.start,
+         )
+         if use_dcp:
+@@ -2529,6 +2532,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+                 output_dtype=self.model_config.dtype,
+                 q_data_type=self.q_data_type,
+                 prefill_backend=self._prefill_backend,
++                query_lens_cpu=prefill_query_lens_cpu,
+             )
+ 
+             self._prefill_backend.prepare_metadata(prefill_metadata)
+diff --git a/vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py b/vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py
+index b8ae15b4e6..167738b07a 100644
+--- a/vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py
++++ b/vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py
+@@ -91,6 +91,26 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
+         self._query_seq_lens = (
+             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
+         )
++        query_lens_cpu = prefill_metadata.query_lens_cpu
++        if query_lens_cpu is None:
++            raise ValueError("TRTLLM ragged prefill requires CPU query lengths")
++        if query_lens_cpu.device.type != "cpu":
++            raise ValueError("TRTLLM ragged prefill query lengths must be on CPU")
++        if query_lens_cpu.ndim != 1 or query_lens_cpu.numel() == 0:
++            raise ValueError(
++                "TRTLLM ragged prefill requires a non-empty 1D query-length tensor"
++            )
++        min_query_len = int(torch.min(query_lens_cpu).item())
++        if min_query_len < 0:
++            raise ValueError("TRTLLM ragged prefill query lengths must be non-negative")
++        self._has_active_rows = min_query_len > 0
++        if not self._has_active_rows:
++            has_mixed_rows = bool(torch.any(query_lens_cpu > 0).item())
++            if has_mixed_rows:
++                raise ValueError(
++                    "TRTLLM ragged prefill contains mixed active and empty query "
++                    f"rows: query_lens={query_lens_cpu.tolist()}"
++                )
+ 
+     def supports_out(self) -> bool:
+         # Output head dim is v.shape[-1] == v_head_dim, so `out` is unpadded.
+@@ -116,6 +136,18 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
+                 dtype=self._prefill_metadata.output_dtype,
+             )
+ 
++        if not self._has_active_rows:
++            out.zero_()
++            if return_softmax_lse:
++                lse = torch.empty(
++                    self.num_heads,
++                    q.shape[0],
++                    dtype=torch.float32,
++                    device=q.device,
++                )
++                return out, lse.fill_(-float("inf"))
++            return out
++
+         ret = trtllm_ragged_attention_deepseek(
+             query=q,
+             key=k,
+@@ -135,6 +167,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
+             is_causal=True,
+             return_lse=return_softmax_lse,
+             out=out,
++            skip_all_rows_active_check=True,
+         )
+ 
+         if isinstance(ret, tuple):
+@@ -152,6 +185,11 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         from flashinfer.prefill import trtllm_ragged_attention_deepseek
+ 
++        if not chunk.all_rows_active:
++            raise ValueError(
++                "TRTLLM ragged context prefill contains an empty query or KV row"
++            )
++
+         if out is None:
+             out = torch.empty(
+                 q.shape[0],
+@@ -180,6 +218,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
+             is_causal=False,
+             return_lse=True,
+             out=out,
++            skip_all_rows_active_check=True,
+         )
+ 
+         # Convert from (q_len, num_heads) to (num_heads, q_len)
