@@ -198,6 +198,23 @@ if missing:
 print("    engine.so resolves libfabric")
 PYEFA
 
+# ACTUALLY IMPORT IT. `ldd` reports missing FILES; it says nothing about missing
+# SYMBOL VERSIONS, and that is the failure mode the neighbouring EFA effort is
+# stuck on right now -- one container carrying two rdma-core generations gives
+#   libibverbs.so.1: version `IBVERBS_PRIVATE_34' not found (required by libmlx5.so.1)
+# at dlopen time, long after ldd has said everything is fine. We do not replace
+# the image's rdma-core (only libfabric is added), so this should pass, but an
+# hour of GPU time is what it costs to find out otherwise.
+python3 - <<'PYIMP'
+import sys
+try:
+    import mooncake, mooncake.engine  # noqa: F401
+except Exception as e:
+    sys.exit("wei-prebuilt-pdx: FATAL: mooncake does not import after installing "
+             f"the EFA wheel: {type(e).__name__}: {e}")
+print("    mooncake imports with the EFA transport in place")
+PYIMP
+
 # The HF cache shim first: a missing checkpoint should fail here, not later.
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
