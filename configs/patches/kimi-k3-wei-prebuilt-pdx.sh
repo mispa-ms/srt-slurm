@@ -128,6 +128,76 @@ if ! GLIBC_TUNABLES=glibc.malloc.hugetlb=1 /tmp/thp_probe 2; then
     exit 1
 fi
 
+# THE EFA TRANSPORT. The generic RDMA transport registers memory on EFA but
+# cannot move data with it: c70 mounted the segment on 8/8 ranks and then logged
+# TRANSFER_FAIL 244,493 times with ext_cache_hit stuck at 0.0%. EFA has no RC
+# queue pairs, only UD and SRD, and engine.so calls ibv_create_qp.
+#
+# Mooncake ships the EFA transport as a SEPARATE wheel that links libfabric:
+#
+#   mooncake-transfer-engine-efa-cuda13   (efa_transport, needs libfabric.so.1)
+#
+# and libfabric has to come from us. apt's 1.17.0 has no efa provider
+# (fi_info -p efa -> -61) and the host has no /opt/amazon; only the EFA kernel
+# driver is present (2.17.3g). We build it once into lustre with a one-line fix
+# -- upstream's efa_device_list_initialize() aborts on the first non-EFA verbs
+# device, and these nodes carry 2 real InfiniBand ports ahead of the 16 EFA ones
+# in ibv_get_device_list order. See tools/build_libfabric_efa.sh.
+FAB=/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/misunp/efa/libfabric
+echo "=== wei-prebuilt-pdx: wiring the EFA transport ==="
+if [[ ! -f "$FAB/lib/libfabric.so.1" ]]; then
+    echo "wei-prebuilt-pdx: FATAL: $FAB/lib/libfabric.so.1 is missing." >&2
+    echo "  Build it with tools/build_libfabric_efa.sh (one job on the batch" >&2
+    echo "  partition; it must be a node WITH EFA devices so fi_info can be" >&2
+    echo "  checked against real hardware)." >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="$FAB/lib:${LD_LIBRARY_PATH:-}"
+
+# Belt and braces: also put it where the loader already looks. The export above
+# only helps if this script's environment reaches the worker command, and that
+# is exactly the assumption that cost four runs with HF_HOME. A symlink in the
+# default search path needs no propagation at all. There is no libfabric in the
+# image to shadow -- apt never installed one here.
+ln -sfn "$FAB/lib/libfabric.so.1.25.0" /usr/lib/x86_64-linux-gnu/libfabric.so.1
+ln -sfn libfabric.so.1 /usr/lib/x86_64-linux-gnu/libfabric.so
+ldconfig 2>/dev/null || true
+
+# Gate on the provider actually enumerating, not merely on the file existing.
+# A libfabric that builds efa and then finds no device is exactly the state that
+# cost the previous round, and it is invisible until Mooncake fails an hour in.
+n=$("$FAB/bin/fi_info" -p efa 2>/dev/null | grep -c "provider: efa" || true)
+echo "    fi_info -p efa: $n endpoints"
+if [[ "$n" -lt 2 ]]; then
+    echo "wei-prebuilt-pdx: FATAL: the efa provider enumerates $n endpoints." >&2
+    echo "  Expected 32 (16 devices x RDM/DGRAM). Run" >&2
+    echo "  FI_LOG_LEVEL=debug FI_LOG_PROV=efa $FAB/bin/fi_info -p efa" >&2
+    exit 1
+fi
+
+# The wheel replaces mooncake in place. --no-deps because the image already
+# pins every dependency and a resolver here would silently move torch.
+echo "    installing mooncake-transfer-engine-efa-cuda13"
+python3 -m pip uninstall -y -q mooncake-transfer-engine mooncake-transfer-engine-cuda13 2>/dev/null || true
+python3 -m pip install --no-deps -q mooncake-transfer-engine-efa-cuda13==0.3.13.post1 || {
+    echo "wei-prebuilt-pdx: FATAL: could not install the EFA transport wheel." >&2
+    exit 1
+}
+python3 - <<'PYEFA'
+import subprocess, sys
+so = "/usr/local/lib/python3.12/dist-packages/mooncake/engine.so"
+out = subprocess.run(["strings", "-a", so], capture_output=True, text=True).stdout
+have = sorted({w for w in ("efa_transport", "rdma_transport", "tcp_transport") if w in out})
+print("    transports in engine.so:", ", ".join(have))
+if "efa_transport" not in have:
+    sys.exit("wei-prebuilt-pdx: FATAL: the installed wheel has no efa_transport.")
+ldd = subprocess.run(["ldd", so], capture_output=True, text=True).stdout
+missing = [l.strip() for l in ldd.splitlines() if "not found" in l and "cuda" not in l.lower()]
+if missing:
+    sys.exit("wei-prebuilt-pdx: FATAL: unresolved libraries:\n  " + "\n  ".join(missing))
+print("    engine.so resolves libfabric")
+PYEFA
+
 # The HF cache shim first: a missing checkpoint should fail here, not later.
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
