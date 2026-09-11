@@ -1,0 +1,35 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index fb48caa5d0..d374f80af1 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -922,6 +922,12 @@ class NixlBaseConnectorWorker:
+                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
+                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+             )
++        if self._TRANSFER_MODE == "push" and local_dcp_size != remote_dcp_size:
++            raise NotImplementedError(
++                "NixlPushConnector supports decode_context_parallel_size > 1 only "
++                "when both instances shard identically (push writes rank-to-rank). "
++                f"Local DCP={local_dcp_size}; remote DCP={remote_dcp_size}."
++            )
+ 
+     def _sync_block_size_with_kernel(self) -> None:
+         backends = get_current_attn_backends(self.vllm_config)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+index 7914b7ab3a..dd7b139082 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+@@ -354,10 +354,9 @@ class NixlPushConnector(NixlBaseConnector):
+         kv_cache_config: "KVCacheConfig",
+     ):
+         super().__init__(vllm_config, role, kv_cache_config)
+-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+-            raise ValueError(
+-                "NixlPushConnector does not support decode_context_parallel_size > 1."
+-            )
++        # DCP is validated at handshake (_validate_remote_parallel_config): push
++        # writes rank-to-rank, so it is supported when both instances shard the
++        # KV cache identically and refused otherwise.
+         self.connector_scheduler: NixlPushConnectorScheduler | None = None
+         self.connector_worker: NixlPushConnectorWorker | None = None
+         if role == KVConnectorRole.SCHEDULER:
