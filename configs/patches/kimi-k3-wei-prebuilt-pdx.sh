@@ -215,6 +215,14 @@ except Exception as e:
 print("    mooncake imports with the EFA transport in place")
 PYIMP
 
+# Arm the stall watchdog before anything long-running starts. It backgrounds
+# itself, claims the node with a lock file so the frontend container does not
+# start a second one, and dumps every worker's stack the moment the engine
+# stalls -- the only window we get, because the RPC timeout arrives five minutes
+# later with the workers already gone. Diagnostics only; it cannot fail the run.
+nohup bash /configs/patches/pdx_stall_watchdog.sh /logs > /dev/null 2>&1 &
+echo "    stall watchdog armed (pid $!) -> /logs/pyspy-watchdog-$(hostname).log"
+
 # The HF cache shim first: a missing checkpoint should fail here, not later.
 bash /configs/patches/vllm-container-deps-k3-hfshim.sh
 
