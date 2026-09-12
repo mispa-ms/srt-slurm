@@ -28,6 +28,10 @@
 # OURS, BY K3_OURS:
 #  ssm  -- SSM/Mamba layers over the layer-name path (necessary: the 09-08 A/B
 #          arm A died at the Mamba-under-PP refusal, pipeline 66840854).
+#  dpp  -- pipeline-parallel decode on the push path. Upstream refuses a consumer
+#          with pp_size > 1; this keys the transfer handles by (pp, tp), carries
+#          decode_pp_size on PUSH_REG and writes only to the overlapping stages.
+#          Only needed by arms whose decode sets pipeline-parallel-size > 1.
 #  mcpp -- MooncakeStore PP handshake override (necessary with a mooncake tier:
 #          0908bmc died at 'received pp_rank > 0 handshake metadata').
 #
@@ -64,6 +68,7 @@ bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-911.sh
 bash /configs/patches/vllm-container-deps-k3-pushdcp-911.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-911.sh ;; esac
+case ",${K3_OURS}," in *,dpp,*)  bash /configs/patches/vllm-container-deps-k3-decodepp-911.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
@@ -108,6 +113,16 @@ if "ssm" in ours:
     if refusal: fail.append("K3_OURS=ssm but the Mamba-under-PP refusal is still present")
 elif not refusal:
     fail.append("arm without ssm, yet the Mamba-under-PP refusal is gone -- this tree is not the upstream-only baseline")
+decode_pp_refusal = "consumer (decode) does not support" in bw
+if "dpp" in ours:
+    if decode_pp_refusal:
+        fail.append("K3_OURS=dpp but the decode-PP refusal is still present")
+    if "_overlapping_remote_pp_ranks" not in bw:
+        fail.append("K3_OURS=dpp but the overlapping-stage helper is missing")
+    if "decode_pp_size" not in src("vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py"):
+        fail.append("K3_OURS=dpp but PUSH_REG does not carry decode_pp_size")
+elif not decode_pp_refusal:
+    fail.append("arm without dpp, yet the decode-PP refusal is gone -- this tree is not the upstream-only baseline")
 mc = src("vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py")
 if ("mcpp" in ours) != ("set_xfer_handshake_metadata_pp_aware" in mc):
     fail.append("MooncakeStore PP override presence does not match K3_OURS")
