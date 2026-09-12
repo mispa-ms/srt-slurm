@@ -36,17 +36,25 @@ if ! command -v py-spy > /dev/null 2>&1; then
         echo "[watchdog] py-spy will not install; nothing to do"; exit 0; }
 fi
 
-# py-spy needs ptrace. Containers without CAP_SYS_PTRACE silently give nothing
-# useful, and finding that out during the stall wastes the whole run -- so say
-# it now, while there is still time to add the capability.
-if py-spy dump --pid $$ > /dev/null 2>&1; then
-    echo "[watchdog] ptrace works (self-dump ok)"
+# py-spy needs ptrace, so check it now rather than during the stall.
+#
+# Test against a real PYTHON process. The first version of this aimed py-spy at
+# its own shell ($$) and read the inevitable failure as "no CAP_SYS_PTRACE" --
+# py-spy only inspects Python interpreters, so that test fails on a healthy node
+# too. On aws-pdx the permissions are in fact fine: kernel.yama.ptrace_scope is
+# 0, which permits same-uid ptrace without CAP_SYS_PTRACE (CapEff is all zeros).
+python3 -c 'import time; time.sleep(60)' &
+probe=$!
+sleep 2
+if py-spy dump --pid "$probe" > /dev/null 2>&1; then
+    echo "[watchdog] ptrace works (dumped a live python child)"
 else
-    echo "[watchdog] WARNING: py-spy cannot dump even this shell."
-    echo "[watchdog] The container probably lacks CAP_SYS_PTRACE; add"
-    echo "[watchdog]   srun_options: --container-mounts ... and cap-add SYS_PTRACE"
-    echo "[watchdog] Continuing anyway -- the fallback below may still print something."
+    echo "[watchdog] WARNING: py-spy cannot dump a plain python child:"
+    py-spy dump --pid "$probe" 2>&1 | sed 's/^/[watchdog]   /' | head -5
+    echo "[watchdog] Check kernel.yama.ptrace_scope and CAP_SYS_PTRACE."
+    echo "[watchdog] Continuing anyway -- the /proc fallback still prints something."
 fi
+kill "$probe" 2>/dev/null || true
 
 dump_everything() {
     local tag=$1 out="$LOGDIR/pyspy-stall-$HOST-$tag.txt"
