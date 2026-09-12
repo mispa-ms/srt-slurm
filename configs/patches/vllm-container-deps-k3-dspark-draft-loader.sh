@@ -68,6 +68,14 @@ if not os.path.exists(target):
 src = open(target).read()
 MARK = "load_config=replace(draft_vllm_config.load_config, load_format=\"auto\")"
 
+# Upstream #54416 (dca96bf97b, merged 2026-09-12 06:22 UTC) puts the same guard in a
+# shared helper, `get_pp_safe_draft_load_config` in spec_decode/utils.py, called from
+# the dspark, dflash and eagle loaders. Nightlies cut from 2026-09-13 carry it. Detect
+# that form first so this chain is a no-op on them instead of trying to patch again.
+if "get_pp_safe_draft_load_config" in src:
+    print("[draft-loader] upstream #54416 present in this image; skipping")
+    sys.exit(0)
+
 if MARK in src:
     print("[draft-loader] already present in this image")
     sys.exit(0)
@@ -138,11 +146,19 @@ root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
 du = open(os.path.join(root, "vllm/v1/worker/gpu/spec_decode/dspark/utils.py")).read()
 wu = open(os.path.join(root, "vllm/model_executor/model_loader/weight_utils.py")).read()
 
-if 'load_format="auto"' not in du or "get_pp_group().world_size > 1" not in du:
+upstream = "get_pp_safe_draft_load_config" in du
+if upstream:
+    su = open(os.path.join(root, "vllm/v1/worker/gpu/spec_decode/utils.py")).read()
+    if "get_pp_group().world_size > 1" not in su or 'load_format="auto"' not in su:
+        sys.exit("[draft-loader] FATAL: the draft loader calls get_pp_safe_draft_load_config but the helper does not guard")
+    print("[draft-loader] verified: upstream #54416 provides the guard; nothing carried")
+elif 'load_format="auto"' not in du or "get_pp_group().world_size > 1" not in du:
     sys.exit("[draft-loader] FATAL: the PP guard is not in load_dspark_model after writing it")
-if "from vllm.distributed.parallel_state import get_pp_group" not in du:
+elif "from vllm.distributed.parallel_state import get_pp_group" not in du:
     sys.exit("[draft-loader] FATAL: get_pp_group import missing")
-if "pg = torch.distributed.group.WORLD" in wu:
+if upstream:
+    pass
+elif "pg = torch.distributed.group.WORLD" in wu:
     print("[draft-loader] verified: guard present; fastsafetensors still uses group.WORLD, so it is needed")
 else:
     print("[draft-loader] note: fastsafetensors no longer hard-codes group.WORLD -- re-check whether this carry is still needed")
