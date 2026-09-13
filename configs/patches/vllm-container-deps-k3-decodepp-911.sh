@@ -9,7 +9,9 @@
 # handshake before: the stage advertises only its own layer window).
 # A PP-sharded producer handshakes only with the decode stages it writes to (P PP2 ->
 # D PP2 handshook with both and the alignment refused the other half, 67584704).
-# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (7002ad768d). Must follow ssm-911.
+# pp_rank is set in __init__ (the decode side's PUSH_REG handshake raised AttributeError
+# on it in 67594496, so no request ever reached the producer).
+# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (see git log). Must follow ssm-911.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"
