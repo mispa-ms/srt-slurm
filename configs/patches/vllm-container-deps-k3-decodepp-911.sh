@@ -7,7 +7,9 @@
 # alignment: an unsharded (PP1) producer builds per-stage descriptors and a per-stage
 # local handle for each stage of a PP-sharded consumer (P PP1 -> D PP2 could not
 # handshake before: the stage advertises only its own layer window).
-# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (864b7dd94d). Must follow ssm-911.
+# A PP-sharded producer handshakes only with the decode stages it writes to (P PP2 ->
+# D PP2 handshook with both and the alignment refused the other half, 67584704).
+# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (7002ad768d). Must follow ssm-911.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"
