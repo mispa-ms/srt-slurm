@@ -198,8 +198,36 @@ echo "[watchdog] armed at $(date -u +%FT%TZ), tailing $W"
 
 # Two dumps, 45 s apart: one stack is a photograph, two tell you whether it is
 # stuck or merely slow.
+# A third, much earlier trigger.
+#
+# The two markers above arrive 60 s or more after the engine notices, and by then
+# the interesting window is half gone -- b300-dsxe found the store's own frames
+# are already absent by the time the stall is visible. The engine prints a
+# throughput line every 10 s, so two consecutive lines reading 0.0 tok/s with
+# requests still Running is a stall at ~20 s instead of ~60 s.
+zero=0
 n=0
 tail -n0 -F "$W" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+        *"Engine 000"*"Avg prompt throughput: 0.0 tokens/s"*"Avg generation throughput: 0.0 tokens/s"*)
+            case "$line" in
+                *"Running: 0 reqs"*) zero=0 ;;   # genuinely idle, not a stall
+                *) zero=$((zero + 1)) ;;
+            esac
+            if [[ "$zero" -ge 2 ]]; then
+                n=$((n + 1))
+                [[ "$n" -gt 1 ]] && continue
+                echo "[watchdog] two zero-throughput ticks with work resident at $(date -u +%FT%TZ)"
+                dump_everything first
+                sleep 45
+                dump_everything second
+                echo "[watchdog] done; exiting"
+                exit 0
+            fi
+            continue
+            ;;
+        *"Engine 000"*) zero=0; continue ;;
+    esac
     case "$line" in
         *"$MARKER"*|*"$MARKER2"*)
             n=$((n + 1))
