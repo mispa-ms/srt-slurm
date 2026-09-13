@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-index 24e07daf1c..60e019a355 100644
+index 24e07daf1c..4412f443ff 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 @@ -13,7 +13,7 @@ from collections import defaultdict
@@ -118,7 +118,7 @@ index 24e07daf1c..60e019a355 100644
                  group_arr = np.asarray(block_ids[g], dtype=np.int32)
                  if k in fa_offsets:
                      parts.append(group_arr + fa_offsets[k])
-@@ -437,6 +472,45 @@ class NixlBaseConnectorWorker:
+@@ -437,6 +472,64 @@ class NixlBaseConnectorWorker:
          """
          return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
  
@@ -139,6 +139,25 @@ index 24e07daf1c..60e019a355 100644
 +            stage
 +            for stage in range(remote_pp_size)
 +            if _ranges_overlap(get_pp_indices(num_layers, stage, remote_pp_size), local)
++        ]
++
++    def _stage_layers_not_backed(
++        self, remote_layer_names: list[str], stage_layer_regions: list[int]
++    ) -> list[str]:
++        """Remote stage layers whose selected local region does not hold them.
++
++        After a PP peer stage's metadata is expanded to one layer per entry,
++        the region-name check compares layer to backing region rather than the
++        two sides' region lists, which differ by construction (a stage
++        advertises a window, an unsharded worker pools several layers per
++        region).
++        """
++        if len(remote_layer_names) != len(stage_layer_regions):
++            return list(remote_layer_names)
++        return [
++            name
++            for name, region_idx in zip(remote_layer_names, stage_layer_regions)
++            if name not in self.region_members[region_idx]
 +        ]
 +
 +    def _handshake_targets(
@@ -164,7 +183,7 @@ index 24e07daf1c..60e019a355 100644
      def _set_region_layers(self, region_layers: list[list[str]]) -> None:
          layer_names = [layer_name for region in region_layers for layer_name in region]
          assert len(layer_names) == len(set(layer_names)), (
-@@ -479,6 +553,158 @@ class NixlBaseConnectorWorker:
+@@ -479,6 +572,158 @@ class NixlBaseConnectorWorker:
              and (self._is_hma_required or self._has_packed_cache)
          )
  
@@ -323,7 +342,7 @@ index 24e07daf1c..60e019a355 100644
      def _align_remote_regions_by_layer(
          self, nixl_agent_meta: NixlAgentMetadata
      ) -> None:
-@@ -793,6 +1019,9 @@ class NixlBaseConnectorWorker:
+@@ -793,6 +1038,9 @@ class NixlBaseConnectorWorker:
          # PP>1 (push mode): this worker holds a contiguous layer slice and
          # transfers into the matching sub-range of a PP=1 remote's regions.
          self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
@@ -333,7 +352,7 @@ index 24e07daf1c..60e019a355 100644
          self._remote_region_offset = 0
          if self.pp_size > 1 and self._is_hma_required and not self._supports_pp_hma:
              raise NotImplementedError(
-@@ -800,12 +1029,6 @@ class NixlBaseConnectorWorker:
+@@ -800,12 +1048,6 @@ class NixlBaseConnectorWorker:
                  "> 1 with hybrid KV cache layouts (HMA); use NixlPushConnector "
                  "for PP + HMA."
              )
@@ -346,7 +365,7 @@ index 24e07daf1c..60e019a355 100644
          # Keep heartbeat handshakes to a PP-sharded producer notif-only.
          self._hb_handshake_notif_only = False
  
-@@ -819,7 +1042,16 @@ class NixlBaseConnectorWorker:
+@@ -819,7 +1061,16 @@ class NixlBaseConnectorWorker:
          self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
          self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
          # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
@@ -364,7 +383,7 @@ index 24e07daf1c..60e019a355 100644
  
          # Map of engine_id -> num_blocks. All ranks in the same deployment will
          # have the same number of blocks.
-@@ -1038,9 +1270,8 @@ class NixlBaseConnectorWorker:
+@@ -1038,9 +1289,8 @@ class NixlBaseConnectorWorker:
          # Regardless, only handshake with the remote TP rank(s) that current
          # local rank will read from. Note that With homogeneous TP,
          # this happens to be the same single rank_i.
@@ -376,7 +395,7 @@ index 24e07daf1c..60e019a355 100644
          )
          remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
          path = make_zmq_path("tcp", host, port)
-@@ -1051,9 +1282,7 @@ class NixlBaseConnectorWorker:
+@@ -1051,9 +1301,7 @@ class NixlBaseConnectorWorker:
          best_offset: float | None = None
  
          with zmq_ctx(zmq.REQ, path) as sock:
@@ -387,7 +406,7 @@ index 24e07daf1c..60e019a355 100644
                  logger.debug(
                      "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
                      path,
-@@ -1149,7 +1378,11 @@ class NixlBaseConnectorWorker:
+@@ -1149,7 +1397,11 @@ class NixlBaseConnectorWorker:
                      )
                  else:
                      remote_agent_name = self.add_remote_agent(
@@ -400,7 +419,7 @@ index 24e07daf1c..60e019a355 100644
                      )
                  setup_agent_time = time.perf_counter()
                  logger.debug(
-@@ -1858,7 +2091,9 @@ class NixlBaseConnectorWorker:
+@@ -1858,7 +2110,9 @@ class NixlBaseConnectorWorker:
              agent_metadata_bytes=encoder.encode(agent_metadata),
          )
  
@@ -411,7 +430,7 @@ index 24e07daf1c..60e019a355 100644
          """Build desc regions (conv sub-projections + ssm) per layer for
          local mamba blocks with DS conv layout, as an Nx3 uint64 array.
  
-@@ -1901,7 +2136,9 @@ class NixlBaseConnectorWorker:
+@@ -1901,7 +2155,9 @@ class NixlBaseConnectorWorker:
          block_arange = np.arange(num_blocks, dtype=np.uint64)
          parts: list[np.ndarray] = []
  
@@ -422,7 +441,7 @@ index 24e07daf1c..60e019a355 100644
              region_indices = [
                  self._transfer_layer_region_indices[k]
                  for k in self._transfer_layer_ssm_positions
-@@ -1934,6 +2171,7 @@ class NixlBaseConnectorWorker:
+@@ -1934,6 +2190,7 @@ class NixlBaseConnectorWorker:
          nixl_agent_meta: NixlAgentMetadata,
          tp_ratio: int,
          transfer_info: EngineTransferInfo,
@@ -430,7 +449,7 @@ index 24e07daf1c..60e019a355 100644
      ) -> np.ndarray:
          """Build remote desc regions (conv sub-projections + ssm) per layer.
          For hetero-TP, each D rank reads only its sub-projection slice from
-@@ -1962,7 +2200,9 @@ class NixlBaseConnectorWorker:
+@@ -1962,7 +2219,9 @@ class NixlBaseConnectorWorker:
          parts: list[np.ndarray] = []
          # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
          # block lengths vary across layers (e.g. MLA).
@@ -441,7 +460,7 @@ index 24e07daf1c..60e019a355 100644
              # Remote lists are in local layer order after alignment.
              region_indices = list(self._transfer_layer_ssm_positions)
          else:
-@@ -2019,12 +2259,21 @@ class NixlBaseConnectorWorker:
+@@ -2019,12 +2278,21 @@ class NixlBaseConnectorWorker:
          self,
          base_addresses: list[int],
          block_size_ratio: int,
@@ -465,7 +484,7 @@ index 24e07daf1c..60e019a355 100644
              # Attention layers only; an SSM layer over the same pooled region
              # is described by _build_mamba_local.
              region_indices = [
-@@ -2058,8 +2307,13 @@ class NixlBaseConnectorWorker:
+@@ -2058,8 +2326,13 @@ class NixlBaseConnectorWorker:
          plan: TPMapping,
          nixl_agent_meta: NixlAgentMetadata,
          block_size_ratio: int,
@@ -480,7 +499,7 @@ index 24e07daf1c..60e019a355 100644
          assert self.transfer_topo is not None
          assert nixl_agent_meta.kv_caches_base_addr, (
              "Remote KV cache base addresses must not be empty."
-@@ -2076,14 +2330,17 @@ class NixlBaseConnectorWorker:
+@@ -2076,14 +2349,17 @@ class NixlBaseConnectorWorker:
          device_id = nixl_agent_meta.device_id
          block_strides = nixl_agent_meta.block_strides
          parts: list[np.ndarray] = []
@@ -506,7 +525,7 @@ index 24e07daf1c..60e019a355 100644
          for i, local_region in entries:
              base_addr = nixl_agent_meta.kv_caches_base_addr[i]
              replicated = self._is_region_replicated(local_region)
-@@ -2191,6 +2448,7 @@ class NixlBaseConnectorWorker:
+@@ -2191,6 +2467,7 @@ class NixlBaseConnectorWorker:
          remote_tp_rank: int = 0,
          remote_tp_size: int = 1,
          remote_dcp_size: int = 1,
@@ -514,7 +533,7 @@ index 24e07daf1c..60e019a355 100644
      ) -> str:
          """
          Add the remote NIXL agent and prepare the descriptors for reading cache
-@@ -2237,19 +2495,25 @@ class NixlBaseConnectorWorker:
+@@ -2237,19 +2514,25 @@ class NixlBaseConnectorWorker:
          """  # noqa: E501
          engine_id = nixl_agent_meta.engine_id
          # TODO re-evaluate refreshing for scaling/recovery
@@ -544,7 +563,7 @@ index 24e07daf1c..60e019a355 100644
          if self._transfer_layer_region_indices:
              if self.block_size != nixl_agent_meta.block_size:
                  raise NotImplementedError(
-@@ -2261,6 +2525,27 @@ class NixlBaseConnectorWorker:
+@@ -2261,6 +2544,27 @@ class NixlBaseConnectorWorker:
                      "prefill TP yet"
                  )
              self._align_remote_regions_by_layer(nixl_agent_meta)
@@ -572,7 +591,7 @@ index 24e07daf1c..60e019a355 100644
          elif (
              self.pp_size > 1
              and len(nixl_agent_meta.kv_caches_base_addr) > num_local_regions
-@@ -2350,12 +2635,19 @@ class NixlBaseConnectorWorker:
+@@ -2350,12 +2654,19 @@ class NixlBaseConnectorWorker:
              nixl_agent_meta.kv_caches_base_addr
          )
          self._validate_remote_agent_handshake(
@@ -593,7 +612,7 @@ index 24e07daf1c..60e019a355 100644
  
          logger.debug(
              "Registering remote agent (%s, rank %s) memory regions with tp_ratio %s",
-@@ -2423,10 +2715,15 @@ class NixlBaseConnectorWorker:
+@@ -2423,10 +2734,15 @@ class NixlBaseConnectorWorker:
          # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
  
          # Register all remote blocks, but only the corresponding kv heads.
@@ -609,7 +628,7 @@ index 24e07daf1c..60e019a355 100644
          )
          logger.debug(
              "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
-@@ -2441,7 +2738,12 @@ class NixlBaseConnectorWorker:
+@@ -2441,7 +2757,12 @@ class NixlBaseConnectorWorker:
                  engine_id,
                  remote_tp_rank,
              )
@@ -623,7 +642,7 @@ index 24e07daf1c..60e019a355 100644
              blocks_data = np.concatenate([blocks_data, mamba])
  
          # A mixed local destination is split into multiple READs below. The
-@@ -2452,17 +2754,82 @@ class NixlBaseConnectorWorker:
+@@ -2452,17 +2773,82 @@ class NixlBaseConnectorWorker:
                  "NIXL pull does not yet support a mixed-memory producer"
              )
          descs = self.nixl_wrapper.get_xfer_descs(blocks_data, remote_mem_types.pop())
@@ -707,7 +726,7 @@ index 24e07daf1c..60e019a355 100644
      ):
          """
          Validate the remote agent handshake metadata ensuring the
-@@ -2586,8 +2953,11 @@ class NixlBaseConnectorWorker:
+@@ -2586,8 +2972,11 @@ class NixlBaseConnectorWorker:
          # the per-rank KV head ratio rather than the raw tp_ratio, because GQA
          # replication caps per-rank heads at 1 when tp > total_kv_heads
          # (issue #45330). Mamba uses the ssm_sizes counterpart, so skip here.
@@ -721,6 +740,42 @@ index 24e07daf1c..60e019a355 100644
          )
          if self._has_mamba and self.use_mla:
              # Hybrid MLA+SSM (e.g. KimiLinear's KDA+MLA): regions are
+@@ -2664,15 +3053,26 @@ class NixlBaseConnectorWorker:
+         if nixl_agent_meta.region_group_ids is not None:
+             assert len(nixl_agent_meta.region_group_ids) == num_remote_regions
+         if nixl_agent_meta.region_names is not None:
+-            expected_names = (
+-                list(self._transfer_layer_names)
+-                if self._transfer_layer_names
+-                else self.region_names
+-            )
+-            assert nixl_agent_meta.region_names == expected_names, (
+-                "NIXL transfer regions must name the same model caches in the "
+-                "same order"
+-            )
++            if stage_layer_regions is not None:
++                # One remote layer per entry, in the stage's order; each must
++                # live in the local region selected to back it.
++                misplaced = self._stage_layers_not_backed(
++                    nixl_agent_meta.region_names, stage_layer_regions
++                )
++                assert not misplaced, (
++                    "Remote PP stage layers are not backed by the local regions "
++                    f"selected for them: {misplaced}"
++                )
++            else:
++                expected_names = (
++                    list(self._transfer_layer_names)
++                    if self._transfer_layer_names
++                    else self.region_names
++                )
++                assert nixl_agent_meta.region_names == expected_names, (
++                    "NIXL transfer regions must name the same model caches in the "
++                    "same order"
++                )
+         if nixl_agent_meta.region_mem_types is not None:
+             assert len(nixl_agent_meta.region_mem_types) == num_remote_regions
+ 
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 index 0081c53ec9..983428adb7 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py

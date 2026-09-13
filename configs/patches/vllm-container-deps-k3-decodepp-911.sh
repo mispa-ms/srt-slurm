@@ -10,7 +10,9 @@
 # A PP-sharded producer handshakes only with the decode stages it writes to (P PP2 ->
 # D PP2 handshook with both and the alignment refused the other half, 67584704).
 # pp_rank is set in __init__ (the decode side's PUSH_REG handshake raised AttributeError
-# on it in 67594496, so no request ever reached the producer).
+# on it in 67594496, so no request ever reached the producer). The handshake's
+# region-name check compares layer to backing region on the stage path (67590656:
+# "must name the same model caches in the same order" on every request).
 # vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (see git log). Must follow ssm-911.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
