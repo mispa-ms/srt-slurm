@@ -234,6 +234,22 @@ except Exception as e:
 print("    mooncake imports with the EFA transport in place")
 PYIMP
 
+# Build the cudaLaunchHostFunc counter. Building it is free and harmless -- it
+# does nothing unless a config puts it on LD_PRELOAD -- and having it present
+# means an arm can be flipped on with one env var instead of a new setup script.
+if command -v gcc > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get \
+     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+     install -y -qq gcc > /tmp/gcc-apt.log 2>&1; then
+    if gcc -O2 -fPIC -shared -o /tmp/cuda_hostfunc_probe.so \
+         /configs/patches/cuda_hostfunc_probe.c -ldl 2>/tmp/hostfunc-build.log; then
+        echo "    cuda_hostfunc_probe.so built (set LD_PRELOAD to use it)"
+    else
+        echo "    WARNING: cuda_hostfunc_probe.so did not build:"; tail -5 /tmp/hostfunc-build.log
+    fi
+else
+    echo "    WARNING: no gcc; cuda_hostfunc_probe.so not built"
+fi
+
 # Arm the stall watchdog before anything long-running starts. It backgrounds
 # itself, claims the node with a lock file so the frontend container does not
 # start a second one, and dumps every worker's stack the moment the engine
