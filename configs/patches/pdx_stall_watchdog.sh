@@ -142,9 +142,32 @@ dump_everything() {
                              --format=csv,noheader 2>/dev/null \
                            | awk -F', *' -v u="$idle_uuid" '$2==u {print $1}' | head -1)
             fi
+            # Also take ONE rank that is still busy. Run 423653 showed the idle
+            # rank sitting in worker_busy_loop with its step already done while
+            # six others held GPU work -- so the ranks are not at the same point,
+            # and the interesting half is what the busy ones are still inside.
+            # One of each, three seconds apart so the two dumps do not interleave.
+            local busy_uuid="" busy_pid=""
+            while IFS=, read -r idx util uuid; do
+                util=${util//[!0-9]/}
+                uuid=${uuid// /}
+                [[ "$util" == "100" ]] && busy_uuid=$uuid
+            done < <(nvidia-smi --query-gpu=index,utilization.gpu,uuid \
+                                --format=csv,noheader 2>/dev/null)
+            if [[ -n "$busy_uuid" ]]; then
+                busy_pid=$(nvidia-smi --query-compute-apps=pid,gpu_uuid \
+                             --format=csv,noheader 2>/dev/null \
+                           | awk -F', *' -v u="$busy_uuid" '$2==u {print $1}' | head -1)
+            fi
+
             if [[ -n "$idle_pid" ]]; then
                 echo "    idle GPU $idle_uuid -> pid $idle_pid; signalling only that one"
                 kill -ABRT "$idle_pid" 2>/dev/null || true
+                if [[ -n "$busy_pid" && "$busy_pid" != "$idle_pid" ]]; then
+                    sleep 3
+                    echo "    busy GPU $busy_uuid -> pid $busy_pid; signalling for contrast"
+                    kill -ABRT "$busy_pid" 2>/dev/null || true
+                fi
             else
                 echo "    no idle GPU found; signalling all, spaced out"
                 for pid in $pids; do
