@@ -3,8 +3,11 @@
 # pipeline_parallel_size > 1 (completions counted per consumer rank, and the transfer
 # handles were keyed by TP rank alone so every decode stage collapsed onto stage 0).
 # Keys dst_xfer_side_handles by (remote_pp_rank, remote_tp_rank), carries decode_pp_size
-# on PUSH_REG, and fans WRITEs out over the overlapping decode stages.
-# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (d3fe83fbae). Must follow ssm-911.
+# on PUSH_REG, and fans WRITEs out over the overlapping decode stages. Also the reverse
+# alignment: an unsharded (PP1) producer builds per-stage descriptors and a per-stage
+# local handle for each stage of a PP-sharded consumer (P PP1 -> D PP2 could not
+# handshake before: the stage advertises only its own layer window).
+# vllm branch misunp/k3-decode-pp-on-50499-d1ac007 (864b7dd94d). Must follow ssm-911.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"
