@@ -161,7 +161,26 @@ export LD_LIBRARY_PATH="$FAB/lib:${LD_LIBRARY_PATH:-}"
 # image to shadow -- apt never installed one here.
 ln -sfn "$FAB/lib/libfabric.so.1.25.0" /usr/lib/x86_64-linux-gnu/libfabric.so.1
 ln -sfn libfabric.so.1 /usr/lib/x86_64-linux-gnu/libfabric.so
+
+# hwloc, for NIXL's LIBFABRIC plugin rather than for Mooncake.
+#
+# The image ships libplugin_LIBFABRIC.so but neither of the two libraries it
+# needs, so NIXL reports it as "unsupported backend 'LIBFABRIC'" and the disagg
+# run dies at engine init with NIXL_ERR_BACKEND (420862). The symlink above
+# covers libfabric.so.1; libhwloc.so.15 is the other one, and with both present
+# createBackend("LIBFABRIC") succeeds. Measured, not assumed.
+if ! ldconfig -p 2>/dev/null | grep -q 'libhwloc\.so\.15'; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold update -qq >> /tmp/hwloc-apt.log 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold install -y -qq libhwloc15 \
+      >> /tmp/hwloc-apt.log 2>&1 \
+      || echo "    WARNING: libhwloc15 would not install; NIXL LIBFABRIC will stay unavailable"
+fi
 ldconfig 2>/dev/null || true
+if ldconfig -p 2>/dev/null | grep -q 'libhwloc\.so\.15'; then
+    echo "    libhwloc.so.15 present (NIXL LIBFABRIC plugin can load)"
+fi
 
 # Gate on the provider actually enumerating, not merely on the file existing.
 # A libfabric that builds efa and then finds no device is exactly the state that
