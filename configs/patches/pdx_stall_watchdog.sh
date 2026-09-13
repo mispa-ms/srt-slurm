@@ -24,16 +24,28 @@ LOGDIR=${1:-/logs}
 MARKER="No available shared memory broadcast block found"
 MARKER2="Failed to complete transfers after"
 HOST=$(hostname)
-STAMP=$LOGDIR/.pyspy-watchdog-$HOST.claimed
 
-# One watchdog per node. The setup script runs in every container on the node
-# (worker and frontend), and two of these tailing the same file would dump the
-# same processes twice.
+# One watchdog per PID NAMESPACE, not per node.
+#
+# The first version claimed a single lock in $LOGDIR -- which both containers on
+# the node share -- so whichever started first won. In run 418400 that was the
+# frontend container, and from there the vLLM workers are in another namespace:
+# pgrep matched one pid, /proc/<pid>/exe came back "Permission denied", and
+# py-spy got nothing. (nvidia-smi still saw all eight worker pids, because it
+# asks the driver rather than /proc, which is how that run produced GPU
+# utilisation and no stacks.)
+#
+# Let every container arm its own. Duplicate dumps cost a few seconds; a dump
+# taken from the wrong namespace is worthless.
+NS=$(readlink /proc/self/ns/pid 2>/dev/null | tr -dc '0-9')
+NS=${NS:-$$}
+TAG=$HOST-ns$NS
+STAMP=$LOGDIR/.pyspy-watchdog-$TAG.claimed
 if ! (set -o noclobber; : > "$STAMP") 2>/dev/null; then
     exit 0
 fi
 
-exec >> "$LOGDIR/pyspy-watchdog-$HOST.log" 2>&1
+exec >> "$LOGDIR/pyspy-watchdog-$TAG.log" 2>&1
 echo "[watchdog] start $(date -u +%FT%TZ) on $HOST, watching $LOGDIR"
 
 if ! command -v py-spy > /dev/null 2>&1; then
@@ -68,23 +80,44 @@ dump_everything() {
     # takes the watchdog down with it. That is exactly how run 417809 produced
     # no dump at all.
     local tag=$1
-    local out="$LOGDIR/pyspy-stall-$HOST-$tag.txt"
+    local out="$LOGDIR/pyspy-stall-$TAG-$tag.txt"
     {
         echo "=== $(date -u +%FT%TZ)  stall dump: $tag ==="
         echo
         echo "--- processes ---"
         ps -eo pid,ppid,stat,etime,pcpu,comm,args --sort=pid | grep -aE "VllmWorker|EngineCore|python3" | grep -av grep
         echo
-        for pid in $(pgrep -f 'VllmWorker|EngineCore' 2>/dev/null); do
+        local pids
+        pids=$(pgrep -f 'VllmWorker|EngineCore' 2>/dev/null | tr '\n' ' ')
+        echo "--- candidate pids: ${pids:-(none visible in this namespace)} ---"
+        echo
+        local got_stack=0
+        for pid in $pids; do
             echo "--- py-spy dump --native --locals pid=$pid ---"
-            timeout 60 py-spy dump --pid "$pid" --native --locals 2>&1 \
-              || timeout 60 py-spy dump --pid "$pid" 2>&1 \
-              || echo "  (py-spy failed for $pid)"
+            if timeout 60 py-spy dump --pid "$pid" --native --locals 2>&1; then
+                got_stack=1
+            elif timeout 60 py-spy dump --pid "$pid" 2>&1; then
+                got_stack=1
+            else
+                echo "  (py-spy failed for $pid)"
+            fi
             echo
             echo "--- /proc/$pid/status wchan+state ---"
             grep -aE '^(State|Threads)' "/proc/$pid/status" 2>/dev/null
             echo
         done
+
+        # If ptrace was refused -- wrong namespace, no CAP_SYS_PTRACE -- fall
+        # back to faulthandler. With PYTHONFAULTHANDLER=1 set on the workers,
+        # SIGABRT makes CPython print every thread's stack to its own stderr,
+        # which lands in the worker log. It kills the process, so only do it on
+        # the SECOND dump: by then the engine is already five minutes from its
+        # own RPC timeout and the run is lost either way.
+        if [[ "$got_stack" -eq 0 && "$tag" == "second" && -n "$pids" ]]; then
+            echo "--- py-spy got nothing; SIGABRT for faulthandler stacks ---"
+            echo "    (stacks appear in the worker log, not here)"
+            for pid in $pids; do kill -ABRT "$pid" 2>/dev/null || true; done
+        fi
         echo "--- nvidia-smi ---"
         nvidia-smi --query-gpu=index,utilization.gpu,memory.used,clocks_throttle_reasons.active \
                    --format=csv 2>&1
