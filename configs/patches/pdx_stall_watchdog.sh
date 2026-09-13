@@ -123,7 +123,35 @@ dump_everything() {
         if [[ "$got_stack" -eq 0 && "$tag" == "second" && -n "$pids" ]]; then
             echo "--- py-spy got nothing; SIGABRT for faulthandler stacks ---"
             echo "    (stacks appear in the worker log, not here)"
-            for pid in $pids; do kill -ABRT "$pid" 2>/dev/null || true; done
+            # ONE process, not all of them. Signalling all nine at once in run
+            # 420977 had nine faulthandler dumps writing to the same fd at the
+            # same instant, and the result was shredded past reading.
+            #
+            # The one worth having is the rank that is NOT on the GPU: seven
+            # ranks spin at 100% inside the collective while one sits at 0%
+            # blocked on the host, and that one is holding everyone up.
+            local idle_uuid="" idle_pid="" idx util uuid
+            while IFS=, read -r idx util uuid; do
+                util=${util//[!0-9]/}
+                uuid=${uuid// /}
+                [[ "$util" == "0" ]] && idle_uuid=$uuid
+            done < <(nvidia-smi --query-gpu=index,utilization.gpu,uuid \
+                                --format=csv,noheader 2>/dev/null)
+            if [[ -n "$idle_uuid" ]]; then
+                idle_pid=$(nvidia-smi --query-compute-apps=pid,gpu_uuid \
+                             --format=csv,noheader 2>/dev/null \
+                           | awk -F', *' -v u="$idle_uuid" '$2==u {print $1}' | head -1)
+            fi
+            if [[ -n "$idle_pid" ]]; then
+                echo "    idle GPU $idle_uuid -> pid $idle_pid; signalling only that one"
+                kill -ABRT "$idle_pid" 2>/dev/null || true
+            else
+                echo "    no idle GPU found; signalling all, spaced out"
+                for pid in $pids; do
+                    kill -ABRT "$pid" 2>/dev/null || true
+                    sleep 3
+                done
+            fi
         fi
         echo "--- nvidia-smi ---"
         nvidia-smi --query-gpu=index,utilization.gpu,memory.used,clocks_throttle_reasons.active \
