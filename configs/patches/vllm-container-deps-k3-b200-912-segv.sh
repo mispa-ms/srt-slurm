@@ -28,17 +28,11 @@ bash /configs/patches/vllm-container-deps-k3-b200-912.sh
 echo "=== k3-b200-912-segv: fault capture ==="
 
 SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-# Refuse to silently replace an existing sitecustomize: chaining to it is the only safe move,
-# and if one appears later we want to know rather than to have swallowed it.
-if [ -e "${SITE}/sitecustomize.py" ]; then
-    if grep -q "K3_SEGV_DIR" "${SITE}/sitecustomize.py"; then
-        echo "[segv] our sitecustomize is already installed; leaving it"
-    else
-        echo "[segv] FATAL: ${SITE}/sitecustomize.py already exists and is not ours -- chain to it instead of overwriting" >&2
-        exit 1
-    fi
-fi
-cat > "${SITE}/sitecustomize.py" <<'PY'
+# NOT sitecustomize.py: Ubuntu ships its own at /usr/lib/python3.12/sitecustomize.py, which comes
+# earlier on sys.path than dist-packages, so a file of that name here is shadowed and never runs.
+# That is exactly how 67611852 died. A .pth file is the mechanism that cannot be shadowed --
+# site.py executes the `import` line of EVERY .pth in EVERY site directory at startup.
+cat > "${SITE}/k3_segv.py" <<'PY'
 """Dump every thread's Python stack on a fatal signal.
 
 vLLM enables faulthandler for the current thread only, which on the 67590200 crash printed a
@@ -60,7 +54,19 @@ try:
 except Exception as exc:  # never break the interpreter over diagnostics
     print("[segv] faulthandler setup failed: %r" % (exc,), file=sys.stderr)
 PY
-python3 -c "import sitecustomize, faulthandler, sys; assert faulthandler.is_enabled(); print('[segv] sitecustomize active at', sitecustomize.__file__)"
+echo "import k3_segv" > "${SITE}/zzz-k3-segv.pth"
+
+# Verify in a FRESH interpreter -- importing it by hand would prove nothing about startup.
+python3 - <<'PY'
+import faulthandler
+import sys
+if not faulthandler.is_enabled():
+    sys.exit("[segv] FATAL: the .pth did not run at startup; faulthandler is not enabled")
+mod = sys.modules.get("k3_segv")
+if mod is None:
+    sys.exit("[segv] FATAL: k3_segv was not imported at startup")
+print("[segv] active at", mod.__file__, "- all_threads faulthandler on")
+PY
 
 # Best effort only: both of these need privileges the container may not have.
 if ulimit -c unlimited 2>/dev/null; then
