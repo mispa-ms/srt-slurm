@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-index 24e07daf1c..bd6baa1a03 100644
+index 24e07daf1c..5e8763ddba 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 @@ -13,7 +13,7 @@ from collections import defaultdict
@@ -11,11 +11,7 @@ index 24e07daf1c..bd6baa1a03 100644
  
  import msgspec
  import numpy as np
-@@ -64,9 +64,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
- from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
- from vllm.distributed.parallel_state import (
-     get_pcp_group,
-+    get_pp_group,
+@@ -67,6 +67,7 @@ from vllm.distributed.parallel_state import (
      get_tensor_model_parallel_rank,
      get_tensor_model_parallel_world_size,
  )
@@ -23,7 +19,7 @@ index 24e07daf1c..bd6baa1a03 100644
  from vllm.logger import init_logger
  from vllm.platforms import current_platform
  from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-@@ -104,6 +106,11 @@ def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
+@@ -104,6 +105,11 @@ def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
      )
  
  
@@ -35,7 +31,7 @@ index 24e07daf1c..bd6baa1a03 100644
  def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
      """Return whether all views share storage and a block stride."""
      block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
-@@ -151,6 +158,26 @@ def _uses_dense_virtual_transfer_pages(
+@@ -151,6 +157,26 @@ def _uses_dense_virtual_transfer_pages(
      )
  
  
@@ -62,7 +58,7 @@ index 24e07daf1c..bd6baa1a03 100644
  class NixlBaseConnectorWorker:
      """Base implementation of Worker side methods shared by pull and push."""
  
-@@ -177,8 +204,16 @@ class NixlBaseConnectorWorker:
+@@ -177,8 +203,16 @@ class NixlBaseConnectorWorker:
          region_num_blocks: list[int] | None = None,
          region_group_ids: list[int] | None = None,
          uses_region_group_mapping: bool | None = None,
@@ -80,7 +76,7 @@ index 24e07daf1c..bd6baa1a03 100644
          num_ssm_regions = 0
          ssm_regions_per_layer = 0
          if self._has_mamba:
-@@ -196,11 +231,13 @@ class NixlBaseConnectorWorker:
+@@ -196,11 +230,13 @@ class NixlBaseConnectorWorker:
          num_blocks = dst_num_blocks
          if block_size_ratio is not None:
              num_blocks = int(num_blocks * block_size_ratio)
@@ -98,7 +94,7 @@ index 24e07daf1c..bd6baa1a03 100644
          )
          if region_num_blocks is None:
              region_num_blocks = [num_blocks] * num_desc_regions
-@@ -217,16 +254,14 @@ class NixlBaseConnectorWorker:
+@@ -217,16 +253,14 @@ class NixlBaseConnectorWorker:
              # The layout follows _build_fa_local / _build_mamba_local emission
              # order: one block run per attention layer, then
              # ssm_regions_per_layer block runs per SSM layer.
@@ -118,7 +114,7 @@ index 24e07daf1c..bd6baa1a03 100644
                  group_arr = np.asarray(block_ids[g], dtype=np.int32)
                  if k in fa_offsets:
                      parts.append(group_arr + fa_offsets[k])
-@@ -437,6 +472,64 @@ class NixlBaseConnectorWorker:
+@@ -437,6 +471,69 @@ class NixlBaseConnectorWorker:
          """
          return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
  
@@ -134,7 +130,12 @@ index 24e07daf1c..bd6baa1a03 100644
 +        if self.pp_size == 1:
 +            return list(range(remote_pp_size))
 +        num_layers = self.model_config.get_total_num_hidden_layers()
-+        local = get_pp_indices(num_layers, self.pp_rank, self.pp_size)
++        # Our own window comes from the model config, the same source
++        # register_kv_caches uses, rather than from the PP process group: a
++        # worker is constructed before -- and in tests without -- one.
++        local = self.model_config.get_layers_start_end_indices(
++            self.vllm_config.parallel_config
++        )
 +        return [
 +            stage
 +            for stage in range(remote_pp_size)
@@ -183,7 +184,7 @@ index 24e07daf1c..bd6baa1a03 100644
      def _set_region_layers(self, region_layers: list[list[str]]) -> None:
          layer_names = [layer_name for region in region_layers for layer_name in region]
          assert len(layer_names) == len(set(layer_names)), (
-@@ -479,6 +572,160 @@ class NixlBaseConnectorWorker:
+@@ -479,6 +576,160 @@ class NixlBaseConnectorWorker:
              and (self._is_hma_required or self._has_packed_cache)
          )
  
@@ -344,17 +345,7 @@ index 24e07daf1c..bd6baa1a03 100644
      def _align_remote_regions_by_layer(
          self, nixl_agent_meta: NixlAgentMetadata
      ) -> None:
-@@ -793,6 +1040,9 @@ class NixlBaseConnectorWorker:
-         # PP>1 (push mode): this worker holds a contiguous layer slice and
-         # transfers into the matching sub-range of a PP=1 remote's regions.
-         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-+        # Which layer window this worker holds; the handshake and the writer
-+        # pair it with the peer stages that overlap it.
-+        self.pp_rank = get_pp_group().rank_in_group if self.pp_size > 1 else 0
-         self._remote_region_offset = 0
-         if self.pp_size > 1 and self._is_hma_required and not self._supports_pp_hma:
-             raise NotImplementedError(
-@@ -800,12 +1050,6 @@ class NixlBaseConnectorWorker:
+@@ -800,12 +1051,6 @@ class NixlBaseConnectorWorker:
                  "> 1 with hybrid KV cache layouts (HMA); use NixlPushConnector "
                  "for PP + HMA."
              )
@@ -367,7 +358,7 @@ index 24e07daf1c..bd6baa1a03 100644
          # Keep heartbeat handshakes to a PP-sharded producer notif-only.
          self._hb_handshake_notif_only = False
  
-@@ -819,7 +1063,16 @@ class NixlBaseConnectorWorker:
+@@ -819,7 +1064,16 @@ class NixlBaseConnectorWorker:
          self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
          self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
          # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
@@ -385,7 +376,7 @@ index 24e07daf1c..bd6baa1a03 100644
  
          # Map of engine_id -> num_blocks. All ranks in the same deployment will
          # have the same number of blocks.
-@@ -1038,9 +1291,8 @@ class NixlBaseConnectorWorker:
+@@ -1038,9 +1292,8 @@ class NixlBaseConnectorWorker:
          # Regardless, only handshake with the remote TP rank(s) that current
          # local rank will read from. Note that With homogeneous TP,
          # this happens to be the same single rank_i.
@@ -397,7 +388,7 @@ index 24e07daf1c..bd6baa1a03 100644
          )
          remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
          path = make_zmq_path("tcp", host, port)
-@@ -1051,9 +1303,7 @@ class NixlBaseConnectorWorker:
+@@ -1051,9 +1304,7 @@ class NixlBaseConnectorWorker:
          best_offset: float | None = None
  
          with zmq_ctx(zmq.REQ, path) as sock:
@@ -408,7 +399,7 @@ index 24e07daf1c..bd6baa1a03 100644
                  logger.debug(
                      "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
                      path,
-@@ -1149,7 +1399,11 @@ class NixlBaseConnectorWorker:
+@@ -1149,7 +1400,11 @@ class NixlBaseConnectorWorker:
                      )
                  else:
                      remote_agent_name = self.add_remote_agent(
@@ -421,7 +412,7 @@ index 24e07daf1c..bd6baa1a03 100644
                      )
                  setup_agent_time = time.perf_counter()
                  logger.debug(
-@@ -1858,7 +2112,9 @@ class NixlBaseConnectorWorker:
+@@ -1858,7 +2113,9 @@ class NixlBaseConnectorWorker:
              agent_metadata_bytes=encoder.encode(agent_metadata),
          )
  
@@ -432,7 +423,7 @@ index 24e07daf1c..bd6baa1a03 100644
          """Build desc regions (conv sub-projections + ssm) per layer for
          local mamba blocks with DS conv layout, as an Nx3 uint64 array.
  
-@@ -1901,7 +2157,9 @@ class NixlBaseConnectorWorker:
+@@ -1901,7 +2158,9 @@ class NixlBaseConnectorWorker:
          block_arange = np.arange(num_blocks, dtype=np.uint64)
          parts: list[np.ndarray] = []
  
@@ -443,7 +434,7 @@ index 24e07daf1c..bd6baa1a03 100644
              region_indices = [
                  self._transfer_layer_region_indices[k]
                  for k in self._transfer_layer_ssm_positions
-@@ -1934,6 +2192,7 @@ class NixlBaseConnectorWorker:
+@@ -1934,6 +2193,7 @@ class NixlBaseConnectorWorker:
          nixl_agent_meta: NixlAgentMetadata,
          tp_ratio: int,
          transfer_info: EngineTransferInfo,
@@ -451,7 +442,7 @@ index 24e07daf1c..bd6baa1a03 100644
      ) -> np.ndarray:
          """Build remote desc regions (conv sub-projections + ssm) per layer.
          For hetero-TP, each D rank reads only its sub-projection slice from
-@@ -1962,7 +2221,9 @@ class NixlBaseConnectorWorker:
+@@ -1962,7 +2222,9 @@ class NixlBaseConnectorWorker:
          parts: list[np.ndarray] = []
          # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
          # block lengths vary across layers (e.g. MLA).
@@ -462,7 +453,7 @@ index 24e07daf1c..bd6baa1a03 100644
              # Remote lists are in local layer order after alignment.
              region_indices = list(self._transfer_layer_ssm_positions)
          else:
-@@ -2019,12 +2280,21 @@ class NixlBaseConnectorWorker:
+@@ -2019,12 +2281,21 @@ class NixlBaseConnectorWorker:
          self,
          base_addresses: list[int],
          block_size_ratio: int,
@@ -486,7 +477,7 @@ index 24e07daf1c..bd6baa1a03 100644
              # Attention layers only; an SSM layer over the same pooled region
              # is described by _build_mamba_local.
              region_indices = [
-@@ -2058,8 +2328,13 @@ class NixlBaseConnectorWorker:
+@@ -2058,8 +2329,13 @@ class NixlBaseConnectorWorker:
          plan: TPMapping,
          nixl_agent_meta: NixlAgentMetadata,
          block_size_ratio: int,
@@ -501,7 +492,7 @@ index 24e07daf1c..bd6baa1a03 100644
          assert self.transfer_topo is not None
          assert nixl_agent_meta.kv_caches_base_addr, (
              "Remote KV cache base addresses must not be empty."
-@@ -2076,14 +2351,17 @@ class NixlBaseConnectorWorker:
+@@ -2076,14 +2352,17 @@ class NixlBaseConnectorWorker:
          device_id = nixl_agent_meta.device_id
          block_strides = nixl_agent_meta.block_strides
          parts: list[np.ndarray] = []
@@ -527,7 +518,7 @@ index 24e07daf1c..bd6baa1a03 100644
          for i, local_region in entries:
              base_addr = nixl_agent_meta.kv_caches_base_addr[i]
              replicated = self._is_region_replicated(local_region)
-@@ -2191,6 +2469,7 @@ class NixlBaseConnectorWorker:
+@@ -2191,6 +2470,7 @@ class NixlBaseConnectorWorker:
          remote_tp_rank: int = 0,
          remote_tp_size: int = 1,
          remote_dcp_size: int = 1,
@@ -535,7 +526,7 @@ index 24e07daf1c..bd6baa1a03 100644
      ) -> str:
          """
          Add the remote NIXL agent and prepare the descriptors for reading cache
-@@ -2237,19 +2516,25 @@ class NixlBaseConnectorWorker:
+@@ -2237,19 +2517,25 @@ class NixlBaseConnectorWorker:
          """  # noqa: E501
          engine_id = nixl_agent_meta.engine_id
          # TODO re-evaluate refreshing for scaling/recovery
@@ -565,7 +556,7 @@ index 24e07daf1c..bd6baa1a03 100644
          if self._transfer_layer_region_indices:
              if self.block_size != nixl_agent_meta.block_size:
                  raise NotImplementedError(
-@@ -2261,6 +2546,27 @@ class NixlBaseConnectorWorker:
+@@ -2261,6 +2547,27 @@ class NixlBaseConnectorWorker:
                      "prefill TP yet"
                  )
              self._align_remote_regions_by_layer(nixl_agent_meta)
@@ -593,7 +584,7 @@ index 24e07daf1c..bd6baa1a03 100644
          elif (
              self.pp_size > 1
              and len(nixl_agent_meta.kv_caches_base_addr) > num_local_regions
-@@ -2350,12 +2656,19 @@ class NixlBaseConnectorWorker:
+@@ -2350,12 +2657,19 @@ class NixlBaseConnectorWorker:
              nixl_agent_meta.kv_caches_base_addr
          )
          self._validate_remote_agent_handshake(
@@ -614,7 +605,7 @@ index 24e07daf1c..bd6baa1a03 100644
  
          logger.debug(
              "Registering remote agent (%s, rank %s) memory regions with tp_ratio %s",
-@@ -2423,10 +2736,15 @@ class NixlBaseConnectorWorker:
+@@ -2423,10 +2737,15 @@ class NixlBaseConnectorWorker:
          # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
  
          # Register all remote blocks, but only the corresponding kv heads.
@@ -630,7 +621,7 @@ index 24e07daf1c..bd6baa1a03 100644
          )
          logger.debug(
              "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
-@@ -2441,7 +2759,12 @@ class NixlBaseConnectorWorker:
+@@ -2441,7 +2760,12 @@ class NixlBaseConnectorWorker:
                  engine_id,
                  remote_tp_rank,
              )
@@ -644,7 +635,7 @@ index 24e07daf1c..bd6baa1a03 100644
              blocks_data = np.concatenate([blocks_data, mamba])
  
          # A mixed local destination is split into multiple READs below. The
-@@ -2452,17 +2775,82 @@ class NixlBaseConnectorWorker:
+@@ -2452,17 +2776,82 @@ class NixlBaseConnectorWorker:
                  "NIXL pull does not yet support a mixed-memory producer"
              )
          descs = self.nixl_wrapper.get_xfer_descs(blocks_data, remote_mem_types.pop())
@@ -728,7 +719,7 @@ index 24e07daf1c..bd6baa1a03 100644
      ):
          """
          Validate the remote agent handshake metadata ensuring the
-@@ -2586,8 +2974,11 @@ class NixlBaseConnectorWorker:
+@@ -2586,8 +2975,11 @@ class NixlBaseConnectorWorker:
          # the per-rank KV head ratio rather than the raw tp_ratio, because GQA
          # replication caps per-rank heads at 1 when tp > total_kv_heads
          # (issue #45330). Mamba uses the ssm_sizes counterpart, so skip here.
@@ -742,7 +733,7 @@ index 24e07daf1c..bd6baa1a03 100644
          )
          if self._has_mamba and self.use_mla:
              # Hybrid MLA+SSM (e.g. KimiLinear's KDA+MLA): regions are
-@@ -2664,15 +3055,26 @@ class NixlBaseConnectorWorker:
+@@ -2664,15 +3056,26 @@ class NixlBaseConnectorWorker:
          if nixl_agent_meta.region_group_ids is not None:
              assert len(nixl_agent_meta.region_group_ids) == num_remote_regions
          if nixl_agent_meta.region_names is not None:
