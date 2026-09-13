@@ -17,7 +17,12 @@
 # and the script always exits 0.
 set -u
 LOGDIR=${1:-/logs}
+# Two triggers. The second is the better one -- run 417809 showed the wedge
+# starts as a Mooncake transfer that never completes, and the engine only
+# notices minutes later -- but keep the engine-side marker too in case a stall
+# ever arrives without it.
 MARKER="No available shared memory broadcast block found"
+MARKER2="Failed to complete transfers after"
 HOST=$(hostname)
 STAMP=$LOGDIR/.pyspy-watchdog-$HOST.claimed
 
@@ -57,7 +62,13 @@ fi
 kill "$probe" 2>/dev/null || true
 
 dump_everything() {
-    local tag=$1 out="$LOGDIR/pyspy-stall-$HOST-$tag.txt"
+    # Two `local` statements, not one. Bash expands EVERY argument of `local`
+    # before assigning any of them, so `local tag=$1 out="…$tag.txt"` reads $tag
+    # while it is still unset -- which under `set -u` aborts the function and
+    # takes the watchdog down with it. That is exactly how run 417809 produced
+    # no dump at all.
+    local tag=$1
+    local out="$LOGDIR/pyspy-stall-$HOST-$tag.txt"
     {
         echo "=== $(date -u +%FT%TZ)  stall dump: $tag ==="
         echo
@@ -95,14 +106,34 @@ if [[ -z "$W" ]]; then
     echo "[watchdog] no worker log under $LOGDIR after an hour; giving up"
     exit 0
 fi
-echo "[watchdog] tailing $W"
+
+# Do not arm until traffic is flowing. The shm marker is not specific to a
+# stall -- vLLM prints it during model load too, and in run 417809 it appeared 7
+# times, the first 20 minutes before serving began. Dumping on that one gets a
+# snapshot of a healthy loader and nothing else.
+#
+# Arm at the first benchmark phase rather than at profiling: 417809 wedged
+# during WARMUP, so waiting for profiling would have missed it.
+B="$LOGDIR/benchmark.out"
+echo "[watchdog] waiting for the benchmark to start sending"
+for _ in $(seq 1 1440); do
+    if [[ -f "$B" ]] && grep -aq 'Phase \(warmup\|profiling\)' "$B"; then
+        break
+    fi
+    sleep 5
+done
+if ! grep -aq 'Phase \(warmup\|profiling\)' "$B" 2>/dev/null; then
+    echo "[watchdog] no benchmark phase within two hours; nothing to watch"
+    exit 0
+fi
+echo "[watchdog] armed at $(date -u +%FT%TZ), tailing $W"
 
 # Two dumps, 45 s apart: one stack is a photograph, two tell you whether it is
 # stuck or merely slow.
 n=0
 tail -n0 -F "$W" 2>/dev/null | while IFS= read -r line; do
     case "$line" in
-        *"$MARKER"*)
+        *"$MARKER"*|*"$MARKER2"*)
             n=$((n + 1))
             [[ "$n" -gt 1 ]] && continue
             echo "[watchdog] stall marker seen at $(date -u +%FT%TZ)"
