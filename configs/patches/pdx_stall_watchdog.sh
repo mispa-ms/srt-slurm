@@ -84,11 +84,18 @@ dump_everything() {
     {
         echo "=== $(date -u +%FT%TZ)  stall dump: $tag ==="
         echo
-        echo "--- processes ---"
-        ps -eo pid,ppid,stat,etime,pcpu,comm,args --sort=pid | grep -aE "VllmWorker|EngineCore|python3" | grep -av grep
+        # Unfiltered. A grep here once hid the very thing we were looking for:
+        # run 418827 printed only supervisord/srun/EngineCore and it looked like
+        # the workers were in another namespace, when in fact they were right
+        # there under names the filter did not match.
+        echo "--- processes (all) ---"
+        ps -eo pid,ppid,stat,etime,pcpu,comm,args --sort=pid | head -60
         echo
+        # vLLM titles its worker processes VLLM::Worker_TP0_DCP0, not
+        # "VllmWorker" -- the pattern used in 418827 matched the EngineCore
+        # alone and every worker stack was missed. VLLM:: catches both.
         local pids
-        pids=$(pgrep -f 'VllmWorker|EngineCore' 2>/dev/null | tr '\n' ' ')
+        pids=$(pgrep -f 'VLLM::|VllmWorker|EngineCore' 2>/dev/null | tr '\n' ' ')
         echo "--- candidate pids: ${pids:-(none visible in this namespace)} ---"
         echo
         local got_stack=0
