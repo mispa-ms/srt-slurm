@@ -73,6 +73,34 @@ else
 fi
 kill "$probe" 2>/dev/null || true
 
+# A healthy-run control for the stall dumps.
+#
+# The stall dumps show the store's KVCacheStoreSendingThread inside
+# cuEventDestroy_v2 on most ranks. That is only evidence if the thread does NOT
+# normally sit there, and nothing in this watchdog ever sampled a healthy run --
+# it arms, waits, and fires once. So: when PDX_HEALTHY_DUMP_EVERY is set to a
+# number of engine ticks (each is 10 s), take a light sample that often.
+#
+# Deliberately lighter than dump_everything: ONE worker rank, no ps, no SIGABRT
+# fallback. py-spy stops the target while it walks it, and a stopped rank stalls
+# the whole TP group until it resumes, so this must stay cheap and bounded.
+dump_healthy() {
+    local n=$1
+    local out="$LOGDIR/pyspy-healthy-$TAG-$n.txt"
+    local pid
+    pid=$(pgrep -f 'VLLM::Worker_TP0' 2>/dev/null | head -1)
+    [[ -z "$pid" ]] && pid=$(pgrep -f 'VLLM::' 2>/dev/null | head -1)
+    if [[ -z "$pid" ]]; then
+        echo "[watchdog] healthy sample $n: no worker pid visible"
+        return
+    fi
+    {
+        echo "=== $(date -u +%FT%TZ)  healthy sample $n (pid $pid) ==="
+        timeout 60 py-spy dump --pid "$pid" --native 2>&1 || echo "  (py-spy failed)"
+    } > "$out" 2>&1
+    echo "[watchdog] wrote $out"
+}
+
 dump_everything() {
     # Two `local` statements, not one. Bash expands EVERY argument of `local`
     # before assigning any of them, so `local tag=$1 out="…$tag.txt"` reads $tag
@@ -230,6 +258,12 @@ echo "[watchdog] armed at $(date -u +%FT%TZ), tailing $W"
 # requests still Running is a stall at ~20 s instead of ~60 s.
 zero=0
 n=0
+ticks=0
+healthy_n=0
+if [[ "${PDX_HEALTHY_DUMP_EVERY:-0}" -gt 0 ]]; then
+    echo "[watchdog] healthy sampling on: every ${PDX_HEALTHY_DUMP_EVERY} engine ticks," \
+         "at most ${PDX_HEALTHY_DUMP_MAX:-4} samples, one worker each"
+fi
 tail -n0 -F "$W" 2>/dev/null | while IFS= read -r line; do
     case "$line" in
         *"Engine 000"*"Avg prompt throughput: 0.0 tokens/s"*"Avg generation throughput: 0.0 tokens/s"*)
@@ -249,7 +283,18 @@ tail -n0 -F "$W" 2>/dev/null | while IFS= read -r line; do
             fi
             continue
             ;;
-        *"Engine 000"*) zero=0; continue ;;
+        *"Engine 000"*)
+            zero=0
+            if [[ "${PDX_HEALTHY_DUMP_EVERY:-0}" -gt 0 ]]; then
+                ticks=$((ticks + 1))
+                if [[ $((ticks % PDX_HEALTHY_DUMP_EVERY)) -eq 0 ]] \
+                   && [[ "$healthy_n" -lt "${PDX_HEALTHY_DUMP_MAX:-4}" ]]; then
+                    healthy_n=$((healthy_n + 1))
+                    dump_healthy "$healthy_n"
+                fi
+            fi
+            continue
+            ;;
     esac
     case "$line" in
         *"$MARKER"*|*"$MARKER2"*)

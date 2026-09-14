@@ -250,6 +250,21 @@ else
     echo "    WARNING: no gcc; cuda_hostfunc_probe.so not built"
 fi
 
+# Optional arm: keep the store's per-step CUDA event alive on the main thread.
+#
+# At every stall the store's sending thread is stopped at pthread_rwlock_wrlock
+# inside cuEventDestroy_v2 (from THCPEvent_dealloc, worker.py:614) while the main
+# thread spins in cuGraphLaunch. The patch moves the free to the main thread. Off
+# unless a config asks for it, so the control arm is byte-identical to today.
+if [[ "${PDX_STORE_EVENT_POOL:-0}" == "1" ]]; then
+    python3 /configs/patches/pdx_store_event_pool.py || {
+        echo "wei-prebuilt-pdx: FATAL: the store event-pool patch did not apply." >&2
+        exit 1
+    }
+else
+    echo "    store event pool: off (set PDX_STORE_EVENT_POOL=1 to enable)"
+fi
+
 # Arm the stall watchdog before anything long-running starts. It backgrounds
 # itself, claims the node with a lock file so the frontend container does not
 # start a second one, and dumps every worker's stack the moment the engine
