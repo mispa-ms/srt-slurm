@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-index 24e07daf1c..958d0c06c9 100644
+index 24e07daf1c..5750628b7d 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 @@ -13,7 +13,7 @@ from collections import defaultdict
@@ -751,6 +751,35 @@ index 24e07daf1c..958d0c06c9 100644
          if nixl_agent_meta.region_mem_types is not None:
              assert len(nixl_agent_meta.region_mem_types) == num_remote_regions
  
+@@ -3479,14 +3864,25 @@ class NixlBaseConnectorWorker:
+         Releases NIXL resources (dlist handles, remote agents) and clears
+         all per-engine data structures. Used by both TTL eviction and
+         shutdown.
+-        """
+-        assert engine_id in self._remote_agents
+ 
++        Every map is cleared on a best-effort basis. Eviction is driven by
++        ``_engine_last_active`` while the resources live in other maps, and the
++        two do disagree in both directions: a just-completed handshake may not
++        have recorded activity yet, and an id can outlive its agents. Asserting
++        on either direction turns a bookkeeping mismatch into a dead engine.
++        """
+         # Notif-only engines (push-mode D side) have no descriptor state.
+         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+             self.nixl_wrapper.release_dlist_handle(handle)
+-        for agent_name in self._remote_agents.pop(engine_id).values():
++        for agent_name in self._remote_agents.pop(engine_id, {}).values():
+             self.nixl_wrapper.remove_remote_agent(agent_name)
++        # Per-stage local descriptor lists are keyed by (engine, stage) and are
++        # registered once per stage, so leaving one behind would have a later
++        # handshake to the same engine address a registration that is gone.
++        for key in [k for k in self._stage_transfers if k[0] == engine_id]:
++            self.nixl_wrapper.release_dlist_handle(
++                self._stage_transfers.pop(key).local_handle
++            )
+ 
+         self.kv_caches_base_addr.pop(engine_id, None)
+         self.dst_num_blocks.pop(engine_id, None)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 index 0081c53ec9..983428adb7 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
