@@ -32,6 +32,10 @@
 #          with pp_size > 1; this keys the transfer handles by (pp, tp), carries
 #          decode_pp_size on PUSH_REG and writes only to the overlapping stages.
 #          Only needed by arms whose decode sets pipeline-parallel-size > 1.
+#  evict -- upstream engine-eviction fix (#35264's _cleanup_remote_engine
+#          asserts on a bookkeeping mismatch and kills the decode engine as soon
+#          as there is more than one producer, pipeline 67705738). Carried by
+#          dpp already, so the two are refused together.
 #  mcpp -- MooncakeStore PP handshake override (necessary with a mooncake tier:
 #          0908bmc died at 'received pp_rank > 0 handshake metadata').
 #
@@ -68,7 +72,13 @@ bash /configs/patches/vllm-container-deps-k3-dspark-pr55472.sh
 bash /configs/patches/vllm-container-deps-k3-pr50499-911.sh
 bash /configs/patches/vllm-container-deps-k3-pushdcp-911.sh
 case ",${K3_OURS}," in *,ssm,*)  bash /configs/patches/vllm-container-deps-k3-ssm-911.sh ;; esac
-case ",${K3_OURS}," in *,dpp,*)  bash /configs/patches/vllm-container-deps-k3-decodepp-911.sh ;; esac
+case ",${K3_OURS}," in
+    *,dpp,*) case ",${K3_OURS}," in *,evict,*)
+        echo "[k3-pp-911] FATAL: K3_OURS has both dpp and evict; dpp carries it" >&2
+        exit 1 ;; esac ;;
+esac
+case ",${K3_OURS}," in *,dpp,*)   bash /configs/patches/vllm-container-deps-k3-decodepp-911.sh ;; esac
+case ",${K3_OURS}," in *,evict,*) bash /configs/patches/vllm-container-deps-k3-evict-911.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
@@ -123,6 +133,12 @@ if "dpp" in ours:
         fail.append("K3_OURS=dpp but PUSH_REG does not carry decode_pp_size")
 elif not decode_pp_refusal:
     fail.append("arm without dpp, yet the decode-PP refusal is gone -- this tree is not the upstream-only baseline")
+evict_assert = "assert engine_id in self._remote_agents" in bw
+if ("evict" in ours or "dpp" in ours) == evict_assert:
+    fail.append(
+        "engine-eviction assert presence does not match K3_OURS "
+        f"(assert present={evict_assert}, ours={sorted(ours)})"
+    )
 mc = src("vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py")
 if ("mcpp" in ours) != ("set_xfer_handshake_metadata_pp_aware" in mc):
     fail.append("MooncakeStore PP override presence does not match K3_OURS")

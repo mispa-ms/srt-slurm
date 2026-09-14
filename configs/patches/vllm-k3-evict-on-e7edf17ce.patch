@@ -1,0 +1,26 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index 24e07daf1c..d9540ae750 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -3479,13 +3479,18 @@ class NixlBaseConnectorWorker:
+         Releases NIXL resources (dlist handles, remote agents) and clears
+         all per-engine data structures. Used by both TTL eviction and
+         shutdown.
+-        """
+-        assert engine_id in self._remote_agents
+ 
++        Every map is cleared on a best-effort basis. Eviction is driven by
++        ``_engine_last_active`` while the resources live in other maps, and the
++        two do disagree in both directions: a just-completed handshake may not
++        have recorded activity yet, and an id can outlive its agents. Asserting
++        on either direction turns a bookkeeping mismatch into a dead engine,
++        which is what two prefill workers do to a decode (pipeline 67705738).
++        """
+         # Notif-only engines (push-mode D side) have no descriptor state.
+         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+             self.nixl_wrapper.release_dlist_handle(handle)
+-        for agent_name in self._remote_agents.pop(engine_id).values():
++        for agent_name in self._remote_agents.pop(engine_id, {}).values():
+             self.nixl_wrapper.remove_remote_agent(agent_name)
+ 
+         self.kv_caches_base_addr.pop(engine_id, None)
