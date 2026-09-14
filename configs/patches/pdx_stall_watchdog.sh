@@ -247,6 +247,28 @@ if ! grep -aq 'Phase \(warmup\|profiling\)' "$B" 2>/dev/null; then
 fi
 echo "[watchdog] armed at $(date -u +%FT%TZ), tailing $W"
 
+# Prove we can ptrace a WORKER, not just a child we spawned ourselves.
+#
+# Run 431605 armed, ran, stalled and produced nothing: every py-spy call returned
+# `Permission denied (os error 13)`, for all five healthy samples and both stall
+# dumps. The start-up test had passed -- because it targets a python child of
+# this shell, which is always in this namespace and always ptraceable. The
+# workers are in the other container's namespace, and whether this watchdog
+# shares it is decided per run. Testing the thing we will actually dump turns a
+# silently empty run into a line in the log.
+wprobe=$(pgrep -f 'VLLM::' 2>/dev/null | head -1)
+if [[ -z "$wprobe" ]]; then
+    echo "[watchdog] WARNING: no VLLM:: process visible from this container;" \
+         "dumps will be empty. Another container's watchdog may have the workers."
+elif py-spy dump --pid "$wprobe" > /dev/null 2>&1; then
+    echo "[watchdog] can ptrace worker pid $wprobe -- dumps will have stacks"
+else
+    echo "[watchdog] WARNING: cannot ptrace worker pid $wprobe:"
+    py-spy dump --pid "$wprobe" 2>&1 | sed 's/^/[watchdog]   /' | head -4
+    echo "[watchdog] WARNING: this run's dumps will be EMPTY. Treat any absence" \
+         "of a signature in them as missing data, not as evidence."
+fi
+
 # Two dumps, 45 s apart: one stack is a photograph, two tell you whether it is
 # stuck or merely slow.
 # A third, much earlier trigger.
