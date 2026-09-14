@@ -38,6 +38,11 @@
 #          dpp already, so the two are refused together.
 #  mcpp -- MooncakeStore PP handshake override (necessary with a mooncake tier:
 #          0908bmc died at 'received pp_rank > 0 handshake metadata').
+#  mrcap -- VLLM_NIXL_MAX_MR_BYTES, so a worker can register its KV pool as
+#          several memory regions instead of one ~147 GiB region. Only adds the
+#          knob; the default is today's behaviour, so an arm that does not set
+#          the variable is unchanged. Needs ssm (it reads the layer-name path's
+#          block_stride_per_layer / region_num_blocks).
 #
 # Replayed on a pristine e7edf17ce tree with exit codes asserted per step.
 # =============================================================================
@@ -80,6 +85,10 @@ esac
 case ",${K3_OURS}," in *,dpp,*)   bash /configs/patches/vllm-container-deps-k3-decodepp-911.sh ;; esac
 case ",${K3_OURS}," in *,evict,*) bash /configs/patches/vllm-container-deps-k3-evict-911.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
+case ",${K3_OURS}," in *,mrcap,*) case ",${K3_OURS}," in *,ssm,*) ;; *)
+    echo "[k3-pp-911] FATAL: K3_OURS has mrcap without ssm; the split reads the layer-name path" >&2
+    exit 1 ;; esac
+    bash /configs/patches/vllm-container-deps-k3-mrcap-911.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
@@ -133,6 +142,11 @@ if "dpp" in ours:
         fail.append("K3_OURS=dpp but PUSH_REG does not carry decode_pp_size")
 elif not decode_pp_refusal:
     fail.append("arm without dpp, yet the decode-PP refusal is gone -- this tree is not the upstream-only baseline")
+mrcap = "VLLM_NIXL_MAX_MR_BYTES" in src("vllm/envs.py")
+if ("mrcap" in ours) != mrcap:
+    fail.append(f"VLLM_NIXL_MAX_MR_BYTES presence ({mrcap}) does not match K3_OURS ({sorted(ours)})")
+if "mrcap" in ours and "_split_registration_ranges" not in bw:
+    fail.append("K3_OURS=mrcap but the registration split is not in base_worker")
 evict_assert = "assert engine_id in self._remote_agents" in bw
 if ("evict" in ours or "dpp" in ours) == evict_assert:
     fail.append(
