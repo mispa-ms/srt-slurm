@@ -38,6 +38,10 @@
 #          dpp already, so the two are refused together.
 #  mcpp -- MooncakeStore PP handshake override (necessary with a mooncake tier:
 #          0908bmc died at 'received pp_rank > 0 handshake metadata').
+#  mcclamp -- vllm#51820, clamp the Mooncake store's token_len to the hash
+#          coverage it has. The asserts it removes are reachable under mtp and
+#          async scheduling, so any arm with a mooncake tier needs it. Touches
+#          only the mooncake store; independent of every other step.
 #  mrcap -- VLLM_NIXL_MAX_MR_BYTES, so a worker can register its KV pool as
 #          several memory regions instead of one ~147 GiB region. Only adds the
 #          knob; the default is today's behaviour, so an arm that does not set
@@ -87,6 +91,7 @@ case ",${K3_OURS}," in *,dpp,*)   bash /configs/patches/vllm-container-deps-k3-d
 case ",${K3_OURS}," in *,evict,*) bash /configs/patches/vllm-container-deps-k3-evict-911.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 case ",${K3_OURS}," in *,mrcap,*) bash /configs/patches/vllm-container-deps-k3-mrcap-911.sh ;; esac
+case ",${K3_OURS}," in *,mcclamp,*) bash /configs/patches/vllm-container-deps-k3-mcclamp-911.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
@@ -114,12 +119,23 @@ if "shard identically" not in bw:
     fail.append("push DCP handshake equality check missing")
 # #54518 gated _pop_done_transfers on _recving_metadata, which a push producer
 # never has, so every WRITE-complete request waited out its 30 s lease (77,584
-# warnings in 66850730). The gate must be gone; the recv-side filter that
+# warnings in 66850730). The gate must be gone; the recv-side handling that
 # replaced it lives in get_finished and does not touch done_sending.
 if "if req_id in self._recving_metadata:" in bw:
     fail.append("#54518's push-producer lease regression is back in _pop_done_transfers")
-if "done_recving.intersection_update(self._recving_metadata)" not in bw:
-    fail.append("recv-side completion filter missing -- _pop_done_transfers shape changed, re-check the push path")
+# Two accepted shapes. Up to the 09-11 nightly get_finished FILTERED:
+#   done_recving.intersection_update(self._recving_metadata)
+# From the 09-14 rebase of #50494/#50499 it POPS AND ASSERTS:
+#   meta = self._recving_metadata.pop(req_id, None); assert meta is not None
+# Same guarantee for the push producer either way, but the newer shape is
+# stricter: a done_recving id with no metadata now raises instead of being
+# dropped. If that assert ever fires in a worker log, this is the line to read.
+recv_done_handled = (
+    "done_recving.intersection_update(self._recving_metadata)" in bw
+    or "not found in recving_metadata list" in bw
+)
+if not recv_done_handled:
+    fail.append("recv-side completion handling missing -- _pop_done_transfers shape changed, re-check the push path")
 if "_pop_done_transfers(self._sending_transfers)" not in pw:
     fail.append("push worker no longer polls its send transfers the expected way")
 if "_align_remote_regions_by_layer" not in bw or "packed_member_layouts" not in bw:
@@ -140,6 +156,15 @@ if "dpp" in ours:
         fail.append("K3_OURS=dpp but PUSH_REG does not carry decode_pp_size")
 elif not decode_pp_refusal:
     fail.append("arm without dpp, yet the decode-PP refusal is gone -- this tree is not the upstream-only baseline")
+try:
+    mc_store = src("vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py")
+except FileNotFoundError:
+    mc_store = ""
+mc_assert = "assert token_len % self.hash_block_size == 0" in mc_store
+if ("mcclamp" in ours) == mc_assert:
+    fail.append(
+        "mooncake token_len assert presence does not match K3_OURS "
+        f"(assert present={mc_assert}, ours={sorted(ours)})")
 mrcap = "VLLM_NIXL_MAX_MR_BYTES" in src("vllm/envs.py")
 if ("mrcap" in ours) != mrcap:
     fail.append(f"VLLM_NIXL_MAX_MR_BYTES presence ({mrcap}) does not match K3_OURS ({sorted(ours)})")

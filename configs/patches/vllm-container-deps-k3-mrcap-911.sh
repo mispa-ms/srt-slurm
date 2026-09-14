@@ -26,7 +26,7 @@
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"
-readonly PATCH_FILE="/configs/patches/vllm-k3-mrcap-on-e7edf17ce.patch"
+readonly PATCH_FILE="/configs/patches/vllm-k3-mrcap-on-dc36fcce.patch"
 readonly MARKER="${VLLM_ROOT}/.k3_mrcap-911_applied"
 if [[ -f "${MARKER}" ]]; then echo "[mrcap-911] already applied."; exit 0; fi
 if [[ ! -r "${PATCH_FILE}" ]]; then echo "[mrcap-911] FATAL: missing ${PATCH_FILE}" >&2; exit 1; fi
