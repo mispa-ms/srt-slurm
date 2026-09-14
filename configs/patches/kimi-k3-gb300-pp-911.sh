@@ -41,8 +41,9 @@
 #  mrcap -- VLLM_NIXL_MAX_MR_BYTES, so a worker can register its KV pool as
 #          several memory regions instead of one ~147 GiB region. Only adds the
 #          knob; the default is today's behaviour, so an arm that does not set
-#          the variable is unchanged. Needs ssm (it reads the layer-name path's
-#          block_stride_per_layer / region_num_blocks).
+#          the variable is unchanged. Independent of ssm and dpp: the split
+#          reads block_stride_per_layer and region_num_blocks, which the
+#          unconditional layer-name steps already provide.
 #
 # Replayed on a pristine e7edf17ce tree with exit codes asserted per step.
 # =============================================================================
@@ -85,10 +86,7 @@ esac
 case ",${K3_OURS}," in *,dpp,*)   bash /configs/patches/vllm-container-deps-k3-decodepp-911.sh ;; esac
 case ",${K3_OURS}," in *,evict,*) bash /configs/patches/vllm-container-deps-k3-evict-911.sh ;; esac
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
-case ",${K3_OURS}," in *,mrcap,*) case ",${K3_OURS}," in *,ssm,*) ;; *)
-    echo "[k3-pp-911] FATAL: K3_OURS has mrcap without ssm; the split reads the layer-name path" >&2
-    exit 1 ;; esac
-    bash /configs/patches/vllm-container-deps-k3-mrcap-911.sh ;; esac
+case ",${K3_OURS}," in *,mrcap,*) bash /configs/patches/vllm-container-deps-k3-mrcap-911.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))

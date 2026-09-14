@@ -19,9 +19,10 @@
 # Cuts are taken on block boundaries only, so every transfer descriptor still
 # resolves inside exactly one registered range.
 #
-# DEPENDS ON ssm: the split reads block_stride_per_layer and region_num_blocks,
-# which are the layer-name path's. Cut against the ssm base, so it composes with
-# evict and with decodepp.
+# Independent of ssm, evict and dpp. The split reads block_stride_per_layer and
+# region_num_blocks, which the unconditional layer-name steps (pr50499-911,
+# pushdcp-911) already provide -- checked on a K3_OURS=mrcap tree. Cut against
+# the ssm base so it composes with all three.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"
