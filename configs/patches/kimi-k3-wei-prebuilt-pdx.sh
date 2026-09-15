@@ -265,6 +265,19 @@ else
     echo "    store event pool: off (set PDX_STORE_EVENT_POOL=1 to enable)"
 fi
 
+# Fence after each breakable CUDA-graph segment, on a switch.
+#
+# This reproduces the owners' mitigation -- theirs, not ours: a device sync after
+# every breakable graph / eager segment completed a full one-hour profile at
+# ~12.3k tok/s/GPU, within 3% of the bia reference. It has never been run on
+# aws-pdx, where c70 stalls 20 of 24, so three clean hours here would be an
+# independent confirmation at p ~ 0.005.
+#
+# Off unless PDX_SEGSYNC is set, so the control arm is byte-identical.
+python3 /configs/patches/pdx_segsync.py || {
+    echo "    segsync: patch script failed; continuing unpatched" >&2
+}
+
 # Arm the stall watchdog before anything long-running starts. It backgrounds
 # itself, claims the node with a lock file so the frontend container does not
 # start a second one, and dumps every worker's stack the moment the engine
