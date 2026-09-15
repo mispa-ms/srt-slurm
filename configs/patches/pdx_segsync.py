@@ -27,6 +27,19 @@ MODES (env `PDX_SEGSYNC`):
               tried and did not help, but capping OUTSTANDING SEGMENTS is a
               different quantity: if depth:8 holds, the cause is queue depth;
               if only depth:1 holds, it is a per-segment ordering dependency.
+    probe     **does not fix anything.** Records one event per segment and no
+              synchronize, so the timing is left alone and the run is expected
+              to stall exactly as the control does. A daemon thread samples the
+              events once a second and logs which segment the device last
+              finished, so the stall names the node it stopped at.
+
+WHY `probe` RATHER THAN cuda-gdb. The device-side question -- which node did the
+front end stop fetching at -- is what cuda-gdb would answer, but cuda-gdb is not
+in this image and is reported not to initialise against an already-wedged
+context. A host-readable progress counter answers the same question without a
+debugger, which is how the owners' `device completed N/M, FIRST PENDING #k`
+numbers are produced. The monitor has to be a separate thread: the replaying
+thread is inside a CUDA call when it wedges and will never run Python again.
 
 Unset or empty leaves the file untouched, so the control arm is byte-identical.
 
@@ -43,6 +56,88 @@ TARGET = (
 )
 MARKER = "# pdx-segsync"
 
+PROBE_TAIL = '''
+
+# --- pdx-segsync probe ------------------------------------------------------
+# Timing-neutral: one event recorded per segment, never waited on. A daemon
+# thread samples them, so when the replaying thread wedges inside a CUDA call
+# the last sample still names the segment the device finished last.
+import threading as _pdx_threading
+import time as _pdx_time
+
+_PDX_PROBE_EVENTS: dict = {}
+_PDX_PROBE_STATE: dict = {}
+_PDX_PROBE_LOCK = _pdx_threading.Lock()
+_PDX_PROBE_STARTED = False
+
+
+def _pdx_probe_record(capture, i):
+    try:
+        key = id(capture)
+        ring = _PDX_PROBE_EVENTS.get(key)
+        if ring is None:
+            ring = _PDX_PROBE_EVENTS[key] = {}
+        ev = ring.get(i)
+        if ev is None:
+            ev = ring[i] = torch.cuda.Event()
+        ev.record()
+        _PDX_PROBE_STATE[key] = (i, len(capture.segments), _pdx_time.time())
+        _pdx_probe_start()
+    except Exception:
+        pass
+
+
+def _pdx_probe_loop():
+    import logging
+
+    log = logging.getLogger("pdx.segprobe")
+    while True:
+        _pdx_time.sleep(1.0)
+        try:
+            for key, (last, total, ts) in list(_PDX_PROBE_STATE.items()):
+                ring = _PDX_PROBE_EVENTS.get(key) or {}
+                pending = None
+                done = 0
+                for i in sorted(ring):
+                    if ring[i].query():
+                        done += 1
+                    elif pending is None:
+                        pending = i
+                age = _pdx_time.time() - ts
+                log.warning(
+                    "segprobe capture=%x segments=%d issued_through=%d "
+                    "device_completed=%d first_pending=%s issue_age=%.1fs",
+                    key, total, last, done,
+                    "none" if pending is None else pending, age,
+                )
+        except Exception:
+            pass
+
+
+def _pdx_probe_start():
+    global _PDX_PROBE_STARTED
+    if _PDX_PROBE_STARTED:
+        return
+    with _PDX_PROBE_LOCK:
+        if _PDX_PROBE_STARTED:
+            return
+        _PDX_PROBE_STARTED = True
+        t = _pdx_threading.Thread(
+            target=_pdx_probe_loop, name="pdx-segprobe", daemon=True
+        )
+        t.start()
+'''
+
+
+def _write(path, out, mode):
+    try:
+        open(path, "w").write(out)
+    except OSError as e:
+        print(f"    segsync: WARNING cannot write {path}: {e}")
+        return 0
+    print(f"    segsync: applied mode={mode} to {path}")
+    return 0
+
 
 def main() -> int:
     mode = os.environ.get("PDX_SEGSYNC", "").strip()
@@ -50,7 +145,7 @@ def main() -> int:
         print("    segsync: off (set PDX_SEGSYNC=all|graph|depth:N to enable)")
         return 0
 
-    if mode != "all" and mode != "graph" and not re.fullmatch(r"depth:\d+", mode):
+    if mode not in ("all", "graph", "probe") and not re.fullmatch(r"depth:\d+", mode):
         print(f"    segsync: WARNING unrecognised PDX_SEGSYNC={mode!r}; leaving "
               f"the file untouched")
         return 0
@@ -85,6 +180,10 @@ def main() -> int:
     ind = m.group("ind")
     body = ind + " " * 4 + "for i, r in enumerate(self.segments):\n"
     body += ind + " " * 8 + "r()\n"
+    if mode == "probe":
+        body += ind + " " * 8 + f"_pdx_probe_record(self, i)  {MARKER} probe\n"
+        out = src[: m.start("loop")] + body + src[m.end("loop") :] + PROBE_TAIL
+        return _write(path, out, mode)
     if mode == "all":
         cond = None
     elif mode == "graph":
