@@ -181,6 +181,24 @@ if ("mcpp" in ours) != ("set_xfer_handshake_metadata_pp_aware" in mc):
     fail.append("MooncakeStore PP override presence does not match K3_OURS")
 if fail: sys.exit("[k3-pp-911] FATAL:\n  - " + "\n  - ".join(fail))
 import vllm
-print(f"[k3-pp-911] verified: K3_OURS={sorted(ours) or 'none'}; vllm {getattr(vllm, '__version__', '?')}")
+# The mooncake TransferEngine that registers RDMA memory regions -- and that
+# carries the auto-chunk fix for MRs larger than the device max_mr_size, which
+# landed in 0.3.13 -- runs INSIDE this worker, so its version comes from the
+# vLLM image's wheel. requirements/kv_connectors.txt pins only
+# `mooncake-transfer-engine >= 0.3.12`, and a config's
+# KV_OFFLOAD_BACKEND_METADATA version is a label that installs nothing.
+# mooncake_kv_store.container pins the master daemon, not this. So print what
+# is actually here; without it no run records which version moved the bytes.
+mc_ver = "absent"
+try:
+    from importlib.metadata import version as _v
+    mc_ver = _v("mooncake-transfer-engine")
+except Exception:
+    try:
+        import mooncake_transfer_engine as _m
+        mc_ver = getattr(_m, "__version__", "unknown")
+    except Exception:
+        pass
+print(f"[k3-pp-911] verified: K3_OURS={sorted(ours) or 'none'}; vllm {getattr(vllm, '__version__', '?')}; mooncake-transfer-engine {mc_ver}")
 PY
 echo "=== k3-pp-911: done ==="
