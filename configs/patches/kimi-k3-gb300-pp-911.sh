@@ -92,6 +92,7 @@ case ",${K3_OURS}," in *,evict,*) bash /configs/patches/vllm-container-deps-k3-e
 case ",${K3_OURS}," in *,mcpp,*) bash /configs/patches/vllm-container-deps-k3-mcpp-908.sh ;; esac
 case ",${K3_OURS}," in *,mrcap,*) bash /configs/patches/vllm-container-deps-k3-mrcap-911.sh ;; esac
 case ",${K3_OURS}," in *,mcclamp,*) bash /configs/patches/vllm-container-deps-k3-mcclamp-911.sh ;; esac
+case ",${K3_OURS}," in *,pushdone,*) bash /configs/patches/vllm-container-deps-k3-pushdone-915.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
@@ -136,8 +137,20 @@ recv_done_handled = (
 )
 if not recv_done_handled:
     fail.append("recv-side completion handling missing -- _pop_done_transfers shape changed, re-check the push path")
-if "_pop_done_transfers(self._sending_transfers)" not in pw:
+# Whitespace-insensitive: #56104 wrapped this call over three lines and the
+# old literal match failed on formatting alone, killing four arms of 68227515
+# after every patch had applied cleanly.
+if "_pop_done_transfers(self._sending_transfers)" not in "".join(pw.split()):
     fail.append("push worker no longer polls its send transfers the expected way")
+# #56104 re-introduced the #54518 shape on the push path, as a set comprehension
+# rather than an if: send completions filtered by _recving_metadata, which is
+# populated D-side only. On a producer that discards every completed push and
+# the request waits out its 30 s lease.
+if "pushdone" in ours:
+    if "if req_id in self._recving_metadata" in pw:
+        fail.append("K3_OURS=pushdone but #56104's gate is still on the push send path")
+elif "if req_id in self._recving_metadata" in pw:
+    fail.append("#56104's push-producer lease gate is live and pushdone is not in K3_OURS")
 if "_align_remote_regions_by_layer" not in bw or "packed_member_layouts" not in bw:
     fail.append("#50499 (rebased head) layer-name routing missing")
 refusal = "with Mamba/SSM hybrid KV cache layouts yet" in bw

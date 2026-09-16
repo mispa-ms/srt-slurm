@@ -1,0 +1,23 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+index 8b34e7ffbb..6e531a0247 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+@@ -807,11 +807,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
+             )
+         # A failed send must never be reported as done: its blocks
+         # are freed via the lease / watchdog instead.
+-        done_pushing = {
+-            req_id
+-            for req_id in done_pushing - failed_pushing
+-            if req_id in self._recving_metadata
+-        }
++        #
++        # Only the failure filter applies here. ``_recving_metadata`` is a
++        # D-side structure (see start_load_kv, "D-side: track reqs waiting for
++        # P to push"), and these are P-side sends, so requiring an entry in it
++        # drops every completed push on a producer and leaves the request to
++        # time out on its lease -- the same shape as #54518.
++        done_pushing = done_pushing - failed_pushing
+         for req_id in done_pushing:
+             self._reqs_to_send.pop(req_id, None)
+             self._reqs_to_process.discard(req_id)
