@@ -129,6 +129,64 @@ def _pdx_probe_start():
 '''
 
 
+def _apply_coulten(path, src):
+    """The owners' spec, implemented literally rather than approximated.
+
+    From their write-up: explicit GRAPH/EAGER types recorded at append time so
+    callback and metadata cannot drift; synchronize the replay stream after
+    every GRAPH callback INCLUDING the terminal one; never after an EAGER
+    callback; fail before replay if the two lists disagree.
+
+    Our earlier `all` mode inferred the type from `__self__` and fenced both
+    kinds. That is a superset of their sync points, so it was not the reason
+    our run stalled -- the reason was that under FULL_AND_PIECEWISE a
+    FULL-dispatched step returns the decorated fn unwrapped and never enters
+    replay() at all. Recording the type at the append site removes the
+    inference; it does not remove that.
+    """
+    # 1. Tag the graph segment where it is recorded.
+    old_graph = "        self.segments.append(self._current_graph.replay)\n"
+    new_graph = ("        self._pdx_append(self._current_graph.replay, True)"
+                 "  " + MARKER + " graph\n")
+    # 2. Tag the eager segment where it is recorded.
+    old_eager = "        self.segments.append(fn)\n"
+    new_eager = ("        self._pdx_append(fn, False)  " + MARKER + " eager\n")
+    # 3. Replace the replay loop.
+    old_replay = ("    def replay(self) -> None:\n"
+                  "        for r in self.segments:\n"
+                  "            r()\n")
+    new_replay = (
+        "    def _pdx_append(self, cb, is_graph):  " + MARKER + "\n"
+        "        types = getattr(self, '_pdx_segment_types', None)\n"
+        "        if types is None:\n"
+        "            types = self._pdx_segment_types = []\n"
+        "        self.segments.append(cb)\n"
+        "        try:\n"
+        "            types.append(is_graph)\n"
+        "        except BaseException:\n"
+        "            self.segments.pop()\n"
+        "            raise\n"
+        "\n"
+        "    def replay(self) -> None:\n"
+        "        types = getattr(self, '_pdx_segment_types', None) or []\n"
+        "        if len(types) != len(self.segments):\n"
+        "            raise RuntimeError('pdx-segsync: segment metadata is inconsistent')\n"
+        "        stream = torch.cuda.current_stream()\n"
+        "        for r, is_graph in zip(self.segments, types):\n"
+        "            r()\n"
+        "            if is_graph:\n"
+        "                stream.synchronize()\n")
+    for old in (old_graph, old_eager, old_replay):
+        if old not in src:
+            print("    segsync: WARNING coulten mode could not find one of its "
+                  "three anchors; leaving the file untouched")
+            return 0
+    out = src.replace(old_graph, new_graph, 1)
+    out = out.replace(old_eager, new_eager, 1)
+    out = out.replace(old_replay, new_replay, 1)
+    return _write(path, out, "coulten")
+
+
 def _write(path, out, mode):
     try:
         open(path, "w").write(out)
@@ -145,7 +203,7 @@ def main() -> int:
         print("    segsync: off (set PDX_SEGSYNC=all|graph|depth:N to enable)")
         return 0
 
-    if mode not in ("all", "graph", "probe") and not re.fullmatch(r"depth:\d+", mode):
+    if mode not in ("all", "graph", "probe", "coulten") and not re.fullmatch(r"depth:\d+", mode):
         print(f"    segsync: WARNING unrecognised PDX_SEGSYNC={mode!r}; leaving "
               f"the file untouched")
         return 0
@@ -176,6 +234,9 @@ def main() -> int:
         print("    segsync: WARNING replay() loop not found in the expected "
               "shape; leaving the file untouched")
         return 0
+
+    if mode == "coulten":
+        return _apply_coulten(path, src)
 
     ind = m.group("ind")
     body = ind + " " * 4 + "for i, r in enumerate(self.segments):\n"
