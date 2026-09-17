@@ -274,6 +274,13 @@ fi
 # independent confirmation at p ~ 0.005.
 #
 # Off unless PDX_SEGSYNC is set, so the control arm is byte-identical.
+# Lowest-priority transfer streams for OffloadingConnector -- one line, and it
+# separates "the copy competes for scheduling" from "the copy occupies SMs".
+# Off unless PDX_OFFLOAD_LOWPRI=1.
+python3 /configs/patches/pdx_offload_lowpri.py || {
+    echo "    offload-lowpri: patch script failed; continuing unpatched" >&2
+}
+
 python3 /configs/patches/pdx_segsync.py || {
     echo "    segsync: patch script failed; continuing unpatched" >&2
 }
