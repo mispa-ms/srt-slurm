@@ -1,0 +1,49 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 6f154ea991..73d7bc7f02 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -1900,6 +1900,44 @@ class MooncakeStoreWorker:
+             for g_idx, db in enumerate(self.token_dbs)
+         )
+ 
++        # --- mcppdbg: what this rank will demand, and what it will write ---
++        # Wrapped: instrumentation must not be able to take down a 4-hour run.
++        # self.coord and the layouts' key_for() have initialisation orders this
++        # call site does not control.
++        try:
++            coord = getattr(self, "coord", None)
++            logger.info(
++                "[mcppdbg] ranks tp=%d/%d pcp=%d/%d dcp=%d/%d pp=%d/%d groups=%d "
++                "hash_block_size=%s partial_hash_hits=%s",
++                self.tp_rank, self.tp_size, self.pcp_rank, self.pcp_size,
++                self.dcp_rank, self.dcp_size, self.pp_rank, self.pp_size,
++                len(self._kv_cache_groups), self.hash_block_size,
++                getattr(coord, "enable_partial_hash_hits", "?"),
++            )
++            for g_idx, db in enumerate(self.token_dbs):
++                spec = self._kv_cache_groups[g_idx].kv_cache_spec
++                prefixes = self._lookup_key_prefixes[g_idx]
++                try:
++                    shard = db.store_layout.local_shard_ids[0]
++                    mine = db.store_layout.key_for(shard, BlockHash(b"\x00" * 32))
++                except Exception as e:  # noqa: BLE001
++                    mine = f"<key_for failed: {e}>"
++                logger.info(
++                    "[mcppdbg] group %d block_size=%s spec=%s prefix_cacheable=%s "
++                    "tp_replication=%s shards=%s prefixes=%d first=%s last=%s "
++                    "mine=%s",
++                    g_idx, db.block_size, type(spec).__name__,
++                    getattr(spec, "prefix_cacheable", "?"),
++                    self._group_tp_replication_factors[g_idx],
++                    getattr(db.store_layout, "local_shard_ids", "?"),
++                    len(prefixes),
++                    prefixes[0] if prefixes else "-",
++                    prefixes[-1] if prefixes else "-",
++                    mine,
++                )
++        except Exception as e:  # noqa: BLE001
++            logger.warning("[mcppdbg] instrumentation failed: %s", e)
++
+     def register_kv_caches(
+         self,
+         kv_caches: dict[str, torch.Tensor],
