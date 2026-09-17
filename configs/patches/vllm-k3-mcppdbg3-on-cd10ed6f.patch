@@ -1,0 +1,48 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 6f154ea991..c2036ef27a 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -1876,6 +1876,11 @@ class MooncakeStoreWorker:
+             for group in self._kv_cache_groups
+         )
+ 
++    @staticmethod
++    def _dbg_groups_seen(candidate_meta):
++        """Groups this lookup actually produced candidates for (mcppdbg3)."""
++        return {g for g, _ in candidate_meta}
++
+     def _init_lookup_key_prefixes(self) -> None:
+         def rank_namespaces(factor: int) -> tuple[tuple[int, int, int, int], ...]:
+             if self.dcp_size > 1:
+@@ -2343,6 +2348,31 @@ class MooncakeStoreWorker:
+             token_len,
+             cached_block_pool,
+         )
++
++        # --- mcppdbg3: contiguity, not presence ---
++        if _dbg_on:
++            try:
++                groups = sorted({g for g, _ in exists_set})
++                for g_idx in sorted(self._dbg_groups_seen(candidate_meta)):
++                    have = {h for g, h in exists_set if g == g_idx}
++                    total = len(block_hashes)
++                    first_gap = next(
++                        (i for i, h in enumerate(block_hashes)
++                         if bytes(h) not in have),
++                        total,
++                    )
++                    head = "".join(
++                        "1" if bytes(h) in have else "0"
++                        for h in block_hashes[:16]
++                    )
++                    logger.info(
++                        "[mcppdbg3] batch %d group %d: hit_length=%s token_len=%s "
++                        "present=%d/%d first_gap=%d head=%s groups_with_any=%s",
++                        _dbg, g_idx, hit_length, token_len,
++                        len(have), total, first_gap, head, groups,
++                    )
++            except Exception as e:  # noqa: BLE001
++                logger.warning("[mcppdbg3] instrumentation failed: %s", e)
+         if hit_length >= num_tokens:
+             usable_length = self.coord.align_lookup_length(num_tokens - 1)
+             if usable_length <= 0:
