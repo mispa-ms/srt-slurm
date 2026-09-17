@@ -1,0 +1,49 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 6f154ea991..bf424a956d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -2328,11 +2328,44 @@ class MooncakeStoreWorker:
+         # shard, replicated groups one namespace per unique KV head).
+         exists_set = set()
+         pos = 0
++        # --- mcppdbg2 ---
++        _dbg = getattr(self, "_mcppdbg2_batches", 0)
++        _dbg_on = _dbg < 3
++        self._mcppdbg2_batches = _dbg + 1
++        _dbg_stats: dict[int, list[int]] = {}
++        _dbg_missing: dict[int, set[int]] = {}
+         for g_idx, hash_bytes in candidate_meta:
+             count = len(self._lookup_key_prefixes[g_idx])
+             if all(res[pos + j] == 1 for j in range(count)):
+                 exists_set.add((g_idx, hash_bytes))
++            if _dbg_on:
++                hits = sum(1 for j in range(count) if res[pos + j] == 1)
++                s = _dbg_stats.setdefault(g_idx, [0, 0, 0])
++                s[0] += 1                      # candidates
++                s[1] += hits                   # namespaces that said yes
++                s[2] += 1 if hits == count else 0   # candidates fully present
++                if 0 < hits < count:
++                    _dbg_missing.setdefault(g_idx, set()).update(
++                        j for j in range(count) if res[pos + j] != 1
++                    )
+             pos += count
++        if _dbg_on:
++            try:
++                for g_idx, (cand, hits, full) in sorted(_dbg_stats.items()):
++                    count = len(self._lookup_key_prefixes[g_idx])
++                    miss = sorted(_dbg_missing.get(g_idx, ()))
++                    logger.info(
++                        "[mcppdbg2] batch %d group %d: %d candidates x %d namespaces, "
++                        "%d yes (%.1f%%), %d fully present; partial-miss namespaces=%s%s",
++                        _dbg, g_idx, cand, count, hits,
++                        100.0 * hits / (cand * count) if cand and count else 0.0,
++                        full, miss[:8],
++                        "" if not miss else " e.g. " + str(
++                            [self._lookup_key_prefixes[g_idx][j] for j in miss[:2]]
++                        ),
++                    )
++            except Exception as e:  # noqa: BLE001
++                logger.warning("[mcppdbg2] instrumentation failed: %s", e)
+ 
+         cached_block_pool = ExternalCachedBlockPool(
+             self.hash_block_size,
