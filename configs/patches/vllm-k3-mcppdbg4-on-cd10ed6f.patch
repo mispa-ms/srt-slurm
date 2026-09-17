@@ -1,0 +1,51 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 8f277d7eea..8b35ec1331 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -160,6 +160,23 @@ class MooncakeStoreScheduler:
+             need_to_allocate,
+         )
+ 
++        # --- mcppdbg4: the decision, per request ---
++        try:
++            _n = getattr(self, "_mcppdbg4_n", 0)
++            self._mcppdbg4_n = _n + 1
++            if _n % 20 == 0:
++                logger.info(
++                    "[mcppdbg4] decide req=%s total=%d hit_length=%d computed=%d "
++                    "need=%d",
++                    request.request_id,
++                    request.num_tokens,
++                    num_external_hit_tokens,
++                    num_computed_tokens,
++                    need_to_allocate,
++                )
++        except Exception as e:  # noqa: BLE001
++            logger.warning("[mcppdbg4] decide instrumentation failed: %s", e)
++
+         if need_to_allocate <= 0:
+             return 0, False
+ 
+@@ -191,6 +208,22 @@ class MooncakeStoreScheduler:
+         if request.request_id not in self.load_specs:
+             return
+ 
++
++        # --- mcppdbg4: what the core scheduler actually granted ---
++        try:
++            _m = getattr(self, "_mcppdbg4_alloc", 0)
++            self._mcppdbg4_alloc = _m + 1
++            if _m % 20 == 0:
++                spec = self.load_specs[request.request_id]
++                logger.info(
++                    "[mcppdbg4] alloc  req=%s external=%d kvpool=%d vllm=%d",
++                    request.request_id,
++                    num_external_tokens,
++                    spec.kvpool_cached_tokens,
++                    spec.vllm_cached_tokens,
++                )
++        except Exception as e:  # noqa: BLE001
++            logger.warning("[mcppdbg4] alloc instrumentation failed: %s", e)
+         if num_external_tokens == 0:
+             self.load_specs[request.request_id].can_load = False
+             return
