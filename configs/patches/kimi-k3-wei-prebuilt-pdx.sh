@@ -277,6 +277,13 @@ fi
 # Lowest-priority transfer streams for OffloadingConnector -- one line, and it
 # separates "the copy competes for scheduling" from "the copy occupies SMs".
 # Off unless PDX_OFFLOAD_LOWPRI=1.
+# Pre-allocate OffloadingConnector's CUDA events instead of creating them while
+# transfers are in flight -- the one property the two hanging connectors share
+# and the survivor lacks. Off unless PDX_OFFLOAD_EVTPRE=1.
+python3 /configs/patches/pdx_offload_evtpre.py || {
+    echo "    offload-evtpre: patch script failed; continuing unpatched" >&2
+}
+
 python3 /configs/patches/pdx_offload_lowpri.py || {
     echo "    offload-lowpri: patch script failed; continuing unpatched" >&2
 }
