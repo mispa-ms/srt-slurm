@@ -1,14 +1,18 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-index 6f154ea991..bf424a956d 100644
+index 6f154ea991..42fa33cf9f 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
-@@ -2328,11 +2328,44 @@ class MooncakeStoreWorker:
+@@ -2328,11 +2328,48 @@ class MooncakeStoreWorker:
          # shard, replicated groups one namespace per unique KV head).
          exists_set = set()
          pos = 0
 +        # --- mcppdbg2 ---
 +        _dbg = getattr(self, "_mcppdbg2_batches", 0)
-+        _dbg_on = _dbg < 3
++        # Sample PERIODICALLY, not the first N. Round two logged batches 0-2 on
++        # both arms and both read 0 yes -- correctly, because the store is empty
++        # at that point. The warm period is where PP1 and PP2 diverge, so take
++        # every 100th batch and keep taking them.
++        _dbg_on = _dbg % 100 == 0
 +        self._mcppdbg2_batches = _dbg + 1
 +        _dbg_stats: dict[int, list[int]] = {}
 +        _dbg_missing: dict[int, set[int]] = {}
