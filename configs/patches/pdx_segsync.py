@@ -171,11 +171,13 @@ def _apply_coulten(path, src):
         "        types = getattr(self, '_pdx_segment_types', None) or []\n"
         "        if len(types) != len(self.segments):\n"
         "            raise RuntimeError('pdx-segsync: segment metadata is inconsistent')\n"
-        "        stream = torch.cuda.current_stream()\n"
+        # current_stream() is re-read each iteration, as in their pseudocode:
+        # an eager segment could in principle change the current stream, and
+        # hoisting the lookup would then fence the wrong one.
         "        for r, is_graph in zip(self.segments, types):\n"
         "            r()\n"
         "            if is_graph:\n"
-        "                stream.synchronize()\n")
+        "                torch.cuda.current_stream().synchronize()\n")
     for old in (old_graph, old_eager, old_replay):
         if old not in src:
             print("    segsync: WARNING coulten mode could not find one of its "
