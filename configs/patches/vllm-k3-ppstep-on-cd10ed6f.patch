@@ -1,0 +1,31 @@
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index ffc9a5de7e..f9873e04c0 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -699,6 +699,26 @@ class EngineCore:
+ 
+         # Block until the next result is available.
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
++
++        # --- ppstep: the two factors of prefill throughput ---
++        try:
++            import time as _t
++            _n = getattr(self, "_ppstep_n", 0)
++            self._ppstep_n = _n + 1
++            _prev = getattr(self, "_ppstep_last", None)
++            _now = _t.perf_counter()
++            self._ppstep_last = _now
++            if _n % 50 == 0 and _prev is not None:
++                logger.info(
++                    "[ppstep] n=%d tokens=%d reqs=%d budget=%d dt_ms=%.1f",
++                    _n,
++                    scheduler_output.total_num_scheduled_tokens,
++                    len(scheduler_output.num_scheduled_tokens),
++                    self.vllm_config.scheduler_config.max_num_batched_tokens,
++                    (_now - _prev) * 1000.0,
++                )
++        except Exception as e:  # noqa: BLE001
++            logger.warning("[ppstep] instrumentation failed: %s", e)
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+             self.log_error_detail(scheduler_output),

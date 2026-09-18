@@ -97,6 +97,7 @@ case ",${K3_OURS}," in *,mcppdbg,*) bash /configs/patches/vllm-container-deps-k3
 case ",${K3_OURS}," in *,mcppdbg2,*) bash /configs/patches/vllm-container-deps-k3-mcppdbg2-915.sh ;; esac
 case ",${K3_OURS}," in *,mcppdbg3,*) bash /configs/patches/vllm-container-deps-k3-mcppdbg3-915.sh ;; esac
 case ",${K3_OURS}," in *,mcppdbg4,*) bash /configs/patches/vllm-container-deps-k3-mcppdbg4-915.sh ;; esac
+case ",${K3_OURS}," in *,ppstep,*) bash /configs/patches/vllm-container-deps-k3-ppstep-915.sh ;; esac
 K3_OURS="${K3_OURS}" python3 - <<'PY'
 import importlib.util, os, sys
 root = os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin))
