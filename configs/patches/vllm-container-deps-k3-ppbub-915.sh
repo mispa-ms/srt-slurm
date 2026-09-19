@@ -2,10 +2,17 @@
 # Ours: measure the pipeline bubble directly, per PP stage.
 #
 # ppstep splits prefill throughput into tokens-per-step x steps-per-second at
-# the engine. That cannot say whether the two stages OVERLAP. Under PP the
-# worker posts a non-blocking irecv and the model runner blocks on it inside
-# sync_and_gather_intermediate_tensors(..., True) -- that block is stage 1
-# sitting idle because stage 0 has not finished, and stage 0 never enters it.
+# the engine. That cannot say whether the two stages OVERLAP.
+#
+# ROUND ONE MEASURED NOTHING. It timed sync_and_gather_intermediate_tensors in
+# v1/worker/gpu_model_runner.py, but these arms set VLLM_USE_V2_MODEL_RUNNER=1
+# and run v1/worker/gpu/model_runner.py, so the patched line never executed and
+# pipeline 68666653 logged wait_ms=0.0 on every rank -- "no measurement", not
+# "no bubble".
+#
+# This anchors on AsyncIntermediateTensors.wait_for_comm instead: both runners
+# reach the tensors through __getattribute__("tensors"), which calls it, and it
+# is the only place the PP recv handles are waited on.
 #
 # One line per 50th step per rank:
 #   [ppbub] pp_rank=R n=N step_ms=S wait_ms=W wait_pct=P
@@ -16,8 +23,8 @@
 # both step_ms ~ PP1's step -> the engine feeds one batch at a time; queue
 #                              depth, not the stage, is the problem
 #
-# Touches gpu_worker.py and gpu_model_runner.py, which no patch in the 0915a
-# chain edits.
+# All three edits are in gpu_worker.py, which no patch in the 0915a chain
+# edits. The patched file is byte-compiled before submission.
 set -euo pipefail
 readonly VLLM_ROOT="$(python3 -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')"
 readonly SITE_PACKAGES="$(dirname "${VLLM_ROOT}")"

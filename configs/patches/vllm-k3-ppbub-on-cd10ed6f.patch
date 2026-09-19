@@ -1,29 +1,39 @@
-diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 97a59bd273..d63354582c 100644
---- a/vllm/v1/worker/gpu_model_runner.py
-+++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -3633,9 +3633,16 @@ class GPUModelRunner(
-             intermediate_tensors = None
-         else:
-             assert intermediate_tensors is not None
-+            # --- ppbub: this block is the stage-1 idle wait ---
-+            import time as _ppbub_t
-+            _ppbub_t0 = _ppbub_t.perf_counter()
-             intermediate_tensors = self.sync_and_gather_intermediate_tensors(
-                 num_input_tokens, intermediate_tensors, True
-             )
-+            self._ppbub_wait_ms = (
-+                getattr(self, "_ppbub_wait_ms", 0.0)
-+                + (_ppbub_t.perf_counter() - _ppbub_t0) * 1000.0
-+            )
- 
-         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-             # Run the encoder, just like we do with other multimodal inputs.
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 2a3531b61b..5791d72bf5 100644
+index 2a3531b61b..3fc4ee7989 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -1158,6 +1158,28 @@ class Worker(WorkerBase):
+@@ -147,6 +147,12 @@ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ 
+ 
++# --- ppbub: accumulated PP recv wait for the current step, reset by the
++# worker once per execute_model. Module-global because the waiting object is
++# constructed per step and the reader is the Worker.
++_PPBUB_WAIT_MS = 0.0
++
++
+ class AsyncIntermediateTensors(IntermediateTensors):
+     """IntermediateTensors with lazy comm synchronization"""
+ 
+@@ -164,6 +170,17 @@ class AsyncIntermediateTensors(IntermediateTensors):
+     def wait_for_comm(self) -> None:
+         if self._comm_waited:
+             return
++        # --- ppbub: this block is the stage-N idle wait ---
++        import time as _ppbub_t
++        _ppbub_t0 = _ppbub_t.perf_counter()
++        try:
++            self._ppbub_inner()
++        finally:
++            global _PPBUB_WAIT_MS
++            _PPBUB_WAIT_MS += (_ppbub_t.perf_counter() - _ppbub_t0) * 1000.0
++        return
++
++    def _ppbub_inner(self) -> None:
+         if self._comm_handles:
+             for handle in self._comm_handles:
+                 handle.wait()
+@@ -1158,6 +1175,29 @@ class Worker(WorkerBase):
  
          intermediate_tensors = None
          forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -37,16 +47,17 @@ index 2a3531b61b..5791d72bf5 100644
 +            self._ppbub_last = _now
 +            _n = getattr(self, "_ppbub_n", 0)
 +            self._ppbub_n = _n + 1
++            import vllm.v1.worker.gpu_worker as _gw
 +            if _n % 50 == 0 and _prev is not None:
 +                _step = (_now - _prev) * 1000.0
-+                _wait = getattr(self.model_runner, "_ppbub_wait_ms", 0.0)
++                _wait = _gw._PPBUB_WAIT_MS
 +                logger.info(
 +                    "[ppbub] pp_rank=%d n=%d step_ms=%.1f wait_ms=%.1f wait_pct=%.1f",
 +                    _gpp().rank_in_group, _n, _step, _wait,
 +                    (100.0 * _wait / _step) if _step > 0 else 0.0,
 +                )
 +            # Reset every step so the sampled value belongs to the sampled step.
-+            self.model_runner._ppbub_wait_ms = 0.0
++            _gw._PPBUB_WAIT_MS = 0.0
 +        except Exception as e:  # noqa: BLE001
 +            logger.warning("[ppbub] worker instrumentation failed: %s", e)
          num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
