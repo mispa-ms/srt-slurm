@@ -38,13 +38,27 @@ import pathlib, sys, subprocess
 site = pathlib.Path(sys.argv[1]) / "vllm"
 # Grep the installed tree rather than importing: a missing symbol should read as
 # "this image is not his", not as an ImportError from some unrelated dependency.
-markers = ["TailKeyBoundary", "KimiFusedSharedExpert", "MooncakeLookupResult"]
+# Each entry is a list of acceptable spellings: the branch's class name first,
+# then whatever upstream renamed it to on merge. The shared-expert fusion is the
+# only one that moved so far -- it is `latent_moe_tail` upstream, enabled
+# automatically on SM100 at TP=8/16 rather than by the branch's env var.
+markers = [["TailKeyBoundary"],
+           ["KimiFusedSharedExpert", "latent_moe_tail"],
+           ["MooncakeLookupResult"]]
 missing = []
-for m in markers:
-    r = subprocess.run(["grep", "-rlq", m, str(site)])
-    print(f"    {m:<26} {'found' if r.returncode == 0 else 'MISSING'}")
-    if r.returncode:
-        missing.append(m)
+for alts in markers:
+    hit = None
+    for m in alts:
+        if subprocess.run(["grep", "-rlq", m, str(site)]).returncode == 0:
+            hit = m
+            break
+    label = alts[0]
+    if hit:
+        extra = "" if hit == alts[0] else f"  (as {hit})"
+        print(f"    {label:<26} found{extra}")
+    else:
+        print(f"    {label:<26} MISSING  (tried: {', '.join(alts)})")
+        missing.append(" or ".join(alts))
 if missing:
     sys.exit(
         "wei-prebuilt: this image does not carry his branch -- missing "
